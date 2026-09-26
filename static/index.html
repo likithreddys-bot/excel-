@@ -39,6 +39,8 @@
   #drop.over { border-color: #2563eb; background: #eef4ff; }
   #history { padding: 0 16px 12px; font-size: 13px; color: #57606a; max-height: 120px; overflow-y: auto; }
   #history li.inactive { text-decoration: line-through; opacity: .6; }
+  #extra-files .chip { cursor: default; }
+  .notes { margin-top: 6px; padding: 6px 8px; background: #fff8e1; border-radius: 6px; font-size: 13px; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -60,6 +62,9 @@
     <button id="upload-btn">Upload file</button>
     <input type="file" id="file" accept=".csv,.xlsx,.xlsm,.xls" hidden>
     <span id="fileinfo"></span>
+    <button id="add-file-btn" class="hidden" title="Another file to look up from, append or compare with">+ Add lookup file</button>
+    <input type="file" id="extra-file" accept=".csv,.xlsx,.xlsm,.xls" hidden>
+    <span id="extra-files"></span>
     <span class="spacer"></span>
     <button id="undo" disabled>Undo</button>
     <button id="redo" disabled>Redo</button>
@@ -101,6 +106,9 @@ function render(state) {
   activeSheet = Math.min(activeSheet, sheets.length - 1);
   const total = sheets.reduce((n, s) => n + s.rows, 0);
   $("fileinfo").textContent = `${state.filename} · ${sheets.length} sheet(s) · ${total.toLocaleString()} rows`;
+  $("add-file-btn").classList.remove("hidden");
+  $("extra-files").innerHTML = state.files
+    .map((f) => `<span class="chip" title="${esc(f.columns.join(", "))}">${esc(f.name)} (${f.rows.toLocaleString()} rows)</span>`).join(" ");
   $("undo").disabled = !state.can_undo;
   $("redo").disabled = !state.can_redo;
   for (const id of ["dl-xlsx", "dl-csv", "input", "send"]) $(id).disabled = false;
@@ -152,6 +160,28 @@ async function uploadFile(file) {
 
 $("upload-btn").onclick = () => $("file").click();
 $("file").onchange = (e) => e.target.files[0] && uploadFile(e.target.files[0]);
+
+$("add-file-btn").onclick = () => $("extra-file").click();
+$("extra-file").onchange = async (e) => {
+  const file = e.target.files[0];
+  if (!file || !sessionId) return;
+  const fd = new FormData();
+  fd.append("session_id", sessionId);
+  fd.append("file", file);
+  try {
+    const res = await fetch("/api/files", { method: "POST", body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail);
+    render(data);
+    const f = data.files.find((x) => file.name.startsWith(x.name)) || data.files[data.files.length - 1];
+    addMsg(`Added <b>${esc(f.name)}</b> (${f.rows.toLocaleString()} rows). Columns: ${f.columns.map((c) => `<code>${esc(c)}</code>`).join(", ")}` +
+      `\nTry: <i>bring ${esc(f.columns[1] || f.columns[0])} from ${esc(f.name)} on ${esc(f.columns[0])}</i>, ` +
+      `<i>rows not in ${esc(f.name)}</i> or <i>append ${esc(f.name)}</i>`, "bot");
+  } catch (err) {
+    addMsg(esc(err.message), "err");
+  }
+  e.target.value = "";
+};
 for (const ev of ["dragover", "dragleave", "drop"]) {
   document.body.addEventListener(ev, (e) => {
     e.preventDefault();
@@ -180,6 +210,7 @@ $("ask").onsubmit = async (e) => {
     const card = addMsg(
       `<div class="plan"><b>Here's what I'll do:</b><ul>${r.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ul>` +
       `${r.rows_before.toLocaleString()} rows → <b>${total.toLocaleString()}</b> rows in ${after.length} sheet(s)${counts}` +
+      (r.notes.length ? `<div class="notes">${r.notes.map(esc).join("<br>")}</div>` : "") +
       `<div class="actions"><button class="primary">Run it</button><button>Cancel</button></div></div>`, "bot");
     const [run, cancel] = card.querySelectorAll("button");
     run.onclick = async () => {

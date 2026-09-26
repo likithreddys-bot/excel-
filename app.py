@@ -9,7 +9,8 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile
+import pandas as pd
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
@@ -28,6 +29,7 @@ class Session:
     filename: str
     original: Sheets
     kept: Sheets = field(default_factory=dict)  # other workbook sheets, passed through to the download
+    files: dict[str, pd.DataFrame] = field(default_factory=dict)  # extra files for lookup/append/compare
     applied: list[tuple[str, Plan]] = field(default_factory=list)  # (request, plan)
     pointer: int = 0  # applied[:pointer] are active; the rest can be redone
     pending: tuple[str, Plan] | None = None
@@ -39,7 +41,7 @@ class Session:
     def recompute(self):
         sheets = self.original
         for _, plan in self.applied[: self.pointer]:
-            sheets = engine.apply_plan(sheets, plan)
+            sheets = engine.apply_plan(sheets, plan, files=self.files)
         self.current = sheets
 
 
@@ -65,6 +67,7 @@ def state(s: Session) -> dict:
         "filename": s.filename,
         "sheets": sheets_payload(s.current),
         "kept_sheets": list(s.kept),
+        "files": [{"name": n, "rows": len(df), "columns": [str(c) for c in df.columns]} for n, df in s.files.items()],
         "history": [
             {"request": req, "summary": plan.summary, "active": i < s.pointer}
             for i, (req, plan) in enumerate(s.applied)
@@ -93,6 +96,19 @@ async def upload(file: UploadFile):
     return {"session_id": sid, **state(sessions[sid])}
 
 
+@app.post("/api/files")
+async def add_file(session_id: str = Form(...), file: UploadFile = File(...)):
+    """An extra file to look up from, append or compare with. It's referred to by its name, e.g. "customers"."""
+    s = get_session(session_id)
+    try:
+        sheets = engine.load_file(file.filename, await file.read())
+    except PlanError as e:
+        raise HTTPException(400, str(e))
+    name = Path(file.filename).stem.strip()
+    s.files[name] = max(sheets.values(), key=len)
+    return state(s)
+
+
 class PlanRequest(BaseModel):
     session_id: str
     message: str
@@ -101,14 +117,15 @@ class PlanRequest(BaseModel):
 @app.post("/api/plan")
 def plan(req: PlanRequest):
     s = get_session(req.session_id)
-    p = make_plan(s.current, req.message)
+    p = make_plan(s.current, req.message, s.files)
     if p.clarification_question:
         s.pending = None
         return {"clarification_question": p.clarification_question}
 
     # Dry run: execute on the real data so the preview shows exact numbers.
+    notes: list[str] = []
     try:
-        result = engine.apply_plan(s.current, p)
+        result = engine.apply_plan(s.current, p, files=s.files, notes=notes)
     except (PlanError, KeyError, ValueError, TypeError) as e:
         s.pending = None
         return {"error": f"This plan can't run on your data: {e}", "plan": p.model_dump()}
@@ -120,6 +137,7 @@ def plan(req: PlanRequest):
         "plan": p.model_dump(),
         "rows_before": sum(engine.row_counts(s.current).values()),
         "rows_after": engine.row_counts(result),
+        "notes": notes,
     }
 
 

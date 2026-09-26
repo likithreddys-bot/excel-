@@ -169,11 +169,33 @@ class LabelStep(BaseModel):
     replace: bool = False
 
 
+class LookupStep(BaseModel):
+    op: Literal["lookup"]
+    file: str
+    left_on: str = Field(description="Key column in the main data")
+    right_on: str = Field(description="Key column in the other file")
+    columns: list[str] = Field(description="Columns to bring from the other file")
+
+
+class AppendStep(BaseModel):
+    op: Literal["append"]
+    file: str
+
+
+class CompareStep(BaseModel):
+    op: Literal["compare"]
+    file: str
+    left_on: str | None = Field(None, description="None = compare whole rows on the shared columns")
+    right_on: str | None = None
+    keep: Literal["only_here", "only_there", "both"]
+
+
 Step = Union[
     FilterStep, SelectColumnsStep, DropColumnsStep, SortStep, DedupeStep, GroupByStep,
     SplitByStep, PivotStep, TopNStep, DatePartStep, CalculateStep,
     CleanTextStep, FillBlanksStep, DropBlankRowsStep, ReplaceStep, SplitColumnStep,
     MergeColumnsStep, RenameStep, ConvertStep, ComputeStep, LabelStep,
+    LookupStep, AppendStep, CompareStep,
 ]
 
 

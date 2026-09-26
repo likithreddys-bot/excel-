@@ -18,7 +18,7 @@ import pandas as pd
 from engine import PlanError, Sheets, apply_plan, date_part
 from plan import (
     Aggregation, CalculateStep, CleanTextStep, ComputeStep, Condition, ConvertStep, DatePartStep, DedupeStep,
-    DropBlankRowsStep, DropColumnsStep, FillBlanksStep, FilterStep, GroupByStep, LabelCase, LabelStep, MergeColumnsStep,
+    AppendStep, CompareStep, DropBlankRowsStep, DropColumnsStep, FillBlanksStep, FilterStep, GroupByStep, LabelCase, LabelStep, LookupStep, MergeColumnsStep,
     PivotStep, Plan, RenameStep, ReplaceStep, SelectColumnsStep, SortStep, SplitByStep, SplitColumnStep,
     Step, TopNStep,
 )
@@ -59,7 +59,8 @@ ID_WORDS = {"id", "no", "num", "number", "code", "pin", "zip", "phone", "mobile"
 VERB = (r"(?:sort|order|arrange|split|segregate|separate|keep|remove|drop|delete|exclude|filter"
         r"|show|dedupe|group|select|get|give|calculate|compute|find|hide|add|rank|pivot|top|bottom"
         r"|rename|replace|trim|fill|merge|combine|convert|change|make|capitali[sz]e"
-        r"|create|insert|set|update|round|label|tag|flag|mark)")
+        r"|create|insert|set|update|round|label|tag|flag|mark"
+        r"|bring|look\s*up|lookup|vlookup|xlookup|fetch|pull|append|compare|match)")
 CLAUSE_SPLIT = re.compile(
     rf"\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|then|also|and)\s+(?={VERB}\b)"
     rf"|,\s*(?={VERB}\b))\s*", re.I)
@@ -97,6 +98,13 @@ DATEDIFF = re.compile(
     r"|between\s+(?P<a2>.+?)\s+and\s+(?P<b2>.+?)|(?:until|till|to|before)\s+(?P<b3>.+?))\s*$"
     r"|^age\s+(?:from|of|using|based\s+on)\s+(?P<dob>.+?)\s*$", re.I)
 NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+
+
+IDENTIFIER_WORDS = {"id", "pan", "email", "account", "acct", "ref", "key", "uid", "gstin", "aadhaar",
+                    "mobile", "phone", "customer", "client", "employee", "emp"}
+FILE_VERBS = re.compile(r"\b(?:look\s*up|lookup|v\s*lookup|x\s*lookup|match(?:ing|ed)?|bring|fetch|pull|get|add|map|join|merge"
+                        r"|enrich|append|stack|compare|not\s+in|missing|only\s+in|in\s+both|common|also\s+in|present\s+in"
+                        r"|found\s+in|difference|diff|not\s+here|but\s+not)\b", re.I)
 
 
 class ParseError(Exception):
@@ -170,7 +178,9 @@ class Mention:
 
 
 class Parser:
-    def __init__(self, sheets: Sheets):
+    def __init__(self, sheets: Sheets, files: dict[str, pd.DataFrame] | None = None):
+        self.files = files or {}
+        self._file_parsers: dict[str, Parser] = {}
         frames = list(sheets.values())
         self.df = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
         self.columns = [str(c) for c in self.df.columns]
@@ -300,6 +310,10 @@ class Parser:
 
     def parse_clause(self, cl: str) -> list[Step]:
         low = cl.lower()
+        if self.files and FILE_VERBS.search(cl):
+            fm = self.find_file(cl)
+            if fm:
+                return self.parse_file_command(cl, fm)
         if re.search(r"\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b", low):
             return [self.parse_dedupe(cl)]
         formula = self.parse_formula_command(cl)
@@ -602,6 +616,108 @@ class Parser:
         if drop:
             return DropColumnsStep(op="drop_columns", columns=cols)
         return SelectColumnsStep(op="select_columns", columns=cols)
+
+    # ---------- another file: lookup, append, compare ----------
+
+    def file_parser(self, name: str) -> "Parser":
+        if name not in self._file_parsers:
+            self._file_parsers[name] = Parser({name: self.files[name]})
+        return self._file_parsers[name]
+
+    def find_file(self, text: str) -> Mention | None:
+        """Where `text` names an uploaded file. A name that is also a column here only counts when it's
+        clearly a file: "from customers", "customers.xlsx", "customers file"."""
+        toks = list(re.finditer(r"\S+", text))
+        for i in range(len(toks)):
+            for j in range(min(i + 4, len(toks)), i, -1):
+                phrase = text[toks[i].start():toks[j - 1].end()]
+                has_ext = re.search(r"\.(?:xlsx|xlsm|xls|csv)\W*$", phrase, re.I)
+                k = _key(re.sub(r"\.(?:xlsx|xlsm|xls|csv)\W*$", "", phrase, flags=re.I))
+                for name in self.files:
+                    fk = _key(name)
+                    if not (k == fk or _singular(k) == _singular(fk)
+                            or (j == i + 1 and len(k) >= 5 and difflib.SequenceMatcher(None, k, fk).ratio() >= 0.88)):
+                        continue
+                    nxt = toks[j].group().lower().strip(".,") if j < len(toks) else ""
+                    prev = [t.group().lower() for t in toks[max(0, i - 2):i] if t.group().lower() not in ("the", "my")]
+                    fileish = (has_ext or nxt in ("file", "sheet", "list", "table", "data", "workbook")
+                               or (prev and prev[-1] in ("from", "with", "against", "in", "into", "to", "onto", "and", "vs", "versus")))
+                    if fileish or self.column(phrase) is None:
+                        end = toks[j].end() if nxt in ("file", "sheet", "list", "table", "data", "workbook") else toks[j - 1].end()
+                        return Mention(toks[i].start(), end, name)
+        m = re.search(r"\b(?:the\s+)?(?:other|second|lookup|new|that|another)\s+(?:file|sheet|list|table|data)\b|\bboth\s+(?:files|sheets)\b", text, re.I)
+        if m and len(self.files) == 1:
+            return Mention(m.start(), m.end(), next(iter(self.files)))
+        return None
+
+    def parse_file_command(self, cl: str, fm: Mention) -> list[Step]:
+        name = fm.column
+        ft = cl[:fm.start] + " __FILE__ " + cl[fm.end:]
+        low = ft.lower()
+        rest = cl[:fm.start] + " " + cl[fm.end:]
+        if re.search(r"\bappend|\bstack\b|\badd\s+(?:the\s+|all\s+)?(?:rows|records|data)\b|\b(?:below|underneath|at\s+the\s+(?:end|bottom))\b", low):
+            return [AppendStep(op="append", file=name)]
+
+        keep = None
+        if re.search(r"(?:in|from)\s+(?:the\s+)?__file__.*\bnot\s+(?:in\s+)?(?:here|this|mine|ours|main|current|my)\b"
+                     r"|\bonly\s+in\s+(?:the\s+)?__file__|\bmissing\s+(?:from|in)\s+(?:here|this|mine|my|the\s+main|current)\b"
+                     r"|__file__\s+(?:rows\s+|records\s+)?(?:that\s+are\s+|which\s+are\s+)?not\s+(?:in\s+)?(?:here|this|mine|my)\b", low):
+            keep = "only_there"
+        elif re.search(r"\bnot\s+(?:in|present\s+in|found\s+in|matching)\s+(?:the\s+)?__file__|\bmissing\s+(?:from|in)\s+(?:the\s+)?__file__"
+                       r"|\bonly\s+(?:in\s+)?(?:here|this|mine|my\s+data)\b|\bnot\s+matched\b", low):
+            keep = "only_here"
+        elif re.search(r"\bin\s+both\b|\bcommon\b|\balso\s+in\s+(?:the\s+)?__file__|\b(?:present|found|exist\w*)\s+in\s+(?:the\s+)?__file__"
+                       r"|\b(?:that\s+are|which\s+are)\s+in\s+(?:the\s+)?__file__", low) or re.search(r"\bboth\s+(?:files|sheets)\b", cl, re.I):
+            keep = "both"
+        elif re.search(r"\bcompare|\bdifference|\bdiff\b", low):
+            raise ParseError(f"What should the comparison show: rows not in {name}, rows of {name} that are not here, "
+                             f"or rows in both? e.g. 'rows not in {name} on pan'")
+
+        km = re.search(r"\b(?:on|using|based\s+on|matching(?:\s+on)?|match(?:ing)?\s+by|by|via)\s+(?:the\s+)?(?:column\s+)?"
+                       r"(?P<k>.+?)(?=\s+(?:and\s+)?(?:bring|get|fetch|pull|return|add|from|in|to\s+get)\b|\s*$)", rest, re.I)
+        # "pan with pan number" names both keys; a trailing "with" (file already removed) doesn't.
+        key_text = re.sub(r"\s+(?:with|and)\s*$", "", km.group("k")) if km else None
+        key = self._file_key(key_text, name, required=keep is None)
+        if km:
+            rest = rest[:km.start()] + " " + rest[km.end():]
+        if keep:
+            left, right = key or (None, None)
+            return [CompareStep(op="compare", file=name, left_on=left, right_on=right, keep=keep)]
+
+        fp = self.file_parser(name)
+        wanted = re.sub(r"\b(?:look\s*up|lookup|v\s*lookup|x\s*lookup|match(?:ing)?|bring|fetch|pull|get|add|map|join|merge|enrich"
+                        r"|with|from|and|the|their|its|columns?|details?|info|information|data|also)\b", " ", rest, flags=re.I)
+        cols = [m.column for m in fp.find_columns(wanted) if m.column != key[1]]
+        if not cols or re.search(r"\b(?:all|every(?:thing)?)\b", rest, re.I):
+            cols = [c for c in fp.columns if c != key[1]]
+        return [LookupStep(op="lookup", file=name, left_on=key[0], right_on=key[1], columns=list(dict.fromkeys(cols)))]
+
+    def _file_key(self, text: str | None, name: str, required: bool) -> tuple[str, str] | None:
+        """(column here, column in the other file) to match rows on."""
+        fp = self.file_parser(name)
+        if text:
+            parts = re.split(r"\s*(?:==|=|<->)\s*|\s+(?:with|to|and)\s+", text.strip(), maxsplit=1)
+            left_t, right_t = (parts[0], parts[1]) if len(parts) == 2 else (parts[0], parts[0])
+            left = self.column(left_t) or next((c for c in self.columns if _key(c) == _key(fp.column(left_t) or "")), None)
+            right = fp.column(right_t) or next((c for c in fp.columns if _key(c) == _key(left or "")), None)
+            if left and right:
+                return left, right
+            missing = f"'{left_t}' here" if not left else f"'{right_t}' in {name}"
+            raise ParseError(f"I couldn't find {missing}. Columns here: {', '.join(self.columns)}. "
+                             f"Columns in {name}: {', '.join(fp.columns)}")
+        common = [(c, fc) for c in self.columns for fc in fp.columns if _key(c) == _key(fc)]
+        # Real identifiers first (pan, id, email...), then codes/numbers.
+        ids = [p for p in common if set(_col_words(p[0])) & IDENTIFIER_WORDS]
+        codes = [p for p in common if set(_col_words(p[0])) & {"code", "no", "num", "number"}]
+        if len(ids) == 1:
+            return ids[0]
+        if not required:
+            return None  # compare whole rows rather than guess a weak key
+        for group in (codes, common):
+            if len(group) == 1:
+                return group[0]
+        options = ", ".join(c for c, _ in (ids or codes or common)) or "(no columns in common)"
+        raise ParseError(f"Which column should I match on? Try: '... on pan'. Columns in both: {options}")
 
     # ---------- calculated columns ----------
 
@@ -1318,6 +1434,16 @@ def describe(step: Step) -> str:
             other = (f"; otherwise '{step.default}'" if step.default is not None
                      else "; otherwise keep the current value" if step.replace else "; otherwise blank")
             return f"{'Replace' if step.replace else 'Add'} column '{step.name}': {rules}{other}"
+        case "lookup":
+            return (f"Look up {', '.join(step.columns)} from {step.file}, matching {step.left_on} here "
+                    f"to {step.right_on} in {step.file} (first match, like VLOOKUP)")
+        case "append":
+            return f"Add the rows of {step.file} below this data (columns lined up by name)"
+        case "compare":
+            by = f"matching {step.left_on} to {step.right_on}" if step.left_on else "comparing whole rows"
+            return {"only_here": f"Keep rows that are not in {step.file} ({by})",
+                    "only_there": f"Show rows of {step.file} that are not in this data ({by})",
+                    "both": f"Keep rows that are also in {step.file} ({by})"}[step.keep]
     return step.op
 
 
@@ -1336,18 +1462,28 @@ def split_clauses(request: str) -> list[str]:
     return clauses
 
 
-def make_plan(sheets: Sheets, request: str) -> Plan:
+def make_plan(sheets: Sheets, request: str, files: dict[str, pd.DataFrame] | None = None) -> Plan:
     try:
         clauses = split_clauses(request)
         if not clauses:
             raise ParseError("Tell me what you'd like to do with the data.")
+        if files:
+            # "match with customers on pan and bring email": a bring/fetch part that names no file
+            # continues the lookup before it rather than starting a new command.
+            finder, merged = Parser(sheets, files), []
+            for c in clauses:
+                if merged and re.match(r"(?:bring|fetch|pull|return|get)\b", c, re.I) and not finder.find_file(c):
+                    merged[-1] += " and " + c
+                else:
+                    merged.append(c)
+            clauses = merged
         steps: list[Step] = []
         for i, clause in enumerate(clauses):
-            new = Parser(sheets).parse_clause(clause)
+            new = Parser(sheets, files).parse_clause(clause)
             steps += new
             if i < len(clauses) - 1:
                 # Later parts see the result so far: "add column gst = ... and sort by gst".
-                sheets = apply_plan(sheets, Plan(summary="", steps=new))
+                sheets = apply_plan(sheets, Plan(summary="", steps=new), files=files)
         return Plan(summary="; ".join(describe(s) for s in steps) + ".", steps=steps)
     except ParseError as e:
         return Plan(clarification_question=str(e), summary="", steps=[])

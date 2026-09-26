@@ -509,11 +509,20 @@ def _sheet_name(parent: str, key: str, total_parents: int) -> str:
     return name[:31] or "blank"
 
 
-def apply_plan(sheets: Sheets, plan: Plan) -> Sheets:
+def apply_plan(sheets: Sheets, plan: Plan, files: dict[str, pd.DataFrame] | None = None,
+               notes: list[str] | None = None) -> Sheets:
+    """`files` are other uploaded tables (for lookup/append/compare); `notes` collects things the
+    user should know about the result, e.g. how many rows found a lookup match."""
     for step in plan.steps:
         out: Sheets = {}
         for name, df in sheets.items():
-            result = _apply_step(df, step)
+            if step.op in ("lookup", "append", "compare"):
+                sheet_notes: list[str] = []
+                result = _apply_file_step(df, step, files or {}, sheet_notes)
+                if notes is not None:
+                    notes += [f"{name}: {n}" if len(sheets) > 1 else n for n in sheet_notes]
+            else:
+                result = _apply_step(df, step)
             if isinstance(result, dict):
                 for key, part in result.items():
                     out[_sheet_name(name, key, len(sheets))] = part
@@ -521,6 +530,86 @@ def apply_plan(sheets: Sheets, plan: Plan) -> Sheets:
                 out[name] = result
         sheets = out
     return sheets
+
+
+# ---------- working with another file: lookup, append, compare ----------
+
+def match_key(s: pd.Series) -> pd.Series:
+    """Values as they should match across files: 101 == 101.0 == " 101 ", and case is ignored."""
+    return s.map(lambda v: pd.NA if pd.isna(v) or str(v).strip() == "" else _fmt_key(v).strip().lower())
+
+
+def _col_key(c) -> str:
+    """Column names line up across files ignoring case, spaces and underscores: "PAN" == "pan", "Txn Date" == "txn_date"."""
+    return re.sub(r"[^a-z0-9]", "", str(c).lower())
+
+
+def _other(files: dict[str, pd.DataFrame], name: str) -> pd.DataFrame:
+    if name not in files:
+        raise PlanError(f"The file '{name}' isn't loaded. Add it with 'Add lookup file' first.")
+    return files[name]
+
+
+def _apply_file_step(df: pd.DataFrame, step, files: dict[str, pd.DataFrame], notes: list[str]) -> pd.DataFrame:
+    other = _other(files, step.file)
+    match step.op:
+        case "lookup":
+            _check_columns(df, [step.left_on])
+            _check_columns(other, [step.right_on] + step.columns)
+            rk = match_key(other[step.right_on])
+            dup = rk.duplicated() & rk.notna()
+            if dup.any():
+                notes.append(f"{step.file} has {dup.sum():,} repeated {step.right_on} value(s); the first match was used "
+                             f"(like VLOOKUP).")
+            table = other[~dup & rk.notna()].set_axis(rk[~dup & rk.notna()])
+            lk = match_key(df[step.left_on])
+            found = lk.isin(table.index)
+            new = {}
+            for c in step.columns:
+                name = c if c not in df.columns and c not in new else f"{c} ({step.file})"
+                new[name] = lk.map(table[c])
+            missing = (~found).sum()
+            notes.append(f"{found.sum():,} of {len(df):,} rows found a match in {step.file}"
+                         + (f"; {missing:,} had no match (left blank)." if missing else "."))
+            return df.assign(**new)
+        case "append":
+            by_key = {_col_key(c): c for c in df.columns}
+            renamed = other.rename(columns=lambda c: by_key.get(_col_key(c), c))
+            only_there = [c for c in renamed.columns if c not in df.columns]
+            only_here = [c for c in df.columns if c not in renamed.columns]
+            if only_there:
+                notes.append(f"Columns only in {step.file} (added, blank for existing rows): {', '.join(map(str, only_there))}.")
+            if only_here:
+                notes.append(f"Columns missing from {step.file} (blank for its rows): {', '.join(map(str, only_here))}.")
+            notes.append(f"Added {len(other):,} rows from {step.file}.")
+            return pd.concat([df, renamed], ignore_index=True)
+        case "compare":
+            if step.left_on:
+                _check_columns(df, [step.left_on])
+                _check_columns(other, [step.right_on])
+                lk, rk = match_key(df[step.left_on]), match_key(other[step.right_on])
+                what = f"{step.left_on}"
+            else:
+                theirs = {_col_key(c): c for c in other.columns}
+                pairs = [(c, theirs[_col_key(c)]) for c in df.columns if _col_key(c) in theirs]
+                if not pairs:
+                    raise PlanError(f"This data and {step.file} have no columns in common. Say which column to compare on.")
+                lk = pd.concat([match_key(df[a]).fillna("") for a, _ in pairs], axis=1).agg("\x1f".join, axis=1)
+                rk = pd.concat([match_key(other[b]).fillna("") for _, b in pairs], axis=1).agg("\x1f".join, axis=1)
+                what = f"whole rows ({', '.join(str(a) for a, _ in pairs)})"
+            blank = lk.isna().sum()
+            if blank:
+                notes.append(f"{blank:,} row(s) have a blank {step.left_on} and can't match anything.")
+            if step.keep == "only_there":
+                out = other[~rk.isin(set(lk.dropna()))]
+                notes.append(f"{len(out):,} row(s) of {step.file} are not in this data (compared by {what}).")
+                return out
+            in_other = lk.isin(set(rk.dropna()))
+            out = df[in_other] if step.keep == "both" else df[~in_other]
+            where = f"also in {step.file}" if step.keep == "both" else f"not in {step.file}"
+            notes.append(f"{len(out):,} of {len(df):,} rows are {where} (compared by {what}).")
+            return out
+    raise PlanError(f"Unknown step {step.op}")
 
 
 def row_counts(sheets: Sheets) -> dict[str, int]:
