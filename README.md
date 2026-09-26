@@ -47,6 +47,13 @@ If a command can't be understood confidently, it asks instead of guessing: for e
 | Running total | `add running total of amount` · `running total of amount per category` · `cumulative sum of amount sorted by date` |
 | Rank | `rank by amount` · `rank by amount within category lowest first` · `rank branches by total amount` |
 | Duplicates | `remove duplicate rows` · `remove duplicates by txn id` |
+| Trim / case | `trim spaces` · `trim name` · `make city title case` · `convert name to uppercase` · `lowercase email` |
+| Blanks | `fill blank city with Unknown` · `fill blanks with 0` · `fill down city` (copy the value from above) · `remove blank rows` · `remove rows with any blank` |
+| Find & replace | `replace "UPI/" with "" in description` · `remove "UPI/" from description` · `replace pune with Pune in city` · `replace N/A with blank` |
+| Text to columns | `split name into first and last` · `split email on @ into user and domain` · `split description by slash` |
+| Merge columns | `merge first and last into full name` · `combine city and state with ", " into location` |
+| Rename | `rename amt to amount` · `rename city to City Name and amt to Amount` |
+| Change type | `convert amt to number` (understands ₹, Rs., INR, commas) · `change txn date to date` · `make pan text` |
 | Several at once | `only debits over 5000, split by category and sort by amount descending` |
 
 Understood automatically:
@@ -54,6 +61,12 @@ Understood automatically:
 - **Values** matched against what's in the data: `debits` finds `DEBIT` in `txn_type`.
 - **Amounts** written as `5k`, `1 lakh`, `2 crore` or `Rs. 5,000`.
 - **Dates** read as `dd/mm/yyyy`, with ISO `yyyy-mm-dd` also accepted.
+
+**Cleaning is careful by design:**
+- **Text to columns and merge keep the original column** and add the new ones beside it.
+- **Type conversion stops instead of blanking values it can't read.** It shows examples, e.g. `'abc'`, so you can fix or remove them first.
+- **Find & replace ignores case and matches inside text** in text columns, like Excel's default. In number columns it matches whole values only, so `replace 0 with blank` won't turn 10 into 1.
+- **Put text in quotes when it has spaces or punctuation:** `replace "Rs. " with ""`.
 
 **Workbooks with several sheets:** commands apply to the main data sheet, meaning the one with the most rows. Other sheets, such as a summary, are kept unchanged and included in the download.
 
@@ -68,11 +81,11 @@ command ──► planner.py ──► Plan (typed steps) ──► engine.py (p
 | File | Role |
 |---|---|
 | `planner.py` | Rule-based parser: plain English → `Plan`, or a clarification question |
-| `plan.py` | The plan format: `filter`, `select_columns`, `drop_columns`, `sort`, `dedupe`, `group_by`, `split_by`, `pivot`, `top_n`, `date_part`, `calculate` |
+| `plan.py` | The plan format: `filter`, `select_columns`, `drop_columns`, `sort`, `dedupe`, `group_by`, `split_by`, `pivot`, `top_n`, `date_part`, `calculate`, `clean_text`, `fill_blanks`, `drop_blank_rows`, `replace`, `split_column`, `merge_columns`, `rename`, `convert` |
 | `engine.py` | Executes a plan on pandas DataFrames; file loading and XLSX/CSV export |
 | `app.py` | FastAPI server: upload, plan (dry run), execute, undo/redo, download |
 | `static/index.html` | The web UI (chat on the left, spreadsheet preview on the right) |
-| `tests/` | Parser tests (`test_planner.py`), analysis tests (`test_analysis.py`) and end-to-end API tests (`test_app.py`) |
+| `tests/` | Parser tests (`test_planner.py`), analysis (`test_analysis.py`), cleaning (`test_cleaning.py`) and end-to-end API tests (`test_app.py`) |
 
 The parser only ever produces a `Plan`. The engine is the only code that touches the data. That separation keeps every result reproducible and every step visible to the user before it runs.
 

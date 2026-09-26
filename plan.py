@@ -98,9 +98,61 @@ class CalculateStep(BaseModel):
     name: str = Field(description="Name of the new column")
 
 
+class CleanTextStep(BaseModel):
+    op: Literal["clean_text"]
+    columns: list[str] | None = Field(None, description="None = all text columns")
+    action: Literal["trim", "upper", "lower", "title"]
+
+
+class FillBlanksStep(BaseModel):
+    op: Literal["fill_blanks"]
+    columns: list[str] | None = Field(None, description="None = all columns")
+    method: Literal["value", "down", "up"]
+    value: str | None = Field(None, description="Only for method=value")
+
+
+class DropBlankRowsStep(BaseModel):
+    op: Literal["drop_blank_rows"]
+    how: Literal["all", "any"] = Field(description="all = row is completely empty; any = any cell is empty")
+
+
+class ReplaceStep(BaseModel):
+    op: Literal["replace"]
+    columns: list[str] | None = Field(None, description="None = all text columns")
+    find: str
+    replace: str = Field(description="Empty string removes the text; a cell left empty becomes blank")
+
+
+class SplitColumnStep(BaseModel):
+    op: Literal["split_column"]
+    column: str
+    delimiter: str
+    names: list[str] = Field(description="New columns; the last one keeps any remaining text")
+
+
+class MergeColumnsStep(BaseModel):
+    op: Literal["merge_columns"]
+    columns: list[str]
+    separator: str
+    name: str
+
+
+class RenameStep(BaseModel):
+    op: Literal["rename"]
+    mapping: dict[str, str]
+
+
+class ConvertStep(BaseModel):
+    op: Literal["convert"]
+    columns: list[str]
+    to: Literal["number", "date", "text"]
+
+
 Step = Union[
     FilterStep, SelectColumnsStep, DropColumnsStep, SortStep, DedupeStep, GroupByStep,
     SplitByStep, PivotStep, TopNStep, DatePartStep, CalculateStep,
+    CleanTextStep, FillBlanksStep, DropBlankRowsStep, ReplaceStep, SplitColumnStep,
+    MergeColumnsStep, RenameStep, ConvertStep,
 ]
 
 

@@ -17,8 +17,10 @@ import pandas as pd
 
 from engine import Sheets, date_part
 from plan import (
-    Aggregation, CalculateStep, Condition, DatePartStep, DedupeStep, DropColumnsStep, FilterStep,
-    GroupByStep, PivotStep, Plan, SelectColumnsStep, SortStep, SplitByStep, Step, TopNStep,
+    Aggregation, CalculateStep, CleanTextStep, Condition, ConvertStep, DatePartStep, DedupeStep,
+    DropBlankRowsStep, DropColumnsStep, FillBlanksStep, FilterStep, GroupByStep, MergeColumnsStep,
+    PivotStep, Plan, RenameStep, ReplaceStep, SelectColumnsStep, SortStep, SplitByStep, SplitColumnStep,
+    Step, TopNStep,
 )
 
 EXAMPLES = [
@@ -55,7 +57,8 @@ ID_WORDS = {"id", "no", "num", "number", "code", "pin", "zip", "phone", "mobile"
 
 # Verbs that start a new clause when they follow "and", "then" or a comma.
 VERB = (r"(?:sort|order|arrange|split|segregate|separate|keep|remove|drop|delete|exclude|filter"
-        r"|show|dedupe|group|select|get|give|calculate|compute|find|hide|add|rank|pivot|top|bottom)")
+        r"|show|dedupe|group|select|get|give|calculate|compute|find|hide|add|rank|pivot|top|bottom"
+        r"|rename|replace|trim|fill|merge|combine|convert|change|make|capitali[sz]e)")
 CLAUSE_SPLIT = re.compile(
     rf"\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|then|also|and)\s+(?={VERB}\b)"
     rf"|,\s*(?={VERB}\b))\s*", re.I)
@@ -69,6 +72,25 @@ TOP_N = re.compile(r"\b(top|bottom|first|last|highest|lowest|largest|smallest|bi
                    r"\s+(\d+)\b(?!\s*(?:days?|weeks?|months?|years?)\b)", re.I)
 DATE_PART = re.compile(r"\b(year|quarter|month|weekday|week|day\s+of\s+(?:the\s+)?week|day)(?:s|ly)?\b"
                        r"|\b(daily|annual(?:ly)?)\b", re.I)
+
+
+SMART_QUOTES = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
+QUOTED = re.compile(r"\"[^\"]*\"|(?<!\w)'[^']*'(?!\w)")  # the (?<!\w) keeps "haven't" from opening a quote
+CASE = re.compile(r"\b(?:upper|lower|title|proper|sentence)[\s-]*case[sd]?\b"
+                  r"|\b(?:uppercase|lowercase|capitali[sz]e[sd]?|all\s+caps|in\s+caps)\b", re.I)
+TRIM = re.compile(r"\btrim(?:med)?\b(?:\s+(?:the\s+)?(?:extra\s+)?(?:white\s*)?spaces?)?"
+                  r"|\b(?:strip|remove|clean(?:\s+up)?|fix|delete)\s+(?:all\s+)?(?:the\s+)?"
+                  r"(?:(?:extra|leading|trailing|double|unnecessary|additional)\s+(?:and\s+)?)*(?:white\s*)?spaces?\b", re.I)
+CONVERT = re.compile(r"^\s*(?:please\s+)?(?:convert|change|make|set|treat|format|turn|cast)\s+(?:the\s+)?(?:columns?\s+)?"
+                     r"(?P<cols>.+?)\s+(?:(?:to|as|into)\s+)?(?:an?\s+)?(?:proper\s+|real\s+)?"
+                     r"(?P<to>numbers?|numeric|integers?|decimals?|dates?|text|strings?)(?:\s+(?:format|type|values?))?\s*$", re.I)
+BLANK_WORDS = {"", "blank", "blanks", "empty", "empties", "empty cells", "empty values", "blank cells",
+               "blank values", "nothing", "null", "nulls", "missing", "missing values"}
+DELIMITERS = {"comma": ",", "commas": ",", "space": " ", "spaces": " ", "dash": "-", "hyphen": "-", "slash": "/",
+              "forward slash": "/", "backslash": "\\", "pipe": "|", "underscore": "_", "colon": ":",
+              "semicolon": ";", "dot": ".", "period": ".", "full stop": ".", "tab": "\t",
+              "nothing": "", "no space": ""}
+NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
 
 
 class ParseError(Exception):
@@ -271,13 +293,18 @@ class Parser:
     # ---------- clauses ----------
 
     def parse(self, request: str) -> Plan:
-        text = re.sub(r",(?=[^\s\d])", ", ", request.strip())  # "date,amount" -> "date, amount"; not "5,000"
+        text = request.strip().translate(SMART_QUOTES)
+        # Quoted text ('"Rs. "', '", "') is set aside so the splitting below can't break it up.
+        quoted: list[str] = []
+        text = QUOTED.sub(lambda m: quoted.append(m.group()) or f"__Q{len(quoted) - 1}__", text)
+        text = re.sub(r",(?=[^\s\d])", ", ", text)  # "date,amount" -> "date, amount"; not "5,000"
         clauses = [c for c in CLAUSE_SPLIT.split(text) if c and c.strip(" ,.")]
         if not clauses:
             raise ParseError("Tell me what you'd like to do with the data.")
         steps: list[Step] = []
         for clause in clauses:
             clause = re.sub(r"^(?:(?:and|also|then|now|please|actually|next|finally)\b[\s,]*)+", "", clause.strip(" ,."), flags=re.I)
+            clause = re.sub(r"__Q(\d+)__", lambda m: quoted[int(m.group(1))], clause)
             steps.extend(self.parse_clause(clause))
         return Plan(summary="; ".join(describe(s) for s in steps) + ".", steps=steps)
 
@@ -285,6 +312,9 @@ class Parser:
         low = cl.lower()
         if re.search(r"\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b", low):
             return [self.parse_dedupe(cl)]
+        cleaning = self.parse_cleaning(cl)
+        if cleaning is not None:
+            return cleaning
         if re.search(r"\b(?:split|segregate|separate|seperate|segment|divide|partition)\b"
                      r"|\bbreak\b.*\b(?:up|down|into)\b|\b(?:sheets?|tabs?|files?)\s+(?:per|for\s+each|by)\b", low):
             return self.parse_split(cl)
@@ -580,6 +610,173 @@ class Parser:
             return DropColumnsStep(op="drop_columns", columns=cols)
         return SelectColumnsStep(op="select_columns", columns=cols)
 
+    # ---------- cleaning ----------
+
+    def parse_cleaning(self, cl: str) -> list[Step] | None:
+        """Cleaning commands, or None if `cl` isn't one."""
+        low = cl.lower()
+        if re.match(r"^\s*(?:please\s+)?rename\b", low):
+            return [self.parse_rename(cl)]
+        if (re.match(r"^\s*(?:please\s+)?(?:replace|substitute)\b", low)
+                or re.match(r"^\s*(?:please\s+)?(?:remove|delete|strip|erase|get\s+rid\s+of|take\s+out)\s+(?:the\s+)?(?:text\s+)?[\"']", cl)):
+            return [self.parse_replace(cl)]
+        step = self.parse_text_split(cl)
+        if step:
+            return [step]
+        if re.match(r"^\s*(?:please\s+)?(?:merge|combine|concatenate|concat|join)\b", low):
+            return [self.parse_merge(cl)]
+        if re.match(r"^\s*(?:please\s+)?(?:remove|delete|drop|exclude)\b", low):
+            if re.search(r"\b(?:blank|empty)\s+(?:rows|lines)\b", low):
+                return [DropBlankRowsStep(op="drop_blank_rows", how="all")]
+            if re.search(r"\brows?\s+(?:with|having|that\s+have|containing)\s+(?:any\s+)?(?:blank|empty|missing)"
+                         r"(?:\s+(?:values?|cells?|fields?|data))?\s*$", low):
+                return [DropBlankRowsStep(op="drop_blank_rows", how="any")]
+        case = CASE.search(low)
+        if case:
+            word = case.group(0)
+            action = "upper" if re.search(r"upper|caps", word) else "lower" if "lower" in word else "title"
+            return [CleanTextStep(op="clean_text", columns=self._text_targets(CASE.sub(" ", cl)), action=action)]
+        if TRIM.search(low):
+            return [CleanTextStep(op="clean_text", columns=self._text_targets(TRIM.sub(" ", cl)), action="trim")]
+        if re.match(r"^\s*(?:please\s+)?fill\b", low):
+            return [self.parse_fill(cl)]
+        m = CONVERT.search(cl)
+        if m:
+            target = m.group("to").lower()
+            to = "date" if target.startswith("date") else "text" if target.startswith(("text", "string")) else "number"
+            cols = self._column_list(m.group("cols"), "convert")
+            return [ConvertStep(op="convert", columns=cols, to=to)]
+        return None
+
+    def _column_list(self, text: str, what: str) -> list[str]:
+        """'a, b and c' -> exact columns; anything that isn't a column is an error, not ignored."""
+        text = re.sub(r"\b(?:the|columns?|fields?|cols?)\b", " ", text, flags=re.I)
+        items = [i.strip() for i in re.split(r",|\band\b|&", text, flags=re.I) if i.strip()]
+        cols = []
+        for item in items:
+            c = self.column(item)
+            if c is None:
+                raise ParseError(f"Which column should I {what}? I couldn't find '{item}'. Columns: " + ", ".join(self.columns))
+            cols.append(c)
+        if not cols:
+            raise ParseError(f"Which column should I {what}? Columns: " + ", ".join(self.columns))
+        return list(dict.fromkeys(cols))
+
+    def _text_targets(self, text: str) -> list[str] | None:
+        """Columns named in a trim/case command; None means every text column."""
+        cols = list(dict.fromkeys(m.column for m in self.find_columns(text)))
+        numeric = [c for c in cols if c in self.numeric_cols]
+        if numeric:
+            raise ParseError(f"{', '.join(numeric)} holds numbers, not text.")
+        return cols or None
+
+    def parse_rename(self, cl: str) -> RenameStep:
+        body = re.sub(r"^\s*(?:please\s+)?rename\s+(?:the\s+)?(?:columns?\s+)?", "", cl, flags=re.I)
+        item = r"(?:\"[^\"]*\"|'[^']*'|.+?)"
+        pairs = re.finditer(rf"(?:^|\s*(?:,|\band\b)\s*)(?P<old>{item})\s+(?:to|as|into|->)\s+(?P<new>{item})"
+                            rf"(?=\s*(?:,|\band\b)\s*{item}\s+(?:to|as|into|->)\s+|\s*$)", body, re.I)
+        mapping = {}
+        for p in pairs:
+            old = self.column(_unquote(p.group("old")))
+            if old is None:
+                raise ParseError(f"I couldn't find a column called '{_unquote(p.group('old'))}'. Columns: " + ", ".join(self.columns))
+            mapping[old] = _unquote(p.group("new"))
+        if not mapping:
+            raise ParseError("Try: rename amt to amount")
+        return RenameStep(op="rename", mapping=mapping)
+
+    def parse_replace(self, cl: str) -> Step:
+        q = r"\"[^\"]*\"|'[^']*'"
+        cols_part = r"(?:the\s+)?(?:columns?\s+)?(?P<cols>.+?)"
+        m = (re.match(rf"^\s*(?:please\s+)?(?:replace|substitute)\s+(?:all\s+)?(?P<find>{q}|.+?)\s+(?:in|within)\s+{cols_part}"
+                      rf"\s+(?:with|by|->)\s+(?P<rep>{q}|.+?)\s*$", cl, re.I)
+             or re.match(rf"^\s*(?:please\s+)?(?:replace|substitute)\s+(?:all\s+)?(?P<find>{q}|.+?)\s+(?:with|by|->|to)\s+"
+                         rf"(?P<rep>{q}|.+?)(?:\s+(?:in|on|for|within)\s+{cols_part})?\s*$", cl, re.I)
+             or re.match(rf"^\s*(?:please\s+)?(?:remove|delete|strip|erase|get\s+rid\s+of|take\s+out)\s+(?:the\s+)?(?:text\s+)?(?P<find>{q})"
+                         rf"(?:\s+(?:from|in)\s+{cols_part})?\s*$", cl, re.I))
+        if not m:
+            raise ParseError('Try: replace "UPI/" with "" in description')
+        find = _unquote(m.group("find"))
+        rep = _unquote(m.groupdict().get("rep") or "")
+        if rep.lower() in BLANK_WORDS:
+            rep = ""
+        cols_text = m.group("cols")
+        cols = None if not cols_text or re.fullmatch(r"\s*(?:all(?:\s+columns)?|everywhere|every\s*where|all\s+text)\s*", cols_text, re.I) \
+            else self._column_list(cols_text, "replace in")
+        if find.lower() in BLANK_WORDS:
+            # "replace blanks with Unknown" means fill the empty cells.
+            return FillBlanksStep(op="fill_blanks", columns=cols, method="value", value=rep)
+        if not find:
+            raise ParseError("What text should I replace?")
+        return ReplaceStep(op="replace", columns=cols, find=find, replace=rep)
+
+    def parse_fill(self, cl: str) -> FillBlanksStep:
+        low = cl.lower()
+        method = ("down" if re.search(r"\bdown(?:wards?)?\b|\bforward\b|\babove\b|\bprevious\b", low) else
+                  "up" if re.search(r"\bup(?:wards?)?\b|\bbackwards?\b|\bbelow\b|\bnext\b", low) else "value")
+        value = None
+        vm = re.search(r"\b(?:with|as|using|to)\s+(?P<v>\"[^\"]*\"|'[^']*'|.+?)(?=\s+(?:in|for|on)\s+|\s*$)", cl, re.I)
+        if method == "value":
+            if not vm:
+                raise ParseError("Fill the blanks with what? e.g. fill blank branch with Unknown, or fill down branch")
+            value = _unquote(vm.group("v"))
+            cl = cl[:vm.start()] + " " + cl[vm.end():]
+        cols = list(dict.fromkeys(m.column for m in self.find_columns(cl))) or None
+        return FillBlanksStep(op="fill_blanks", columns=cols, method=method, value=value)
+
+    def parse_text_split(self, cl: str) -> SplitColumnStep | None:
+        m = re.match(r"^\s*(?:please\s+)?(?:split|separate|break)\s+(?:up\s+)?(?:the\s+)?(?:column\s+)?(?P<col>.+?)\s+"
+                     r"(?P<rest>(?:into|by|on|at|using|with)\b.*)$", cl, re.I)
+        if not m or re.match(r"(?:by|per|on|for|according|based|into|each)\b", m.group("col"), re.I) \
+                or re.search(r"\b(?:sheets?|tabs?|files?|workbooks?)\b", m.group("rest"), re.I):
+            return None  # "split by category": one sheet per value, not text-to-columns
+        col = self.column(m.group("col"))
+        if col is None:
+            return None
+        rest = m.group("rest")
+        dm = re.search(r"\b(?:by|on|at|using|with)\s+(?:an?\s+|the\s+)?(?P<d>\"[^\"]*\"|'[^']*'|forward\s+slash|full\s+stop|\S+)", rest, re.I)
+        delimiter = " "
+        if dm:
+            d = _unquote(dm.group("d"))
+            delimiter = DELIMITERS.get(d.lower(), d)
+            rest = rest[:dm.start()] + " " + rest[dm.end():]
+        names: list[str] = []
+        nm = re.search(r"\binto\s+(?P<n>.+?)\s*$", rest, re.I)
+        count = None
+        if nm:
+            cm = re.fullmatch(r"(\d+|two|three|four|five|six)\s+(?:new\s+)?(?:columns?|parts?|pieces?|fields?)", nm.group("n").strip(), re.I)
+            if cm:
+                count = int(NUMBER_WORDS.get(cm.group(1).lower(), cm.group(1)))
+            else:
+                names = [_unquote(n) for n in re.split(r",|\band\b|&", nm.group("n"), flags=re.I) if n.strip()]
+                if len(names) < 2:
+                    raise ParseError("Split into which new columns? e.g. split name into first and last")
+        if not names:
+            if count is None:
+                count = int(self.df[col].dropna().astype(str).str.count(re.escape(delimiter)).max() + 1)
+                count = max(2, min(count, 10))
+            names = [f"{col} {i}" for i in range(1, count + 1)]
+        return SplitColumnStep(op="split_column", column=col, delimiter=delimiter, names=names)
+
+    def parse_merge(self, cl: str) -> MergeColumnsStep:
+        body = re.sub(r"^\s*(?:please\s+)?(?:merge|combine|concatenate|concat|join)\s+(?:the\s+)?(?:columns?\s+)?", "", cl, flags=re.I)
+        separator = " "
+        sm = re.search(r"\s+(?:with|using|separated\s+by|by)\s+(?:an?\s+|the\s+)?(?P<s>\"[^\"]*\"|'[^']*'|no\s+space|forward\s+slash|\S+)"
+                       r"(?:\s+(?:separator|in\s+between|between))?", body, re.I)
+        if sm and (sm.group("s")[0] in "\"'" or sm.group("s").lower() in DELIMITERS):
+            s = _unquote(sm.group("s"))
+            separator = DELIMITERS.get(s.lower(), s)
+            body = body[:sm.start()] + " " + body[sm.end():]
+        name = None
+        nm = re.search(r"\s+(?:into|as|to)\s+(?:an?\s+)?(?:new\s+)?(?:column\s+)?(?:called\s+|named\s+)?(?P<n>.+?)\s*$", body, re.I)
+        if nm:
+            name = _unquote(nm.group("n"))
+            body = body[:nm.start()]
+        cols = self._column_list(body, "merge")
+        if len(cols) < 2:
+            raise ParseError("Merge which columns? e.g. merge first and last into full name")
+        return MergeColumnsStep(op="merge_columns", columns=cols, separator=separator, name=name or " ".join(cols))
+
     # ---------- row filters ----------
 
     def parse_filter(self, cl: str) -> FilterStep:
@@ -843,6 +1040,11 @@ def _move_period_words(head: str, tail: str) -> tuple[str, str]:
     return head, " ".join(words) + " " + tail
 
 
+def _unquote(v: str) -> str:
+    v = v.strip()
+    return v[1:-1] if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'" else v
+
+
 def _clean_value(v: str) -> str:
     v = v.strip().strip(".,")
     v = re.sub(r"\s+(?:only|rows?|records?|entries|transactions?|ones)$", "", v, flags=re.I)
@@ -930,6 +1132,31 @@ def describe(step: Step) -> str:
                     "running_total": f"running total of {step.column}",
                     "rank": f"rank by {step.column} ({'highest' if step.descending else 'lowest'} = 1)"}[step.kind]
             return f"Add column '{step.name}' = {what}{per}"
+        case "clean_text":
+            where = ", ".join(step.columns) if step.columns else "all text columns"
+            what = {"trim": "Trim extra spaces", "upper": "Make UPPERCASE", "lower": "Make lowercase",
+                    "title": "Make Title Case"}[step.action]
+            return f"{what} in {where}"
+        case "fill_blanks":
+            where = ", ".join(step.columns) if step.columns else "all columns"
+            how = {"value": f"with '{step.value}'", "down": "with the value above", "up": "with the value below"}[step.method]
+            return f"Fill blank cells in {where} {how}"
+        case "drop_blank_rows":
+            return "Remove completely empty rows" if step.how == "all" else "Remove rows that have any empty cell"
+        case "replace":
+            where = ", ".join(step.columns) if step.columns else "all text columns"
+            to = f"'{step.replace}'" if step.replace else "nothing (remove it)"
+            return f"Replace '{step.find}' with {to} in {where}"
+        case "split_column":
+            d = {" ": "space", "\t": "tab"}.get(step.delimiter, f"'{step.delimiter}'")
+            return f"Split {step.column} at each {d} into new columns {', '.join(step.names)} (original kept)"
+        case "merge_columns":
+            sep = {" ": "a space", "": "nothing"}.get(step.separator, f"'{step.separator}'")
+            return f"Combine {', '.join(step.columns)} into new column '{step.name}', separated by {sep}"
+        case "rename":
+            return "Rename " + ", ".join(f"{a} → {b}" for a, b in step.mapping.items())
+        case "convert":
+            return f"Convert {', '.join(step.columns)} to {step.to}"
     return step.op
 
 

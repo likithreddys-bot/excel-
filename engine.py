@@ -6,6 +6,7 @@ so a `split_by` early in a plan makes later steps apply per sheet.
 from __future__ import annotations
 
 import io
+import re
 import zipfile
 
 import pandas as pd
@@ -230,7 +231,124 @@ def _apply_step(df: pd.DataFrame, step: Step) -> Sheets | pd.DataFrame:
         case "calculate":
             _check_columns(df, [step.column] + (step.per or []))
             return _calculate(df, step)
+        case "clean_text":
+            cols = step.columns or text_columns(df)
+            _check_columns(df, cols)
+            return df.assign(**{c: _clean_text(df[c], step.action) for c in cols})
+        case "fill_blanks":
+            cols = step.columns or list(df.columns)
+            _check_columns(df, cols)
+            return df.assign(**{c: _fill(df[c], step) for c in cols})
+        case "drop_blank_rows":
+            blank = pd.DataFrame({c: _is_blank(df[c]) for c in df.columns})
+            return df[~(blank.all(axis=1) if step.how == "all" else blank.any(axis=1))]
+        case "replace":
+            cols = step.columns or text_columns(df)
+            _check_columns(df, cols)
+            return df.assign(**{c: _replace(df[c], step.find, step.replace) for c in cols})
+        case "split_column":
+            _check_columns(df, [step.column])
+            text = df[step.column].astype("string")
+            parts = text.str.split(step.delimiter, n=len(step.names) - 1, expand=True, regex=False)
+            parts = parts.reindex(columns=range(len(step.names))).apply(lambda s: s.str.strip())
+            parts.columns = step.names
+            return _insert_after(df, step.column, parts)
+        case "merge_columns":
+            _check_columns(df, step.columns)
+            cells = df[step.columns].astype("string").apply(lambda s: s.str.strip())
+            merged = cells.apply(lambda r: step.separator.join(v for v in r if pd.notna(v) and v != ""), axis=1)
+            return _insert_after(df, step.columns[-1], pd.DataFrame({step.name: merged.replace("", pd.NA)}))
+        case "rename":
+            _check_columns(df, list(step.mapping))
+            clash = [n for n in step.mapping.values() if n in df.columns and n not in step.mapping]
+            if clash:
+                raise PlanError(f"There is already a column called {', '.join(clash)}")
+            return df.rename(columns=step.mapping)
+        case "convert":
+            _check_columns(df, step.columns)
+            return df.assign(**{c: _convert(df[c], c, step.to) for c in step.columns})
     raise PlanError(f"Unknown step {step.op}")
+
+
+def text_columns(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c])]
+
+
+def _is_blank(s: pd.Series) -> pd.Series:
+    return s.isna() | s.astype("string").str.strip().eq("").fillna(False)
+
+
+def _clean_text(s: pd.Series, action: str) -> pd.Series:
+    t = s.astype("string")
+    match action:
+        case "trim":
+            t = t.str.strip().str.replace(r"\s+", " ", regex=True)
+            t = t.mask(t.eq(""))  # a cell of only spaces is blank
+        case "upper":
+            t = t.str.upper()
+        case "lower":
+            t = t.str.lower()
+        case "title":
+            t = t.str.title()
+    return t.where(s.notna(), pd.NA).astype(object)
+
+
+def _fill(s: pd.Series, step) -> pd.Series:
+    s = s.mask(_is_blank(s))
+    if step.method == "down":
+        return s.ffill()
+    if step.method == "up":
+        return s.bfill()
+    value = step.value
+    if pd.api.types.is_numeric_dtype(s):
+        try:
+            value = float(value)
+        except ValueError:
+            s = s.astype(object)  # e.g. "N/A" into a number column
+    return s.fillna(value)
+
+
+def _replace(s: pd.Series, find: str, repl: str) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(s):
+        # Numbers match as whole values: "replace 0 with blank" must not turn 10 into 1.
+        try:
+            target = float(find)
+        except ValueError:
+            return s
+        new = pd.NA if not repl.strip() else repl
+        try:
+            new = float(repl)
+        except ValueError:
+            pass
+        return (s if isinstance(new, float) else s.astype(object)).mask(s == target, new)
+    t = s.astype("string").str.replace(re.escape(find), lambda m: repl, case=False, regex=True)
+    t = t.mask(t.str.strip().eq(""))  # a cell that became empty is blank
+    return t.where(s.notna(), pd.NA).astype(object)
+
+
+def _insert_after(df: pd.DataFrame, after: str, new: pd.DataFrame) -> pd.DataFrame:
+    clash = [c for c in new.columns if c in df.columns]
+    if clash:
+        raise PlanError(f"There is already a column called {', '.join(clash)}")
+    pos = list(df.columns).index(after) + 1
+    return pd.concat([df.iloc[:, :pos], new.set_axis(df.index), df.iloc[:, pos:]], axis=1)
+
+
+def _convert(s: pd.Series, name: str, to: str) -> pd.Series:
+    if to == "text":
+        return s.map(lambda v: v if pd.isna(v) else _fmt_key(v)).astype(object)
+    if to == "number":
+        # "Rs." must go together with its dot, or "Rs. 90" would become ".90".
+        cleaned = s.astype("string").str.replace(r"(?<![a-z])(?:rs|inr)\.?|[₹$€£,\s]", "", regex=True, case=False)
+        out = pd.to_numeric(cleaned, errors="coerce")
+    else:
+        out = _as_date(s)
+    bad = s[out.isna() & ~_is_blank(s)]
+    if len(bad):
+        examples = ", ".join(repr(str(v)) for v in bad.unique()[:3])
+        raise PlanError(f"{len(bad):,} value(s) in '{name}' can't be read as a {to}, e.g. {examples}. "
+                        f"Fix or remove those first (e.g. replace {examples.split(',')[0]} with blank).")
+    return out
 
 
 def _fmt_key(key) -> str:
@@ -267,6 +385,11 @@ def to_xlsx(sheets: Sheets) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for name, df in sheets.items():
+            # Dates without a time of day are written as plain dates, not "2024-01-01 00:00:00".
+            for c in df.columns:
+                s = df[c]
+                if pd.api.types.is_datetime64_any_dtype(s) and (s.dropna() == s.dropna().dt.normalize()).all():
+                    df = df.assign(**{c: s.dt.date})
             df.to_excel(writer, sheet_name=name, index=False)
     return buf.getvalue()
 
