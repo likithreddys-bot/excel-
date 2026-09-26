@@ -1,0 +1,9 @@
+[project]
+name = "sheet-assistant"
+version = "0.1.0"
+description = "Plain-English spreadsheet operations (filter, split, sort, group) with a rule-based parser. No AI/LLM."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
