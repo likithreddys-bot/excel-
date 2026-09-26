@@ -15,10 +15,10 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from engine import Sheets, date_part
+from engine import PlanError, Sheets, apply_plan, date_part
 from plan import (
-    Aggregation, CalculateStep, CleanTextStep, Condition, ConvertStep, DatePartStep, DedupeStep,
-    DropBlankRowsStep, DropColumnsStep, FillBlanksStep, FilterStep, GroupByStep, MergeColumnsStep,
+    Aggregation, CalculateStep, CleanTextStep, ComputeStep, Condition, ConvertStep, DatePartStep, DedupeStep,
+    DropBlankRowsStep, DropColumnsStep, FillBlanksStep, FilterStep, GroupByStep, LabelCase, LabelStep, MergeColumnsStep,
     PivotStep, Plan, RenameStep, ReplaceStep, SelectColumnsStep, SortStep, SplitByStep, SplitColumnStep,
     Step, TopNStep,
 )
@@ -58,7 +58,8 @@ ID_WORDS = {"id", "no", "num", "number", "code", "pin", "zip", "phone", "mobile"
 # Verbs that start a new clause when they follow "and", "then" or a comma.
 VERB = (r"(?:sort|order|arrange|split|segregate|separate|keep|remove|drop|delete|exclude|filter"
         r"|show|dedupe|group|select|get|give|calculate|compute|find|hide|add|rank|pivot|top|bottom"
-        r"|rename|replace|trim|fill|merge|combine|convert|change|make|capitali[sz]e)")
+        r"|rename|replace|trim|fill|merge|combine|convert|change|make|capitali[sz]e"
+        r"|create|insert|set|update|round|label|tag|flag|mark)")
 CLAUSE_SPLIT = re.compile(
     rf"\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|then|also|and)\s+(?={VERB}\b)"
     rf"|,\s*(?={VERB}\b))\s*", re.I)
@@ -90,7 +91,12 @@ DELIMITERS = {"comma": ",", "commas": ",", "space": " ", "spaces": " ", "dash": 
               "forward slash": "/", "backslash": "\\", "pipe": "|", "underscore": "_", "colon": ":",
               "semicolon": ";", "dot": ".", "period": ".", "full stop": ".", "tab": "\t",
               "nothing": "", "no space": ""}
-NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+DATEDIFF = re.compile(
+    r"^(?:the\s+)?(?:number\s+of\s+|no\.?\s+of\s+)?(?P<unit>day|week|month|year)s?\s+"
+    r"(?:(?:since|from|after)\s+(?P<a>.+?)(?:\s+(?:to|until|till)\s+(?P<b>.+?))?"
+    r"|between\s+(?P<a2>.+?)\s+and\s+(?P<b2>.+?)|(?:until|till|to|before)\s+(?P<b3>.+?))\s*$"
+    r"|^age\s+(?:from|of|using|based\s+on)\s+(?P<dob>.+?)\s*$", re.I)
+NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
 
 
 class ParseError(Exception):
@@ -292,26 +298,13 @@ class Parser:
 
     # ---------- clauses ----------
 
-    def parse(self, request: str) -> Plan:
-        text = request.strip().translate(SMART_QUOTES)
-        # Quoted text ('"Rs. "', '", "') is set aside so the splitting below can't break it up.
-        quoted: list[str] = []
-        text = QUOTED.sub(lambda m: quoted.append(m.group()) or f"__Q{len(quoted) - 1}__", text)
-        text = re.sub(r",(?=[^\s\d])", ", ", text)  # "date,amount" -> "date, amount"; not "5,000"
-        clauses = [c for c in CLAUSE_SPLIT.split(text) if c and c.strip(" ,.")]
-        if not clauses:
-            raise ParseError("Tell me what you'd like to do with the data.")
-        steps: list[Step] = []
-        for clause in clauses:
-            clause = re.sub(r"^(?:(?:and|also|then|now|please|actually|next|finally)\b[\s,]*)+", "", clause.strip(" ,."), flags=re.I)
-            clause = re.sub(r"__Q(\d+)__", lambda m: quoted[int(m.group(1))], clause)
-            steps.extend(self.parse_clause(clause))
-        return Plan(summary="; ".join(describe(s) for s in steps) + ".", steps=steps)
-
     def parse_clause(self, cl: str) -> list[Step]:
         low = cl.lower()
         if re.search(r"\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b", low):
             return [self.parse_dedupe(cl)]
+        formula = self.parse_formula_command(cl)
+        if formula is not None:
+            return formula
         cleaning = self.parse_cleaning(cl)
         if cleaning is not None:
             return cleaning
@@ -609,6 +602,166 @@ class Parser:
         if drop:
             return DropColumnsStep(op="drop_columns", columns=cols)
         return SelectColumnsStep(op="select_columns", columns=cols)
+
+    # ---------- calculated columns ----------
+
+    def parse_formula_command(self, cl: str) -> list[Step] | None:
+        """'add column gst = amount * 0.18', 'size = high if amount > 50000 else low',
+        'round amount to 2 decimals', 'add days since txn date', 'label amount over 1 lakh as large'.
+        None if `cl` isn't one."""
+        text = cl.strip().rstrip(".")
+        m = re.match(r"^\s*(?:please\s+)?round(?:\s+off)?\s+(?:the\s+)?(?:column\s+)?(?P<x>.+?)(?:\s+to\s+(?P<n>\d+|one|two|three|four)"
+                     r"\s+(?:decimals?|decimal\s+places?|places?|digits?))?\s*$", text, re.I)
+        if m:
+            col = self.column(m.group("x"))
+            if col is None:
+                raise ParseError(f"Which column should I round? Columns: " + ", ".join(self.numeric_cols))
+            n = int(NUMBER_WORDS.get((m.group("n") or "0").lower(), m.group("n") or 0))
+            return [ComputeStep(op="compute", name=col, expr=f"round([{col}], {n})", replace=True)]
+
+        m = re.match(r"^\s*(?:please\s+)?(?P<verb>label|tag|flag|mark)\s+(?:the\s+)?(?:rows?\s+|transactions?\s+|records?\s+)?"
+                     r"(?:where\s+|with\s+|that\s+have\s+|if\s+)?(?P<c>.+?)(?:\s+as\s+(?P<v>\"[^\"]*\"|'[^']*'|[^,]+?))?"
+                     r"(?:\s*,?\s*\b(?:else|otherwise)\b[\s,:]*(?P<d>.+))?\s*$", text, re.I)
+        if m:
+            name = "flag" if m.group("verb").lower() in ("flag", "mark") else "label"
+            return [self._label(name, [(m.group("v") or "Yes", m.group("c"))], m.group("d"), replace=False)]
+
+        m = re.match(r"^\s*(?:please\s+)?(?:add|calculate|compute|show|create)\s+(?:a\s+column\s+(?:for|with)\s+)?(?:the\s+)?"
+                     r"(?P<rhs>(?:number\s+of\s+)?(?:days?|weeks?|months?|years?)\s+(?:since|from|after|between|until|till|before)\b.+"
+                     r"|age\s+(?:from|of|using|based\s+on)\s+.+)$", text, re.I)
+        if m:
+            rhs = m.group("rhs")
+            name = "age" if rhs.lower().startswith("age") else re.sub(r"^number\s+of\s+", "", rhs, flags=re.I)
+            return [self._compute(name, rhs, explicit=True, verb=None)]
+
+        verb = r"(?:add|create|make|insert|calculate|compute|new|set|update)"
+        m = re.match(rf"^\s*(?:please\s+)?(?P<verb>{verb})\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?|col)\s+(?:called\s+|named\s+)?"
+                     rf"(?P<name>\"[^\"]*\"|'[^']*'|.+?)\s*(?:=|:|\bas\b|\bequal\s+to\b|\bequals\b|\bwhich\s+is\b|\bthat\s+is\b|\bwith\b)"
+                     rf"\s*(?P<rhs>.+)$", text, re.I) \
+            or re.match(rf"^\s*(?:please\s+)?(?P<verb>add|calculate|compute|create)\s+(?P<name>.+?)\s+as\s+(?P<rhs>.+)$", text, re.I)
+        if m:
+            return [self._compute(m.group("name"), m.group("rhs"), explicit=True, verb=m.group("verb").lower())]
+        m = re.match(rf"^\s*(?:please\s+)?(?:(?P<verb>{verb})\s+)?(?P<name>[^=:<>!]+?)\s*[=:]\s*(?P<rhs>[^=].*)$", text, re.I)
+        if m and len(m.group("name").split()) <= 4:
+            verb_word = (m.group("verb") or "").lower()
+            if self.column(m.group("name")) and verb_word not in ("set", "update"):
+                return None  # "txn_type = DEBIT" is a filter on an existing column
+            return [self._compute(m.group("name"), m.group("rhs"), explicit=False, verb=verb_word)]
+        return None
+
+    def _compute(self, name: str, rhs: str, explicit: bool, verb: str | None) -> Step:
+        name = re.sub(r"^(?:the\s+)|\s+column$", "", _unquote(name).strip(), flags=re.I).strip()
+        existing = next((c for c in self.columns if _key(c) == _key(name)), None) or (None if explicit else self.column(name))
+        replace = bool(existing) and verb in ("set", "update")
+        if existing and not replace:
+            raise ParseError(f"There is already a column called {existing}. Say 'set {existing} = ...' to overwrite it, "
+                             "or pick a new name.")
+        name = existing if replace else name
+        if re.search(r"\bif\b|\b(?:else|otherwise)\b", rhs, re.I):
+            return self._label_rhs(name, rhs, replace)
+        try:
+            return ComputeStep(op="compute", name=name, expr=self.parse_expression(rhs), replace=replace)
+        except ParseError:
+            # "flag = amount > 100000": a condition on its own becomes a Yes/No column.
+            if re.search(r"[<>]|\b(?:is|are|over|under|above|below|more|less|greater|contains?|between|empty)\b", rhs, re.I):
+                return self._label(name, [("Yes", rhs)], "No", replace)
+            raise
+
+    def _label_rhs(self, name: str, rhs: str, replace: bool) -> LabelStep:
+        rhs = rhs.strip()
+        m = re.match(r"^if\s+(?P<c>.+?)\s+then\s+(?P<v>.+?)\s*,?\s+(?:else|otherwise)\s+(?P<d>.+)$", rhs, re.I)
+        if m:
+            return self._label(name, [(m.group("v"), m.group("c"))], m.group("d"), replace)
+        dm = re.search(r"\s*,?\s*\b(?:else|otherwise|or\s+else)\b[\s,:]*(?P<d>.+)$", rhs, re.I)
+        body = rhs[:dm.start()] if dm else rhs
+        cases = []
+        for part in re.split(r",\s*(?=(?:\"[^\"]*\"|'[^']*'|[^,]+?)\s+if\b)", body):
+            pm = re.match(r"^\s*(?P<v>\"[^\"]*\"|'[^']*'|.+?)\s+(?:if|when|where)\s+(?P<c>.+?)\s*$", part, re.I)
+            if not pm:
+                raise ParseError("Try: add column size = high if amount > 50000 else low")
+            cases.append((pm.group("v"), pm.group("c")))
+        return self._label(name, cases, dm.group("d") if dm else None, replace)
+
+    def _label(self, name: str, cases: list[tuple[str, str]], default: str | None, replace: bool) -> LabelStep:
+        if name in self.columns and not replace:
+            raise ParseError(f"There is already a column called {name}. Say 'set {name} = ...' to overwrite it.")
+        default = _unquote(default) if default else None
+        if default is not None and default.lower() in BLANK_WORDS:
+            default = None
+        return LabelStep(op="label", name=name, default=default, replace=replace,
+                         cases=[LabelCase(when=self.parse_filter(c), value=_unquote(v)) for v, c in cases])
+
+    def parse_expression(self, text: str) -> str:
+        """Plain-English arithmetic -> the engine's restricted formula, e.g. '18% of amount' -> '0.18 * [amount]'."""
+        t = text.strip().rstrip(".")
+        dd = DATEDIFF.match(t)
+        if dd:
+            if dd.group("dob"):
+                unit, a, b = "year", dd.group("dob"), "today"
+            else:
+                unit = dd.group("unit").lower()
+                a = dd.group("a") or dd.group("a2") or "today"
+                b = dd.group("b") or dd.group("b2") or dd.group("b3") or "today"
+            return f"{unit}s({self._date_operand(a)}, {self._date_operand(b)})"
+        rm = re.match(r"^round(?:ed)?\s*(?:off\s+)?\(?\s*(?P<x>.+?)\s*(?:,\s*|\s+to\s+)(?P<n>\d+)\s*(?:decimals?|(?:decimal\s+)?places?)?\s*\)?$", t, re.I)
+        if rm:
+            return f"round({self.parse_expression(rm.group('x'))}, {rm.group('n')})"
+        # "amount + 18%" means "amount increased by 18%", as people mean it, not amount + 0.18.
+        pm = re.match(r"^(?P<base>.+?)\s*(?P<op>[+-]|\bplus\b|\bminus\b)\s*(?P<p>\d+(?:\.\d+)?)\s*%$", t, re.I)
+        if pm:
+            sign = 1 if pm.group("op").lower() in ("+", "plus") else -1
+            return f"({self.parse_expression(pm.group('base'))}) * {_fmt(1 + sign * float(pm.group('p')) / 100)}"
+        # [bracketed] and "quoted" column names are set aside so "Amount (INR)" isn't split at its brackets.
+        held: list[str] = []
+        t = re.sub(r"\[[^\]]+\]|\"[^\"]*\"|'[^']*'", lambda m: held.append(m.group()[1:-1]) or f"__H{len(held) - 1}__", t)
+        t = re.sub(r"\bmultiplied\s+by\b|\btimes\b|×|(?<=\s)x(?=\s)", " * ", t, flags=re.I)
+        t = re.sub(r"\bdivided\s+by\b|÷", " / ", t, flags=re.I)
+        t = re.sub(r"\bplus\b", " + ", t, flags=re.I)
+        t = re.sub(r"\bminus\b", " - ", t, flags=re.I)
+        t = re.sub(r"%\s+of\b", "% * ", t, flags=re.I)
+        out = []
+        for tok in re.split(r"(\*|/|\+|\(|\)|,|(?:(?<=\s)|^)-(?=[\s\d(]))", t):
+            chunk = (tok or "").strip()
+            if not chunk:
+                continue
+            if chunk in ("*", "/", "+", "-", "(", ")", ","):
+                out.append(chunk)
+                continue
+            chunk = re.sub(r"__H(\d+)__", lambda m: held[int(m.group(1))], chunk)
+            out.append(self._operand(chunk))
+        if not out:
+            raise ParseError("What should the new column be? e.g. add column gst = amount * 0.18")
+        return " ".join(out)
+
+    def _operand(self, chunk: str) -> str:
+        if chunk.endswith("%") and parse_number(chunk[:-1]) is not None:
+            return _fmt(parse_number(chunk[:-1]) / 100)
+        n = parse_number(chunk)
+        if n is not None:
+            return _fmt(n)
+        if chunk.lower() in ("abs", "round"):
+            return chunk.lower()
+        if chunk.lower() in ("today", "now", "today's date"):
+            return "today()"
+        col = self.column(chunk)
+        if col:
+            return f"[{col}]"
+        if "-" in chunk:  # "credit-debit" without spaces
+            parts = chunk.split("-")
+            if all(self.column(p) or parse_number(p) is not None for p in parts):
+                return " - ".join(self._operand(p) for p in parts)
+        raise ParseError(f"I couldn't find a column called '{chunk}' for the formula. Columns: " + ", ".join(self.columns))
+
+    def _date_operand(self, text: str) -> str:
+        t = _unquote(text.strip())
+        if t.lower() in ("today", "now", "today's date", "current date", "the current date"):
+            return "today()"
+        col = self.column(t)
+        if col is None:
+            raise ParseError(f"I couldn't find a date column called '{t}'. Date columns: " + ", ".join(self.date_cols or ["(none)"]))
+        if col not in self.date_cols:
+            raise ParseError(f"'{col}' doesn't look like a date column. Date columns: " + ", ".join(self.date_cols or ["(none)"]))
+        return f"[{col}]"
 
     # ---------- cleaning ----------
 
@@ -1157,11 +1310,46 @@ def describe(step: Step) -> str:
             return "Rename " + ", ".join(f"{a} → {b}" for a, b in step.mapping.items())
         case "convert":
             return f"Convert {', '.join(step.columns)} to {step.to}"
+        case "compute":
+            formula = re.sub(r"\[([^\]]+)\]", r"\1", step.expr)
+            return f"{'Replace' if step.replace else 'Add'} column '{step.name}' = {formula}"
+        case "label":
+            rules = "; ".join(f"'{c.value}' if " + describe(c.when).removeprefix("Keep rows where ") for c in step.cases)
+            other = (f"; otherwise '{step.default}'" if step.default is not None
+                     else "; otherwise keep the current value" if step.replace else "; otherwise blank")
+            return f"{'Replace' if step.replace else 'Add'} column '{step.name}': {rules}{other}"
     return step.op
+
+
+def split_clauses(request: str) -> list[str]:
+    text = request.strip().translate(SMART_QUOTES)
+    # Quoted text ('"Rs. "', '", "') is set aside so the splitting below can't break it up.
+    quoted: list[str] = []
+    text = QUOTED.sub(lambda m: quoted.append(m.group()) or f"__Q{len(quoted) - 1}__", text)
+    text = re.sub(r",(?=[^\s\d])", ", ", text)  # "date,amount" -> "date, amount"; not "5,000"
+    clauses = []
+    for clause in CLAUSE_SPLIT.split(text):
+        if not clause or not clause.strip(" ,."):
+            continue
+        clause = re.sub(r"^(?:(?:and|also|then|now|please|actually|next|finally)\b[\s,]*)+", "", clause.strip(" ,."), flags=re.I)
+        clauses.append(re.sub(r"__Q(\d+)__", lambda m: quoted[int(m.group(1))], clause))
+    return clauses
 
 
 def make_plan(sheets: Sheets, request: str) -> Plan:
     try:
-        return Parser(sheets).parse(request)
+        clauses = split_clauses(request)
+        if not clauses:
+            raise ParseError("Tell me what you'd like to do with the data.")
+        steps: list[Step] = []
+        for i, clause in enumerate(clauses):
+            new = Parser(sheets).parse_clause(clause)
+            steps += new
+            if i < len(clauses) - 1:
+                # Later parts see the result so far: "add column gst = ... and sort by gst".
+                sheets = apply_plan(sheets, Plan(summary="", steps=new))
+        return Plan(summary="; ".join(describe(s) for s in steps) + ".", steps=steps)
     except ParseError as e:
         return Plan(clarification_question=str(e), summary="", steps=[])
+    except PlanError as e:
+        return Plan(clarification_question=f"That can't run on this data: {e}", summary="", steps=[])

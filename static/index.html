@@ -204,6 +204,7 @@ const EXAMPLES = [
   "sort by amount descending", "keep columns date, amount", "total amount by category", "remove duplicate rows",
   "pivot amount by category and txn type", "total amount by month", "top 10 by amount", "add % of total",
   "trim spaces", "fill blank branch with Unknown", 'replace "UPI/" with "" in description',
+  "add column gst = amount * 18%", "add column size = high if amount > 1 lakh else low", "add days since txn date",
 ];
 $("examples").innerHTML = EXAMPLES.map((e) => `<span class="chip">${esc(e)}</span>`).join("");
 $("examples").addEventListener("click", (e) => {

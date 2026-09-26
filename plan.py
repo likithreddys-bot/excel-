@@ -148,11 +148,32 @@ class ConvertStep(BaseModel):
     to: Literal["number", "date", "text"]
 
 
+class ComputeStep(BaseModel):
+    op: Literal["compute"]
+    name: str
+    expr: str = Field(description="Restricted formula: numbers, [column], + - * / ( ), "
+                                  "round(x, n), abs(x), days/weeks/months/years(start, end), today()")
+    replace: bool = Field(False, description="Overwrite an existing column of the same name")
+
+
+class LabelCase(BaseModel):
+    when: FilterStep
+    value: str
+
+
+class LabelStep(BaseModel):
+    op: Literal["label"]
+    name: str
+    cases: list[LabelCase] = Field(description="First matching case wins")
+    default: str | None = Field(None, description="Value when no case matches; None = blank")
+    replace: bool = False
+
+
 Step = Union[
     FilterStep, SelectColumnsStep, DropColumnsStep, SortStep, DedupeStep, GroupByStep,
     SplitByStep, PivotStep, TopNStep, DatePartStep, CalculateStep,
     CleanTextStep, FillBlanksStep, DropBlankRowsStep, ReplaceStep, SplitColumnStep,
-    MergeColumnsStep, RenameStep, ConvertStep,
+    MergeColumnsStep, RenameStep, ConvertStep, ComputeStep, LabelStep,
 ]
 
 

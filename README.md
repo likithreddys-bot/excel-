@@ -54,6 +54,11 @@ If a command can't be understood confidently, it asks instead of guessing: for e
 | Merge columns | `merge first and last into full name` · `combine city and state with ", " into location` |
 | Rename | `rename amt to amount` · `rename city to City Name and amt to Amount` |
 | Change type | `convert amt to number` (understands ₹, Rs., INR, commas) · `change txn date to date` · `make pan text` |
+| Calculated columns | `add column gst = amount * 0.18` · `add gst as 18% of amount` · `add column net = credit - debit` · `add column with tax = amount + 18%` (increase by 18%) · `add column per unit = amount / qty` · `add column double = [Amount (INR)] * 2` (brackets for names with symbols) |
+| Rounding | `round amount to 2 decimals` · `add column k = round(amount / 3, 1)` |
+| If / else labels | `add column size = high if amount > 50000 else low` · `add band: high if amount > 1 lakh, medium if amount > 10000, else low` · `add column status = 'Record Found' if result code is 101 otherwise 'Not Found'` · `add column big = amount > 100000` (Yes/No) · `label amount over 1 lakh as large, otherwise small` · `flag rows where amount > 50000` |
+| Dates | `add days since txn date` · `add column duration = days between start date and end date` · `add column m = months between start date and end date` · `add age from dob` |
+| Overwrite a column | `set amount = amount * 100` · `set category = Other if category is Cash` (other rows keep their value) |
 | Several at once | `only debits over 5000, split by category and sort by amount descending` |
 
 Understood automatically:
@@ -68,6 +73,12 @@ Understood automatically:
 - **Find & replace ignores case and matches inside text** in text columns, like Excel's default. In number columns it matches whole values only, so `replace 0 with blank` won't turn 10 into 1.
 - **Put text in quotes when it has spaces or punctuation:** `replace "Rs. " with ""`.
 
+**Formulas are restricted by design.** A command becomes a small formula such as `[amount] * 0.18`, which the engine's own calculator evaluates. It never uses Python `eval`, so a formula can only do arithmetic, `round`, `abs` and date differences.
+- **Math on a text column stops and says to convert it first**, rather than treating the text as blank.
+- **Dividing by zero gives a blank cell.**
+- **`add column x` won't overwrite an existing column.** Use `set x = ...` to do that on purpose.
+- **Later parts of a command can use columns created earlier in it**, e.g. `add column gst = amount * 0.18 and sort by gst`.
+
 **Workbooks with several sheets:** commands apply to the main data sheet, meaning the one with the most rows. Other sheets, such as a summary, are kept unchanged and included in the download.
 
 ## How it works
@@ -81,11 +92,11 @@ command ──► planner.py ──► Plan (typed steps) ──► engine.py (p
 | File | Role |
 |---|---|
 | `planner.py` | Rule-based parser: plain English → `Plan`, or a clarification question |
-| `plan.py` | The plan format: `filter`, `select_columns`, `drop_columns`, `sort`, `dedupe`, `group_by`, `split_by`, `pivot`, `top_n`, `date_part`, `calculate`, `clean_text`, `fill_blanks`, `drop_blank_rows`, `replace`, `split_column`, `merge_columns`, `rename`, `convert` |
+| `plan.py` | The plan format: `filter`, `select_columns`, `drop_columns`, `sort`, `dedupe`, `group_by`, `split_by`, `pivot`, `top_n`, `date_part`, `calculate`, `clean_text`, `fill_blanks`, `drop_blank_rows`, `replace`, `split_column`, `merge_columns`, `rename`, `convert`, `compute`, `label` |
 | `engine.py` | Executes a plan on pandas DataFrames; file loading and XLSX/CSV export |
 | `app.py` | FastAPI server: upload, plan (dry run), execute, undo/redo, download |
 | `static/index.html` | The web UI (chat on the left, spreadsheet preview on the right) |
-| `tests/` | Parser tests (`test_planner.py`), analysis (`test_analysis.py`), cleaning (`test_cleaning.py`) and end-to-end API tests (`test_app.py`) |
+| `tests/` | Parser tests (`test_planner.py`), analysis (`test_analysis.py`), cleaning (`test_cleaning.py`), formulas (`test_formulas.py`) and end-to-end API tests (`test_app.py`) |
 
 The parser only ever produces a `Plan`. The engine is the only code that touches the data. That separation keeps every result reproducible and every step visible to the user before it runs.
 

@@ -189,11 +189,7 @@ def _mask(df: pd.DataFrame, c: Condition) -> pd.Series:
 def _apply_step(df: pd.DataFrame, step: Step) -> Sheets | pd.DataFrame:
     match step.op:
         case "filter":
-            masks = [_mask(df, c) for c in step.conditions]
-            combined = masks[0]
-            for m in masks[1:]:
-                combined = (combined & m) if step.match == "all" else (combined | m)
-            return df[combined.fillna(False)]
+            return df[_filter_mask(df, step)]
         case "select_columns":
             _check_columns(df, step.columns)
             return df[step.columns]
@@ -267,7 +263,157 @@ def _apply_step(df: pd.DataFrame, step: Step) -> Sheets | pd.DataFrame:
         case "convert":
             _check_columns(df, step.columns)
             return df.assign(**{c: _convert(df[c], c, step.to) for c in step.columns})
+        case "compute":
+            _check_new_column(df, step.name, step.replace)
+            return df.assign(**{step.name: evaluate(df, step.expr)})
+        case "label":
+            _check_new_column(df, step.name, step.replace)
+            masks = [_filter_mask(df, case.when) for case in step.cases]
+            values = [case.value for case in step.cases] + ([step.default] if step.default is not None else [])
+            # Overwriting a column with no "else": rows that match no rule keep their current value.
+            keep = step.replace and step.default is None
+            numeric = all(re.fullmatch(r"-?\d+(\.\d+)?", v) for v in values) and (
+                not keep or pd.api.types.is_numeric_dtype(df[step.name]))
+            out = df[step.name].astype(object).copy() if keep else pd.Series(pd.NA, index=df.index, dtype=object)
+            if step.default is not None:
+                out[:] = float(step.default) if numeric else step.default
+            for mask, case in reversed(list(zip(masks, step.cases))):  # first matching case wins
+                out[mask] = float(case.value) if numeric else case.value
+            return df.assign(**{step.name: pd.to_numeric(out) if numeric else out})
     raise PlanError(f"Unknown step {step.op}")
+
+
+def _filter_mask(df: pd.DataFrame, step) -> pd.Series:
+    masks = [_mask(df, c) for c in step.conditions]
+    combined = masks[0]
+    for m in masks[1:]:
+        combined = (combined & m) if step.match == "all" else (combined | m)
+    return combined.fillna(False).astype(bool)
+
+
+def _check_new_column(df: pd.DataFrame, name: str, replace: bool) -> None:
+    if name in df.columns and not replace:
+        raise PlanError(f"There is already a column called {name}. Use 'set {name} = ...' to overwrite it.")
+
+
+# ---------- restricted formulas: numbers, [column], + - * / ( ), and a few functions ----------
+
+_TOKEN = re.compile(r"\s*(?:(?P<num>\d+(?:\.\d+)?)|\[(?P<col>[^\]]+)\]|(?P<fn>[a-z_]+)(?=\s*\()|(?P<op>[-+*/(),]))")
+_FUNCS = {"round", "abs", "days", "weeks", "months", "years", "today"}
+
+
+def evaluate(df: pd.DataFrame, expr: str) -> pd.Series:
+    tokens, pos = [], 0
+    while expr[pos:].strip():
+        m = _TOKEN.match(expr, pos)
+        if not m:
+            raise PlanError(f"Can't read the formula near '{expr[pos:].strip()}'")
+        tokens.append((m.lastgroup, m.group(m.lastgroup)))
+        pos = m.end()
+    ev = _Evaluator(df, tokens)
+    out = ev.expr()
+    if ev.i != len(tokens):
+        raise PlanError(f"Can't read the formula near '{tokens[ev.i][1]}'")
+    if not isinstance(out, pd.Series):
+        out = pd.Series(out, index=df.index)
+    if pd.api.types.is_float_dtype(out):
+        out = out.replace([float("inf"), float("-inf")], float("nan")).round(10)  # x/0 -> blank; 0.1*3 -> 0.3
+    return out
+
+
+class _Evaluator:
+    """Recursive-descent evaluator over pandas Series. Only the grammar below can run."""
+
+    def __init__(self, df: pd.DataFrame, tokens: list[tuple[str, str]]):
+        self.df, self.tokens, self.i = df, tokens, 0
+
+    def peek(self):
+        return self.tokens[self.i] if self.i < len(self.tokens) else (None, None)
+
+    def take(self, value=None):
+        kind, v = self.peek()
+        if kind is None or (value is not None and v != value):
+            raise PlanError(f"Formula expected '{value or 'a value'}'")
+        self.i += 1
+        return kind, v
+
+    def expr(self):
+        left = self.term()
+        while self.peek()[1] in ("+", "-"):
+            op = self.take()[1]
+            right = self.term()
+            left = _num(left) + _num(right) if op == "+" else _num(left) - _num(right)
+        return left
+
+    def term(self):
+        left = self.factor()
+        while self.peek()[1] in ("*", "/"):
+            op = self.take()[1]
+            right = self.factor()
+            left = _num(left) * _num(right) if op == "*" else _num(left) / _num(right)
+        return left
+
+    def factor(self):
+        kind, v = self.take()
+        if kind == "num":
+            return float(v)
+        if kind == "col":
+            _check_columns(self.df, [v])
+            return self.df[v]
+        if v == "-":
+            return -_num(self.factor())
+        if v == "(":
+            out = self.expr()
+            self.take(")")
+            return out
+        if kind == "fn" and v in _FUNCS:
+            self.take("(")
+            args = []
+            while self.peek()[1] != ")":
+                args.append(self.expr())
+                if self.peek()[1] == ",":
+                    self.take(",")
+            self.take(")")
+            return _call(v, args, self.df.index)
+        raise PlanError(f"Unexpected '{v}' in formula")
+
+
+def _num(x):
+    if not isinstance(x, pd.Series) or pd.api.types.is_numeric_dtype(x):
+        return x
+    out = pd.to_numeric(x, errors="coerce")
+    bad = x[out.isna() & ~_is_blank(x)]
+    if len(bad):
+        name = x.name or "a column"
+        raise PlanError(f"{name} has text like {str(bad.iloc[0])!r}, so it can't be used in a calculation. "
+                        f"Convert it first: convert {name} to number")
+    return out
+
+
+def _date_arg(a, index) -> pd.Series:
+    if isinstance(a, pd.Series):
+        return a if pd.api.types.is_datetime64_any_dtype(a) else _as_date(a)
+    return pd.Series(a, index=index)  # today()
+
+
+def _call(fn: str, args: list, index) -> pd.Series | float | pd.Timestamp:
+    if fn == "today":
+        return pd.Timestamp.today().normalize()
+    if fn == "round":
+        x, n = _num(args[0]), int(args[1]) if len(args) > 1 else 0
+        return x.round(n) if isinstance(x, pd.Series) else round(x, n)
+    if fn == "abs":
+        return abs(_num(args[0]))
+    if len(args) != 2:
+        raise PlanError(f"{fn}() needs a start and an end date")
+    start, end = (_date_arg(a, index) for a in args)
+    days = (end - start).dt.days
+    if fn == "days":
+        return days
+    if fn == "weeks":
+        return days // 7
+    months = (end.dt.year - start.dt.year) * 12 + (end.dt.month - start.dt.month) - (end.dt.day < start.dt.day)
+    return months if fn == "months" else months // 12
 
 
 def text_columns(df: pd.DataFrame) -> list[str]:
