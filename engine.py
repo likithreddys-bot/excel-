@@ -11,7 +11,9 @@ import zipfile
 
 import pandas as pd
 
-from plan import Condition, Plan, Step
+import xlsxwriter
+
+from plan import FORMAT_OPS, Condition, Plan, Step
 
 Sheets = dict[str, pd.DataFrame]
 
@@ -516,9 +518,12 @@ def apply_plan(sheets: Sheets, plan: Plan, files: dict[str, pd.DataFrame] | None
     for step in plan.steps:
         out: Sheets = {}
         for name, df in sheets.items():
-            if step.op in ("lookup", "append", "compare"):
+            if step.op in ("lookup", "append", "compare") or step.op in FORMAT_OPS:
                 sheet_notes: list[str] = []
-                result = _apply_file_step(df, step, files or {}, sheet_notes)
+                if step.op in FORMAT_OPS:
+                    result = _check_format(df, step, sheet_notes)  # data unchanged; applied in to_xlsx
+                else:
+                    result = _apply_file_step(df, step, files or {}, sheet_notes)
                 if notes is not None:
                     notes += [f"{name}: {n}" if len(sheets) > 1 else n for n in sheet_notes]
             else:
@@ -616,16 +621,180 @@ def row_counts(sheets: Sheets) -> dict[str, int]:
     return {name: len(df) for name, df in sheets.items()}
 
 
-def to_xlsx(sheets: Sheets) -> bytes:
+# ---------- formatting: highlights, number formats, charts (Excel download only) ----------
+
+NUMBER_FORMATS = {
+    # Indian grouping: 12,34,56,789.00
+    "rupees": '[>=10000000]"₹"##\\,##\\,##\\,##0.00;[>=100000]"₹"##\\,##\\,##0.00;"₹"#,##0.00',
+    "commas": "#,##0.00",
+    "percent": '0.00"%"',  # values like 15.79 are already percentages
+}
+
+
+def highlight_mask(df: pd.DataFrame, step) -> pd.Series:
+    if step.duplicates_in:
+        s = match_key(df[step.duplicates_in])
+        return s.duplicated(keep=False) & s.notna()
+    return _filter_mask(df, step.when)
+
+
+def _format_columns(step) -> list[str]:
+    match step.op:
+        case "highlight":
+            return ([c.column for c in step.when.conditions] if step.when else []) + \
+                   [c for c in (step.duplicates_in, step.column) if c]
+        case "number_format":
+            return step.columns or []
+        case "chart":
+            return [step.x] + ([step.y] if step.y else []) + ([c.column for c in step.when.conditions] if step.when else [])
+    return []
+
+
+def _check_format(df: pd.DataFrame, step, notes: list[str]) -> pd.DataFrame:
+    _check_columns(df, _format_columns(step))
+    if step.op == "highlight":
+        notes.append(f"{highlight_mask(df, step).sum():,} of {len(df):,} rows will be highlighted.")
+    if step.op == "number_format" and step.style == "date":
+        text = [c for c in (step.columns or []) if not pd.api.types.is_datetime64_any_dtype(df[c])]
+        if text:
+            raise PlanError(f"{', '.join(text)} isn't stored as dates. Convert it first: convert {text[0]} to date")
+    if step.op == "number_format" and step.style != "date":
+        text = [c for c in (step.columns or []) if not pd.api.types.is_numeric_dtype(df[c])]
+        if text:
+            raise PlanError(f"{', '.join(text)} holds text, so a number format won't show. Convert it first: "
+                            f"convert {text[0]} to number")
+    if step.op == "chart":
+        n = chart_data(df, step).shape[0]
+        if n > 50:
+            raise PlanError(f"That chart would have {n:,} bars/points. Chart by a column with fewer values.")
+    notes.append("Formatting and charts appear in the Excel download (not CSV).")
+    return df
+
+
+def chart_data(df: pd.DataFrame, step) -> pd.DataFrame:
+    if step.when:
+        df = df[_filter_mask(df, step.when)]
+    x = date_part(df[step.x], step.x_part) if step.x_part else df[step.x]
+    label = step.x_part or step.x
+    g = pd.Series(1, index=df.index) if step.y is None else _num(df[step.y])
+    out = g.groupby(x.rename(label), observed=True).agg("count" if step.y is None else step.func)
+    name = "count" if step.y is None else f"{step.func} of {step.y}"
+    return out.rename(name).reset_index()
+
+
+def preview_styles(df: pd.DataFrame, formats: list, rows: int) -> list[dict]:
+    """Highlight colours for the on-screen preview: per row, {"row": colour, "cells": {column: colour}}."""
+    styles = [{"row": None, "cells": {}} for _ in range(min(rows, len(df)))]
+    for step in formats:
+        if step.op != "highlight" or any(c not in df.columns for c in _format_columns(step)):
+            continue
+        for i, hit in enumerate(highlight_mask(df, step).head(rows)):
+            if hit and step.column:
+                styles[i]["cells"][str(step.column)] = step.color
+            elif hit:
+                styles[i]["row"] = step.color
+    return styles
+
+
+def _number_format(step) -> str:
+    if step.style == "date":
+        return step.date_pattern
+    if step.style == "decimals":
+        return "#,##0" + ("." + "0" * step.decimals if step.decimals else "")
+    return NUMBER_FORMATS[step.style]
+
+
+def _write_sheet(wb, fmt, name: str, df: pd.DataFrame, formats: list) -> None:
+    ws = wb.add_worksheet(name)
+    cols = [str(c) for c in df.columns]
+    live = [f for f in formats if all(str(c) in cols for c in _format_columns(f))]  # skip columns removed later
+
+    col_fmt: dict[int, str] = {}  # column index -> number format
+    for j, c in enumerate(df.columns):
+        s = df[c]
+        if pd.api.types.is_datetime64_any_dtype(s):
+            col_fmt[j] = "yyyy-mm-dd" if (s.dropna() == s.dropna().dt.normalize()).all() else "yyyy-mm-dd hh:mm"
+    for step in (f for f in live if f.op == "number_format"):
+        for c in step.columns or [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]:
+            col_fmt[cols.index(str(c))] = _number_format(step)
+
+    row_fill: dict[int, str] = {}              # row -> colour
+    cell_fill: dict[tuple[int, int], str] = {}  # (row, column) -> colour
+    for step in (f for f in live if f.op == "highlight"):
+        for i in highlight_mask(df, step).to_numpy().nonzero()[0]:
+            if step.column:
+                cell_fill[(i, cols.index(str(step.column)))] = step.color
+            else:
+                row_fill[i] = step.color
+
+    ws.freeze_panes(1, 0)
+    ws.write_row(0, 0, cols, fmt(bold=True, bg_color="#DDE3EA", border=1))
+    for j, c in enumerate(df.columns):
+        sample = [len(cols[j])] + [len(str(v)) for v in df[c].head(1000) if not pd.isna(v)]
+        ws.set_column(j, j, min(max(sample) + 2, 50), fmt(num_format=col_fmt[j]) if j in col_fmt else None)
+
+    # Dates go in as Excel date numbers so the column's date format applies (otherwise the writer's
+    # default date format wins).
+    out = df.assign(**{df.columns[j]: (df.iloc[:, j] - pd.Timestamp("1899-12-30")) / pd.Timedelta(days=1)
+                       for j in range(len(df.columns)) if pd.api.types.is_datetime64_any_dtype(df.iloc[:, j])})
+    values = out.astype(object).where(out.notna(), None).to_numpy().tolist()
+    for i, row in enumerate(values):
+        fill = row_fill.get(i)
+        if fill is None and not cell_fill:
+            ws.write_row(i + 1, 0, row)  # plain row: column formats apply
+            continue
+        for j, v in enumerate(row):
+            colour = cell_fill.get((i, j), fill)
+            if colour:  # a cell with its own fill must repeat the column's number format
+                ws.write(i + 1, j, v, fmt(bg_color="#" + colour, num_format=col_fmt.get(j)))
+            else:
+                ws.write(i + 1, j, v)
+
+
+def _write_chart(wb, fmt, sheets: Sheets, step, n: int) -> None:
+    data = chart_data(pd.concat(list(sheets.values()), ignore_index=True), step)
+    name = f"Chart {n}"
+    ws = wb.add_worksheet(name)
+    ws.write_row(0, 0, list(data.columns), fmt(bold=True, bg_color="#DDE3EA", border=1))
+    for i, row in enumerate(data.astype(object).where(data.notna(), None).to_numpy().tolist(), start=1):
+        ws.write_row(i, 0, row)
+    ws.set_column(0, 0, min(max(len(str(v)) for v in [data.columns[0], *data.iloc[:, 0]]) + 2, 40))
+    ws.set_column(1, 1, 18, fmt(num_format="#,##0.##"))
+    chart = wb.add_chart({"type": step.kind})
+    chart.add_series({"name": [name, 0, 1], "categories": [name, 1, 0, len(data), 0],
+                      "values": [name, 1, 1, len(data), 1], "data_labels": {"value": step.kind == "pie"}})
+    chart.set_title({"name": step.title})
+    if step.kind != "pie":
+        chart.set_legend({"none": True})
+    chart.set_size({"width": 720, "height": 400})
+    ws.insert_chart(1, 3, chart)
+
+
+def to_xlsx(sheets: Sheets, formats: list | None = None, unformatted: Sheets | None = None) -> bytes:
+    """`unformatted` sheets (e.g. a workbook's summary sheet) are written as-is, after the others."""
+    formats = formats or []
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        for name, df in sheets.items():
-            # Dates without a time of day are written as plain dates, not "2024-01-01 00:00:00".
-            for c in df.columns:
-                s = df[c]
-                if pd.api.types.is_datetime64_any_dtype(s) and (s.dropna() == s.dropna().dt.normalize()).all():
-                    df = df.assign(**{c: s.dt.date})
-            df.to_excel(writer, sheet_name=name, index=False)
+    wb = xlsxwriter.Workbook(buf, {"strings_to_urls": False, "strings_to_numbers": False,
+                                   "nan_inf_to_errors": True, "default_date_format": "yyyy-mm-dd"})
+    cache: dict[tuple, object] = {}
+
+    def fmt(**props):
+        """One Format object per distinct style (Excel files have a limit on how many styles they hold)."""
+        props = {k: v for k, v in props.items() if v is not None}
+        key = tuple(sorted(props.items()))
+        if key not in cache:
+            cache[key] = wb.add_format(props)
+        return cache[key]
+
+    for name, df in sheets.items():
+        _write_sheet(wb, fmt, name, df, formats)
+    for name, df in (unformatted or {}).items():
+        _write_sheet(wb, fmt, name, df, [])
+    all_columns = {str(c) for df in sheets.values() for c in df.columns}
+    for n, step in enumerate([f for f in formats if f.op == "chart"], start=1):
+        if all(str(c) in all_columns for c in _format_columns(step)):
+            _write_chart(wb, fmt, sheets, step, n)
+    wb.close()
     return buf.getvalue()
 
 

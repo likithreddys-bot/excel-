@@ -62,6 +62,9 @@ If a command can't be understood confidently, it asks instead of guessing: for e
 | Lookup (VLOOKUP) | `bring email and phone from customers on pan` · `lookup email from customers using pan` · `match with customers on pan` (all their columns) · `bring score from ref matching pan with pan number` (keys named differently) |
 | Append files | `append march` · `add the rows from march` |
 | Compare files | `rows not in march on pan` · `rows in march but not here` · `rows also in customers on pan` · `rows in both files` (without `on …`, a clear ID column like pan is used, otherwise whole rows) |
+| Highlight | `highlight rows where amount > 1 lakh in red` · `highlight amount above 50000` (just those cells) · `highlight debits in green` · `highlight duplicates in pan` · `highlight blanks in branch` |
+| Number formats | `show amount in rupees` (₹12,34,567.00) · `format balance with commas` · `show amount with 0 decimals` · `show % of total sum_amount as percent` · `show txn date as dd-mmm-yyyy` |
+| Charts | `bar chart of total amount by category` · `line chart of amount by month` · `pie chart of count by txn type` · `horizontal bar chart of average amount by branch` · `chart debits amount by category` |
 | Several at once | `only debits over 5000, split by category and sort by amount descending` |
 
 Understood automatically:
@@ -88,6 +91,14 @@ Understood automatically:
 - **Appending reports columns that exist in only one of the files.** Comparing reports rows with a blank key.
 - **A file whose name is also a column** only counts as the file when it's clearly used that way: `from amount`, `amount.xlsx`, `amount file`.
 
+**Formatting changes only the Excel download, never the data.**
+- **Every XLSX download has a bold, shaded, frozen header row and fitted column widths.**
+- **Highlights also show in the on-screen preview**, and the preview card says how many rows will be highlighted.
+- **Highlights are worked out on the final data**, so they still apply after later filters or sorts.
+- **Charts go on their own "Chart N" sheet** with a small summary table. Your data isn't grouped to make them.
+- **CSV downloads have no formatting.**
+- **A date format on dates stored as text** (e.g. "15/11/2024") adds a visible "convert to date" step first.
+
 **Workbooks with several sheets:** commands apply to the main data sheet, meaning the one with the most rows. Other sheets, such as a summary, are kept unchanged and included in the download.
 
 ## How it works
@@ -101,11 +112,11 @@ command ──► planner.py ──► Plan (typed steps) ──► engine.py (p
 | File | Role |
 |---|---|
 | `planner.py` | Rule-based parser: plain English → `Plan`, or a clarification question |
-| `plan.py` | The plan format: `filter`, `select_columns`, `drop_columns`, `sort`, `dedupe`, `group_by`, `split_by`, `pivot`, `top_n`, `date_part`, `calculate`, `clean_text`, `fill_blanks`, `drop_blank_rows`, `replace`, `split_column`, `merge_columns`, `rename`, `convert`, `compute`, `label`, `lookup`, `append`, `compare` |
-| `engine.py` | Executes a plan on pandas DataFrames; file loading and XLSX/CSV export |
+| `plan.py` | The plan format: `filter`, `select_columns`, `drop_columns`, `sort`, `dedupe`, `group_by`, `split_by`, `pivot`, `top_n`, `date_part`, `calculate`, `clean_text`, `fill_blanks`, `drop_blank_rows`, `replace`, `split_column`, `merge_columns`, `rename`, `convert`, `compute`, `label`, `lookup`, `append`, `compare`, `highlight`, `number_format`, `chart` |
+| `engine.py` | Executes a plan on pandas DataFrames; file loading; XLSX export (xlsxwriter, with formatting and charts) and CSV |
 | `app.py` | FastAPI server: upload, extra files, plan (dry run with notes), execute, undo/redo, download |
 | `static/index.html` | The web UI (chat on the left, spreadsheet preview on the right) |
-| `tests/` | Parser tests (`test_planner.py`), analysis (`test_analysis.py`), cleaning (`test_cleaning.py`), formulas (`test_formulas.py`), other files (`test_files.py`) and end-to-end API tests (`test_app.py`) |
+| `tests/` | Parser tests (`test_planner.py`), analysis (`test_analysis.py`), cleaning (`test_cleaning.py`), formulas (`test_formulas.py`), other files (`test_files.py`), formatting (`test_formatting.py`) and end-to-end API tests (`test_app.py`) |
 
 The parser only ever produces a `Plan`. The engine is the only code that touches the data. That separation keeps every result reproducible and every step visible to the user before it runs.
 

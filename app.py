@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 import engine
 from engine import PlanError, Sheets
-from plan import Plan
+from plan import FORMAT_OPS, Plan
 from planner import describe, make_plan
 
 PREVIEW_ROWS = 100
@@ -38,6 +38,10 @@ class Session:
     def __post_init__(self):
         self.current = self.original
 
+    def formats(self) -> list:
+        """Active formatting steps (highlights, number formats, charts), applied in the Excel download."""
+        return [st for _, p in self.applied[: self.pointer] for st in p.steps if st.op in FORMAT_OPS]
+
     def recompute(self):
         sheets = self.original
         for _, plan in self.applied[: self.pointer]:
@@ -54,18 +58,19 @@ def get_session(sid: str) -> Session:
     return sessions[sid]
 
 
-def sheets_payload(sheets: Sheets) -> list[dict]:
+def sheets_payload(sheets: Sheets, formats: list) -> list[dict]:
     out = []
     for name, df in sheets.items():
         head = json.loads(df.head(PREVIEW_ROWS).to_json(orient="split", index=False, date_format="iso"))
-        out.append({"name": name, "rows": len(df), "columns": head["columns"], "data": head["data"]})
+        out.append({"name": name, "rows": len(df), "columns": head["columns"], "data": head["data"],
+                    "styles": engine.preview_styles(df, formats, PREVIEW_ROWS)})
     return out
 
 
 def state(s: Session) -> dict:
     return {
         "filename": s.filename,
-        "sheets": sheets_payload(s.current),
+        "sheets": sheets_payload(s.current, s.formats()),
         "kept_sheets": list(s.kept),
         "files": [{"name": n, "rows": len(df), "columns": [str(c) for c in df.columns]} for n, df in s.files.items()],
         "history": [
@@ -137,7 +142,7 @@ def plan(req: PlanRequest):
         "plan": p.model_dump(),
         "rows_before": sum(engine.row_counts(s.current).values()),
         "rows_after": engine.row_counts(result),
-        "notes": notes,
+        "notes": list(dict.fromkeys(notes)),
     }
 
 
@@ -180,14 +185,12 @@ def redo(req: SessionRequest):
 def download(sid: str, fmt: str = "xlsx"):
     s = get_session(sid)
     stem = s.filename.rsplit(".", 1)[0] + "_result"
-    sheets = dict(s.current)
-    for name, df in s.kept.items():
-        sheets[name if name not in sheets else f"{name} (original)"[:31]] = df
+    kept = {name if name not in s.current else f"{name} (original)"[:31]: df for name, df in s.kept.items()}
     if fmt == "csv":
-        data, ext = engine.to_csv(sheets)
+        data, ext = engine.to_csv({**s.current, **kept})
         media = "text/csv" if ext == "csv" else "application/zip"
     else:
-        data, ext = engine.to_xlsx(sheets), "xlsx"
+        data, ext = engine.to_xlsx(s.current, s.formats(), unformatted=kept), "xlsx"
         media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     return Response(
         data,

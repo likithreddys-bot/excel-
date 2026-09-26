@@ -190,13 +190,42 @@ class CompareStep(BaseModel):
     keep: Literal["only_here", "only_there", "both"]
 
 
+class HighlightStep(BaseModel):
+    op: Literal["highlight"]
+    when: FilterStep | None = Field(None, description="Rows to highlight; None when using duplicates_in")
+    duplicates_in: str | None = Field(None, description="Highlight rows whose value in this column repeats")
+    column: str | None = Field(None, description="Colour only this column's cells; None = the whole row")
+    color: str = Field(description="Hex colour, e.g. FFF2CC")
+
+
+class NumberFormatStep(BaseModel):
+    op: Literal["number_format"]
+    columns: list[str] | None = Field(None, description="None = all number columns")
+    style: Literal["rupees", "commas", "percent", "decimals", "date"]
+    decimals: int = 2
+    date_pattern: str = "DD/MM/YYYY"
+
+
+class ChartStep(BaseModel):
+    op: Literal["chart"]
+    kind: Literal["column", "bar", "line", "pie"]
+    x: str
+    x_part: Literal["year", "quarter", "month", "week", "weekday", "day"] | None = None
+    y: str | None = Field(None, description="None = count rows")
+    func: Literal["sum", "mean", "count", "min", "max"]
+    title: str
+    when: FilterStep | None = Field(None, description="Chart only these rows; the data itself isn't filtered")
+
+
 Step = Union[
     FilterStep, SelectColumnsStep, DropColumnsStep, SortStep, DedupeStep, GroupByStep,
     SplitByStep, PivotStep, TopNStep, DatePartStep, CalculateStep,
     CleanTextStep, FillBlanksStep, DropBlankRowsStep, ReplaceStep, SplitColumnStep,
     MergeColumnsStep, RenameStep, ConvertStep, ComputeStep, LabelStep,
-    LookupStep, AppendStep, CompareStep,
+    LookupStep, AppendStep, CompareStep, HighlightStep, NumberFormatStep, ChartStep,
 ]
+
+FORMAT_OPS = ("highlight", "number_format", "chart")  # change only the Excel download, not the data
 
 
 class Plan(BaseModel):

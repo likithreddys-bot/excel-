@@ -127,7 +127,12 @@ function renderSheet() {
     .map((s, i) => `<div class="tab ${i === activeSheet ? "active" : ""}" data-i="${i}">${esc(s.name)} (${s.rows.toLocaleString()})</div>`).join("");
   const s = sheets[activeSheet];
   const head = "<tr>" + s.columns.map((c) => `<th>${esc(c)}</th>`).join("") + "</tr>";
-  const body = s.data.map((r) => "<tr>" + r.map((v) => `<td>${esc(v)}</td>`).join("") + "</tr>").join("");
+  // Highlights from "highlight ..." commands, so they can be checked before downloading.
+  const bg = (colour) => (colour ? ` style="background:#${esc(colour)}"` : "");
+  const body = s.data.map((r, i) => {
+    const st = (s.styles && s.styles[i]) || { row: null, cells: {} };
+    return `<tr${bg(st.row)}>` + r.map((v, j) => `<td${bg(st.cells[s.columns[j]])}>${esc(v)}</td>`).join("") + "</tr>";
+  }).join("");
   const more = s.rows > s.data.length ? `<p style="padding:4px 8px;color:#57606a">Showing first ${s.data.length} of ${s.rows.toLocaleString()} rows</p>` : "";
   $("grid").innerHTML = `<table>${head}${body}</table>${more}`;
 }
@@ -236,6 +241,7 @@ const EXAMPLES = [
   "pivot amount by category and txn type", "total amount by month", "top 10 by amount", "add % of total",
   "trim spaces", "fill blank branch with Unknown", 'replace "UPI/" with "" in description',
   "add column gst = amount * 18%", "add column size = high if amount > 1 lakh else low", "add days since txn date",
+  "highlight rows where amount > 1 lakh in red", "show amount in rupees", "bar chart of total amount by category",
 ];
 $("examples").innerHTML = EXAMPLES.map((e) => `<span class="chip">${esc(e)}</span>`).join("");
 $("examples").addEventListener("click", (e) => {

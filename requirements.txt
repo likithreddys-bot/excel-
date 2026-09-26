@@ -3,3 +3,4 @@ uvicorn==0.54.0
 python-multipart==0.0.32
 pandas==3.0.6
 openpyxl==3.1.5
+xlsxwriter==3.2.9

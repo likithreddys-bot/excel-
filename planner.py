@@ -18,7 +18,7 @@ import pandas as pd
 from engine import PlanError, Sheets, apply_plan, date_part
 from plan import (
     Aggregation, CalculateStep, CleanTextStep, ComputeStep, Condition, ConvertStep, DatePartStep, DedupeStep,
-    AppendStep, CompareStep, DropBlankRowsStep, DropColumnsStep, FillBlanksStep, FilterStep, GroupByStep, LabelCase, LabelStep, LookupStep, MergeColumnsStep,
+    AppendStep, ChartStep, CompareStep, HighlightStep, NumberFormatStep, DropBlankRowsStep, DropColumnsStep, FillBlanksStep, FilterStep, GroupByStep, LabelCase, LabelStep, LookupStep, MergeColumnsStep,
     PivotStep, Plan, RenameStep, ReplaceStep, SelectColumnsStep, SortStep, SplitByStep, SplitColumnStep,
     Step, TopNStep,
 )
@@ -60,7 +60,8 @@ VERB = (r"(?:sort|order|arrange|split|segregate|separate|keep|remove|drop|delete
         r"|show|dedupe|group|select|get|give|calculate|compute|find|hide|add|rank|pivot|top|bottom"
         r"|rename|replace|trim|fill|merge|combine|convert|change|make|capitali[sz]e"
         r"|create|insert|set|update|round|label|tag|flag|mark"
-        r"|bring|look\s*up|lookup|vlookup|xlookup|fetch|pull|append|compare|match)")
+        r"|bring|look\s*up|lookup|vlookup|xlookup|fetch|pull|append|compare|match"
+        r"|highlight|colou?r|shade|format|display|draw|plot)")
 CLAUSE_SPLIT = re.compile(
     rf"\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|then|also|and)\s+(?={VERB}\b)"
     rf"|,\s*(?={VERB}\b))\s*", re.I)
@@ -97,6 +98,17 @@ DATEDIFF = re.compile(
     r"(?:(?:since|from|after)\s+(?P<a>.+?)(?:\s+(?:to|until|till)\s+(?P<b>.+?))?"
     r"|between\s+(?P<a2>.+?)\s+and\s+(?P<b2>.+?)|(?:until|till|to|before)\s+(?P<b3>.+?))\s*$"
     r"|^age\s+(?:from|of|using|based\s+on)\s+(?P<dob>.+?)\s*$", re.I)
+COLORS = {"yellow": "FFF2CC", "red": "F4CCCC", "green": "D9EAD3", "blue": "CFE2F3", "orange": "FCE5CD",
+          "purple": "D9D2E9", "pink": "F8D7E3", "grey": "E7E6E6",
+          "dark yellow": "FFD966", "dark red": "E06666", "dark green": "93C47D", "dark blue": "6FA8DC",
+          "dark orange": "F6B26B", "dark purple": "8E7CC3", "dark pink": "E48FB0", "dark grey": "B7B7B7"}
+COLOR_NAMES = {v: k for k, v in COLORS.items()}
+NUMBER_FORMAT = re.compile(
+    r"^\s*(?:please\s+)?(?:format|show|display|make|set|put)\s+(?:the\s+)?(?P<cols>.+?)\s+(?:as|in|with|to|using)\s+(?:an?\s+)?"
+    r"(?P<style>rupees?|inr|₹|indian\s+(?:rupees?|format|currency)|currency|money|commas?|comma\s+separators?"
+    r"|thousands?\s+separators?|percent(?:age)?s?|%|(?P<dec>\d+|no|zero|one|two|three)\s+decimals?(?:\s+places?)?"
+    r"|whole\s+numbers?|integers?|(?P<date>(?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)))"
+    r"(?:\s+format)?\s*$", re.I)
 NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
 
 
@@ -314,6 +326,10 @@ class Parser:
             fm = self.find_file(cl)
             if fm:
                 return self.parse_file_command(cl, fm)
+        # Formatting first: "highlight duplicates in pan" must colour rows, never remove them.
+        formatting = self.parse_format_command(cl)
+        if formatting is not None:
+            return formatting
         if re.search(r"\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b", low):
             return [self.parse_dedupe(cl)]
         formula = self.parse_formula_command(cl)
@@ -718,6 +734,118 @@ class Parser:
                 return group[0]
         options = ", ".join(c for c, _ in (ids or codes or common)) or "(no columns in common)"
         raise ParseError(f"Which column should I match on? Try: '... on pan'. Columns in both: {options}")
+
+    # ---------- formatting: highlight, number formats, charts ----------
+
+    def parse_format_command(self, cl: str) -> list[Step] | None:
+        """Commands that only change how the Excel download looks. None if `cl` isn't one."""
+        low = cl.lower()
+        if re.match(r"^\s*(?:please\s+)?(?:highlight|colou?r|shade)\b", low):
+            return [self.parse_highlight(cl)]
+        if re.search(r"\b(?:chart|graph|plot)\b", low):
+            return [self.parse_chart(cl)]
+        m = NUMBER_FORMAT.match(cl)
+        if m:
+            return self.parse_number_format(m)
+        return None
+
+    def parse_highlight(self, cl: str) -> HighlightStep:
+        color = COLORS["yellow"]
+        cm = re.search(r"\s*\b(?:in|with|as|using)?\s*(?P<shade>light|pale|dark|bright)?\s*"
+                       r"(?P<c>yellow|red|green|blue|orange|purple|pink|gr[ae]y)\b(?:\s+colou?r)?", cl, re.I)
+        if cm:
+            base = cm.group("c").lower().replace("gray", "grey")
+            color = COLORS[("dark " if (cm.group("shade") or "").lower() in ("dark", "bright") else "") + base]
+            cl = cl[:cm.start()] + " " + cl[cm.end():]
+        body = re.sub(r"^\s*(?:please\s+)?(?:highlight|colou?r|shade)\s+(?:all\s+)?(?:the\s+)?", "", cl, flags=re.I).strip()
+        rows = bool(re.match(r"(?:rows?|records?|transactions?|entries|lines)\b", body, re.I))
+        body = re.sub(r"^(?:rows?|records?|transactions?|entries|lines)\s+(?:where|with|that\s+have|having|which\s+have|whose|if|for)?\s*",
+                      "", body, flags=re.I)
+        m = re.match(r"^(?:the\s+)?(?:duplicates?|duplicate\s+values?|repeated\s+values?|repeats?)\s+(?:in|of|on)\s+(?P<c>.+)$", body, re.I) \
+            or re.match(r"^(?:duplicate|repeated)\s+(?P<c>.+)$", body, re.I)
+        if m:
+            col = self.column(m.group("c"))
+            if col is None:
+                raise ParseError(f"Which column should I check for duplicates? Columns: {', '.join(self.columns)}")
+            return HighlightStep(op="highlight", duplicates_in=col, column=None if rows else col, color=color)
+        m = re.match(r"^(?:the\s+)?(?:blanks?|empty(?:\s+cells?)?|missing(?:\s+values?)?)\s+(?:in|of)\s+(?P<c>.+)$", body, re.I) \
+            or re.match(r"^(?:blank|empty|missing)\s+(?P<c>.+)$", body, re.I)
+        if m:
+            col = self.column(m.group("c"))
+            if col is None:
+                raise ParseError(f"Which column should I check for blanks? Columns: {', '.join(self.columns)}")
+            when = FilterStep(op="filter", conditions=[Condition(column=col, operator="is_empty")], match="all")
+            return HighlightStep(op="highlight", when=when, column=None if rows else col, color=color)
+        when = self.parse_filter(body)
+        # "highlight amount above 50000" colours those cells; "highlight debits" (no column named) colours rows.
+        starts_with_column = any(m.start == 0 for m in self.find_columns(body))
+        column = None if rows or not starts_with_column else when.conditions[0].column
+        return HighlightStep(op="highlight", when=when, column=column, color=color)
+
+    def parse_number_format(self, m: re.Match) -> list[Step]:
+        style_text = m.group("style").lower()
+        if m.group("date"):
+            style, decimals, pattern = "date", 2, m.group("date").upper()
+        elif re.match(r"rupee|inr|₹|indian|currency|money", style_text):
+            style, decimals, pattern = "rupees", 2, None
+        elif re.match(r"comma|thousand", style_text):
+            style, decimals, pattern = "commas", 2, None
+        elif re.match(r"percent|%", style_text):
+            style, decimals, pattern = "percent", 2, None
+        else:
+            n = m.group("dec")
+            style, pattern = "decimals", None
+            decimals = 0 if not n or n.lower() in ("no", "zero") else int(NUMBER_WORDS.get(n.lower(), n))
+        cols_text = m.group("cols")
+        if re.fullmatch(r"\s*(?:all\s+)?(?:the\s+)?(?:numbers?|number\s+columns?|numeric\s+columns?|values?|everything)\s*", cols_text, re.I):
+            cols = None
+        else:
+            cols = self._column_list(cols_text, "format")
+        steps: list[Step] = []
+        if style == "date":
+            text_dates = [c for c in (cols or []) if c in self.date_cols and not pd.api.types.is_datetime64_any_dtype(self.df[c])]
+            if text_dates:  # "15/11/2024" stored as text can't take a date format; convert it (shown in the preview)
+                steps.append(ConvertStep(op="convert", columns=text_dates, to="date"))
+        kwargs = {"date_pattern": pattern} if pattern else {}
+        return steps + [NumberFormatStep(op="number_format", columns=cols, style=style, decimals=decimals, **kwargs)]
+
+    def parse_chart(self, cl: str) -> ChartStep:
+        low = cl.lower()
+        kind = ("pie" if "pie" in low else "line" if re.search(r"\b(?:line|trend)\b", low)
+                else "bar" if "horizontal" in low else "column")
+        body = re.sub(r"\b(?:(?:make|create|add|draw|show|give\s+me|insert|plot)\s+)?(?:(?:as|in)\s+)?(?:an?\s+)?"
+                      r"(?:(?:horizontal|vertical)\s+)?(?:bar|column|line|pie|trend)?\s*(?:chart|graph|plot)\b\s*(?:of|for|showing|with)?",
+                      " ", cl, flags=re.I)
+        body, filters = self.extra_filters(body)
+        m = GROUP_MARKER.search(body)
+        if not m:
+            raise ParseError("Chart by what? e.g. 'bar chart of total amount by category' or 'line chart of amount by month'")
+        head, tail = _move_period_words(body[:m.start()], body[m.end():])
+        funcs = self._funcs(head.lower())
+        values = [x.column for x in self.find_columns(head)]
+        if len(values) > 1:
+            raise ParseError("A chart shows one column at a time. Which one: " + ", ".join(values) + "?")
+        if not values and re.search(r"\b(?:it|that|this|them|those|the\s+result|the\s+totals?)\b", head, re.I):
+            values = [self.default_number_column()]  # "…and add a pie chart of it": the number just calculated
+        prefix, found = self.dims(tail)
+        xs = list(dict.fromkeys(x.column for x in found))
+        if len(xs) != 1:
+            raise ParseError("Chart by which one column? e.g. '... by category' or '... by month'")
+        func = funcs[0] if funcs else ("sum" if values else "count")
+        if func == "nunique":
+            func = "count"
+        y = None if func == "count" and not values else (values[0] if values else self.default_number_column())
+        if func == "count":
+            y = None
+        x, x_part = xs[0], None
+        if prefix:  # "by month": chart by the month of the date column, without adding a column to the data
+            x, x_part = prefix[0].column, prefix[0].part
+        self._check_width([xs[0]], prefix, "chart bars")
+        title = {"sum": "Total", "mean": "Average", "count": "Count", "min": "Minimum", "max": "Maximum"}[func]
+        title += f" {y}" if y else ""
+        title += f" by {x_part or x}"
+        return ChartStep(op="chart", kind=kind, x=x, x_part=x_part, y=y, func=func, title=title[0].upper() + title[1:],
+                         when=filters[0] if filters else None)
 
     # ---------- calculated columns ----------
 
@@ -1444,6 +1572,19 @@ def describe(step: Step) -> str:
             return {"only_here": f"Keep rows that are not in {step.file} ({by})",
                     "only_there": f"Show rows of {step.file} that are not in this data ({by})",
                     "both": f"Keep rows that are also in {step.file} ({by})"}[step.keep]
+        case "highlight":
+            colour = COLOR_NAMES.get(step.color, f"#{step.color}")
+            target = f"{step.column} cells" if step.column else "rows"
+            rule = (f"with a repeated {step.duplicates_in}" if step.duplicates_in
+                    else "where " + describe(step.when).removeprefix("Keep rows where "))
+            return f"Highlight {target} {rule} in {colour} (Excel download)"
+        case "number_format":
+            what = {"rupees": "rupees (₹12,34,567.00)", "commas": "numbers with commas", "percent": "percent",
+                    "decimals": f"{step.decimals} decimal places", "date": step.date_pattern}[step.style]
+            return f"Show {', '.join(step.columns) if step.columns else 'all number columns'} as {what} (Excel download)"
+        case "chart":
+            only = " for rows where " + describe(step.when).removeprefix("Keep rows where ") if step.when else ""
+            return f"Add a {step.kind} chart '{step.title}'{only} on a new sheet (Excel download)"
     return step.op
 
 
