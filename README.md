@@ -17,7 +17,13 @@ pip install -r requirements.txt
 python -m uvicorn app:app --port 8000
 ```
 
-Open http://localhost:8000 and upload a CSV or XLSX file. `samples/bank_transactions.csv` is a synthetic file to try it with.
+Open http://localhost:8000 and upload a CSV or XLSX file.
+
+This repository contains no data files. To create a synthetic file to try it with (fake bank transactions, 5,000 rows):
+
+```bash
+python -c "import sys; sys.path.insert(0, 'tests'); from test_planner import make_bank_df; import os; os.makedirs('samples', exist_ok=True); make_bank_df(5000).to_csv('samples/bank_transactions.csv', index=False)"
+```
 
 ## Using it
 
@@ -135,7 +141,7 @@ python -m pytest
 ## Data handling
 
 - Uploaded files are held **in memory only**, one session per upload, and are lost when the server restarts. Nothing is written to disk.
-- `.gitignore` blocks all `.csv` / `.xlsx` files except the synthetic sample, so real data can't be committed by accident.
+- `.gitignore` blocks all `.csv` / `.xlsx` / `.xls` / `.zip` files and the `samples/` folder, so no data can be committed by accident. The repository is code only.
 
 ## Known limitations
 

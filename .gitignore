@@ -11,14 +11,13 @@ venv/
 .DS_Store
 Thumbs.db
 
-# Real data must never be committed (customer/bank data).
-# Only the synthetic sample in samples/ is tracked.
+# No data files are ever committed - not even samples. Code only.
 *.csv
 *.xlsx
 *.xlsm
 *.xls
 *.zip
-!samples/*.csv
+samples/
 
 # Secrets
 .env
