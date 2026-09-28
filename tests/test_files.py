@@ -3,9 +3,7 @@ import io
 
 import pandas as pd
 import pytest
-from fastapi.testclient import TestClient
 
-import app
 import engine
 from planner import make_plan
 
@@ -207,8 +205,8 @@ def xlsx(df):
     return b.getvalue()
 
 
-def test_app_add_file_lookup_undo_redo():
-    c = TestClient(app.app)
+def test_app_add_file_lookup_undo_redo(client):
+    c = client
     sid = c.post("/api/upload", files={"file": ("main.xlsx", xlsx(main_df()))}).json()["session_id"]
     st = c.post("/api/files", data={"session_id": sid}, files={"file": ("customers.xlsx", xlsx(customers()))}).json()
     assert st["files"][0]["name"] == "customers"
@@ -220,8 +218,8 @@ def test_app_add_file_lookup_undo_redo():
     assert "email" in c.post("/api/redo", json={"session_id": sid}).json()["sheets"][0]["columns"]
 
 
-def test_app_unknown_file_mentions_do_not_break_planning():
-    c = TestClient(app.app)
+def test_app_unknown_file_mentions_do_not_break_planning(client):
+    c = client
     sid = c.post("/api/upload", files={"file": ("main.xlsx", xlsx(main_df()))}).json()["session_id"]
     r = c.post("/api/plan", json={"session_id": sid, "message": "bring email from customers on pan"}).json()
     assert "clarification_question" in r or "error" in r

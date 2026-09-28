@@ -40,6 +40,7 @@
   #history { padding: 0 16px 12px; font-size: 13px; color: #57606a; max-height: 120px; overflow-y: auto; }
   #history li.inactive { text-decoration: line-through; opacity: .6; }
   #extra-files .chip { cursor: default; }
+  #user { color: #57606a; font-size: 13px; }
   .notes { margin-top: 6px; padding: 6px 8px; background: #fff8e1; border-radius: 6px; font-size: 13px; }
   .hidden { display: none !important; }
 </style>
@@ -70,6 +71,8 @@
     <button id="redo" disabled>Redo</button>
     <button id="dl-xlsx" disabled>Download XLSX</button>
     <button id="dl-csv" disabled>Download CSV</button>
+    <span id="user" title=""></span>
+    <button id="logout" title="Log out and delete your uploaded data now">Log out</button>
   </div>
   <div id="drop">Drop a CSV or XLSX file here<br>or use “Upload file”</div>
   <div id="tabs" class="hidden"></div>
@@ -94,12 +97,44 @@ function addMsg(html, cls) {
   return div;
 }
 
-async function api(path, body) {
-  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || res.statusText);
-  return data;
+// Every API call goes through here: an expired login goes back to the login page.
+async function send(path, options) {
+  const res = await fetch(path, options);
+  if (res.status === 401) { location.href = "/login"; throw new Error("Please log in again."); }
+  if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+  return res;
 }
+
+async function api(path, body) {
+  const res = await send(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return res.json();
+}
+
+async function download(fmt) {
+  try {
+    const res = await send(`/api/download/${sessionId}?fmt=${fmt}`);
+    const name = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "")?.[1] || `result.${fmt}`;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(await res.blob());
+    a.download = name;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (err) {
+    addMsg(esc(err.message), "err");
+  }
+}
+
+fetch("/api/me").then((r) => (r.status === 401 ? (location.href = "/login") : r.json())).then((me) => {
+  if (!me || !me.user) return;
+  $("user").textContent = me.user;
+  addMsg(`Logged in as <b>${esc(me.user)}</b>. Your uploaded data is deleted after ${me.idle_minutes} minutes ` +
+    `without activity, or as soon as you log out.`, "bot");
+});
+
+$("logout").onclick = async () => {
+  await fetch("/api/logout", { method: "POST" });
+  location.href = "/login";
+};
 
 function render(state) {
   sheets = state.sheets;
@@ -147,9 +182,7 @@ async function uploadFile(file) {
   fd.append("file", file);
   addMsg(`Uploading ${esc(file.name)}…`, "bot");
   try {
-    const res = await fetch("/api/upload", { method: "POST", body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail);
+    const data = await (await send("/api/upload", { method: "POST", body: fd })).json();
     sessionId = data.session_id;
     activeSheet = 0;
     render(data);
@@ -174,9 +207,7 @@ $("extra-file").onchange = async (e) => {
   fd.append("session_id", sessionId);
   fd.append("file", file);
   try {
-    const res = await fetch("/api/files", { method: "POST", body: fd });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail);
+    const data = await (await send("/api/files", { method: "POST", body: fd })).json();
     render(data);
     const f = data.files.find((x) => file.name.startsWith(x.name)) || data.files[data.files.length - 1];
     addMsg(`Added <b>${esc(f.name)}</b> (${f.rows.toLocaleString()} rows). Columns: ${f.columns.map((c) => `<code>${esc(c)}</code>`).join(", ")}` +
@@ -250,8 +281,8 @@ $("examples").addEventListener("click", (e) => {
 
 $("undo").onclick =async () => render(await api("/api/undo", { session_id: sessionId }));
 $("redo").onclick = async () => render(await api("/api/redo", { session_id: sessionId }));
-$("dl-xlsx").onclick = () => (location.href = `/api/download/${sessionId}?fmt=xlsx`);
-$("dl-csv").onclick = () => (location.href = `/api/download/${sessionId}?fmt=csv`);
+$("dl-xlsx").onclick = () => download("xlsx");
+$("dl-csv").onclick = () => download("csv");
 </script>
 </body>
 </html>

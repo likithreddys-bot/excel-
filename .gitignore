@@ -21,3 +21,4 @@ samples/
 
 # Secrets
 .env
+users.json

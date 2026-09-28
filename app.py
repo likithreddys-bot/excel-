@@ -1,38 +1,50 @@
 """FastAPI server: upload -> plan (dry run) -> confirm -> execute, with undo/redo and download.
 
-Run:  uvicorn app:app --reload
+Everyone logs in (accounts: `python users.py add <name>`), sees only their own uploads, and uploaded
+data is deleted after SHEET_ASSISTANT_IDLE_MINUTES without activity (default 60) or on logout.
+
+Run:  uvicorn app:app
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import time
 import uuid
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
+import auth
 import engine
 from engine import PlanError, Sheets
 from plan import FORMAT_OPS, Plan
 from planner import describe, make_plan
 
 PREVIEW_ROWS = 100
-
-app = FastAPI()
+IDLE_MINUTES = float(os.environ.get("SHEET_ASSISTANT_IDLE_MINUTES", 60))
+HTTPS = os.environ.get("SHEET_ASSISTANT_HTTPS") == "1"  # set when served over HTTPS: cookie is then Secure
+COOKIE = "sheet_assistant_login"
+STATIC = Path(__file__).parent / "static"
 
 
 @dataclass
 class Session:
     filename: str
     original: Sheets
+    owner: str
     kept: Sheets = field(default_factory=dict)  # other workbook sheets, passed through to the download
     files: dict[str, pd.DataFrame] = field(default_factory=dict)  # extra files for lookup/append/compare
     applied: list[tuple[str, Plan]] = field(default_factory=list)  # (request, plan)
     pointer: int = 0  # applied[:pointer] are active; the rest can be redone
     pending: tuple[str, Plan] | None = None
+    last_used: float = field(default_factory=time.time)
     current: Sheets = field(init=False)
 
     def __post_init__(self):
@@ -52,10 +64,48 @@ class Session:
 sessions: dict[str, Session] = {}
 
 
-def get_session(sid: str) -> Session:
-    if sid not in sessions:
-        raise HTTPException(404, "Session not found; upload the file again")
-    return sessions[sid]
+def clear_idle() -> None:
+    """Delete uploaded data nobody has touched for IDLE_MINUTES, and expired logins."""
+    cutoff = time.time() - IDLE_MINUTES * 60
+    for sid in [sid for sid, s in sessions.items() if s.last_used < cutoff]:
+        del sessions[sid]
+    auth.drop_expired_tokens()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    async def sweep():
+        while True:  # runs even when nobody is using the app
+            await asyncio.sleep(60)
+            clear_idle()
+
+    task = asyncio.create_task(sweep())
+    yield
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    request.state.user = auth.user_for(request.cookies.get(COOKIE))
+    if request.state.user or request.url.path in ("/login", "/api/login"):
+        return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"detail": "Please log in again."}, status_code=401)
+    return RedirectResponse("/login")
+
+
+def get_session(sid: str, request: Request) -> Session:
+    s = sessions.get(sid)
+    if s is None or s.owner != request.state.user:  # other people's sessions look the same as missing ones
+        raise HTTPException(404, f"Your data was cleared (after {IDLE_MINUTES:g} minutes without activity, "
+                                 "or when you logged out). Please upload the file again.")
+    s.last_used = time.time()
+    return s
 
 
 def sheets_payload(sheets: Sheets, formats: list) -> list[dict]:
@@ -82,13 +132,57 @@ def state(s: Session) -> dict:
     }
 
 
+# ---------- login ----------
+
+@app.get("/login")
+def login_page(request: Request):
+    if request.state.user:
+        return RedirectResponse("/")
+    return FileResponse(STATIC / "login.html")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+def login(req: LoginRequest):
+    try:
+        token = auth.login(req.username, req.password)
+    except auth.LoginError as e:
+        raise HTTPException(401, str(e))
+    response = JSONResponse({"user": req.username.strip().lower()})
+    response.set_cookie(COOKIE, token, max_age=int(auth.LOGIN_HOURS * 3600), httponly=True,
+                        samesite="strict", secure=HTTPS)
+    return response
+
+
+@app.post("/api/logout")
+def logout(request: Request):
+    """Log out and delete this person's uploaded data straight away."""
+    for sid in [sid for sid, s in sessions.items() if s.owner == request.state.user]:
+        del sessions[sid]
+    auth.logout(request.cookies.get(COOKIE))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(COOKIE)
+    return response
+
+
+@app.get("/api/me")
+def me(request: Request):
+    return {"user": request.state.user, "idle_minutes": IDLE_MINUTES}
+
+
+# ---------- the app ----------
+
 @app.get("/")
 def index():
-    return FileResponse(Path(__file__).parent / "static" / "index.html")
+    return FileResponse(STATIC / "index.html")
 
 
 @app.post("/api/upload")
-async def upload(file: UploadFile):
+async def upload(request: Request, file: UploadFile):
     try:
         sheets = engine.load_file(file.filename, await file.read())
     except PlanError as e:
@@ -97,14 +191,14 @@ async def upload(file: UploadFile):
     main = max(sheets, key=lambda n: len(sheets[n]))
     kept = {n: df for n, df in sheets.items() if n != main}
     sid = uuid.uuid4().hex
-    sessions[sid] = Session(filename=file.filename, original={main: sheets[main]}, kept=kept)
+    sessions[sid] = Session(filename=file.filename, original={main: sheets[main]}, owner=request.state.user, kept=kept)
     return {"session_id": sid, **state(sessions[sid])}
 
 
 @app.post("/api/files")
-async def add_file(session_id: str = Form(...), file: UploadFile = File(...)):
+async def add_file(request: Request, session_id: str = Form(...), file: UploadFile = File(...)):
     """An extra file to look up from, append or compare with. It's referred to by its name, e.g. "customers"."""
-    s = get_session(session_id)
+    s = get_session(session_id, request)
     try:
         sheets = engine.load_file(file.filename, await file.read())
     except PlanError as e:
@@ -120,8 +214,8 @@ class PlanRequest(BaseModel):
 
 
 @app.post("/api/plan")
-def plan(req: PlanRequest):
-    s = get_session(req.session_id)
+def plan(req: PlanRequest, request: Request):
+    s = get_session(req.session_id, request)
     p = make_plan(s.current, req.message, s.files)
     if p.clarification_question:
         s.pending = None
@@ -151,8 +245,8 @@ class SessionRequest(BaseModel):
 
 
 @app.post("/api/execute")
-def execute(req: SessionRequest):
-    s = get_session(req.session_id)
+def execute(req: SessionRequest, request: Request):
+    s = get_session(req.session_id, request)
     if not s.pending:
         raise HTTPException(400, "Nothing to execute")
     del s.applied[s.pointer :]  # a new command discards the redo stack
@@ -164,8 +258,8 @@ def execute(req: SessionRequest):
 
 
 @app.post("/api/undo")
-def undo(req: SessionRequest):
-    s = get_session(req.session_id)
+def undo(req: SessionRequest, request: Request):
+    s = get_session(req.session_id, request)
     if s.pointer > 0:
         s.pointer -= 1
         s.recompute()
@@ -173,8 +267,8 @@ def undo(req: SessionRequest):
 
 
 @app.post("/api/redo")
-def redo(req: SessionRequest):
-    s = get_session(req.session_id)
+def redo(req: SessionRequest, request: Request):
+    s = get_session(req.session_id, request)
     if s.pointer < len(s.applied):
         s.pointer += 1
         s.recompute()
@@ -182,8 +276,8 @@ def redo(req: SessionRequest):
 
 
 @app.get("/api/download/{sid}")
-def download(sid: str, fmt: str = "xlsx"):
-    s = get_session(sid)
+def download(sid: str, request: Request, fmt: str = "xlsx"):
+    s = get_session(sid, request)
     stem = s.filename.rsplit(".", 1)[0] + "_result"
     kept = {name if name not in s.current else f"{name} (original)"[:31]: df for name, df in s.kept.items()}
     if fmt == "csv":

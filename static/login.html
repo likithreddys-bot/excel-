@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sheet Assistant – Log in</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; color: #1f2328; background: #f6f7f9;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  form { background: #fff; border: 1px solid #d8dde3; border-radius: 10px; padding: 24px; width: 100%; max-width: 340px;
+         display: flex; flex-direction: column; gap: 12px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-weight: 500; }
+  input { font: inherit; padding: 8px; border: 1px solid #c4cad2; border-radius: 6px; }
+  button { font: inherit; padding: 8px 12px; border-radius: 6px; border: 1px solid #2563eb; background: #2563eb; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #error { color: #9b1c1c; background: #fdecec; border-radius: 6px; padding: 8px; display: none; }
+  .hint { color: #57606a; font-size: 12px; margin: 0; }
+</style>
+</head>
+<body>
+<form id="login">
+  <h1>Sheet Assistant</h1>
+  <div id="error"></div>
+  <label>Username <input id="username" autocomplete="username" required autofocus></label>
+  <label>Password <input id="password" type="password" autocomplete="current-password" required></label>
+  <button id="submit">Log in</button>
+  <p class="hint">No account? Ask your administrator.</p>
+</form>
+<script>
+const form = document.getElementById("login");
+const error = document.getElementById("error");
+form.onsubmit = async (e) => {
+  e.preventDefault();
+  error.style.display = "none";
+  document.getElementById("submit").disabled = true;
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: form.username.value, password: form.password.value }),
+    });
+    if (res.ok) { location.href = "/"; return; }
+    error.textContent = (await res.json()).detail || "Couldn't log in.";
+    error.style.display = "block";
+    form.password.value = "";
+  } finally {
+    document.getElementById("submit").disabled = false;
+  }
+};
+</script>
+</body>
+</html>

@@ -4,9 +4,7 @@ import io
 import openpyxl
 import pandas as pd
 import pytest
-from fastapi.testclient import TestClient
 
-import app
 import engine
 from planner import make_plan
 from test_planner import make_bank_df
@@ -199,14 +197,14 @@ def test_chart_with_too_many_bars_asks(sheets):
 
 # ---------- through the app ----------
 
-def test_app_download_has_formatting_and_keeps_summary_sheet_plain():
+def test_app_download_has_formatting_and_keeps_summary_sheet_plain(client):
     main = pd.DataFrame({"pan": list("ABCD"), "result_code": [101, 109, 101, 109]})
     summary = pd.DataFrame({"result_code": [101, 109], "Count": [2, 2]})
     buf = io.BytesIO()
     with pd.ExcelWriter(buf) as w:
         main.to_excel(w, sheet_name="Output", index=False)
         summary.to_excel(w, sheet_name="Summary", index=False)
-    c = TestClient(app.app)
+    c = client
     r = c.post("/api/upload", files={"file": ("itr.xlsx", buf.getvalue())}).json()
     sid = r["session_id"]
     plan_r = c.post("/api/plan", json={"session_id": sid, "message": "highlight rows where result code is 101 in green"}).json()

@@ -14,6 +14,7 @@ Requires Python 3.11+ (tested on 3.14).
 python -m venv .venv
 .venv\Scripts\activate            # Windows  (macOS/Linux: source .venv/bin/activate)
 pip install -r requirements.txt
+python users.py add yourname          # create an account (asks for a password, 8+ characters)
 python -m uvicorn app:app --port 8000
 ```
 
@@ -120,9 +121,10 @@ command ──► planner.py ──► Plan (typed steps) ──► engine.py (p
 | `planner.py` | Rule-based parser: plain English → `Plan`, or a clarification question |
 | `plan.py` | The plan format: `filter`, `select_columns`, `drop_columns`, `sort`, `dedupe`, `group_by`, `split_by`, `pivot`, `top_n`, `date_part`, `calculate`, `clean_text`, `fill_blanks`, `drop_blank_rows`, `replace`, `split_column`, `merge_columns`, `rename`, `convert`, `compute`, `label`, `lookup`, `append`, `compare`, `highlight`, `number_format`, `chart` |
 | `engine.py` | Executes a plan on pandas DataFrames; file loading; XLSX export (xlsxwriter, with formatting and charts) and CSV |
-| `app.py` | FastAPI server: upload, extra files, plan (dry run with notes), execute, undo/redo, download |
+| `app.py` | FastAPI server: login, upload, extra files, plan (dry run with notes), execute, undo/redo, download, idle clean-up |
+| `auth.py` / `users.py` | Accounts (hashed passwords), logins, lockout / the command to add and remove accounts |
 | `static/index.html` | The web UI (chat on the left, spreadsheet preview on the right) |
-| `tests/` | Parser tests (`test_planner.py`), analysis (`test_analysis.py`), cleaning (`test_cleaning.py`), formulas (`test_formulas.py`), other files (`test_files.py`), formatting (`test_formatting.py`) and end-to-end API tests (`test_app.py`) |
+| `tests/` | Parser tests (`test_planner.py`), analysis (`test_analysis.py`), cleaning (`test_cleaning.py`), formulas (`test_formulas.py`), other files (`test_files.py`), formatting (`test_formatting.py`) end-to-end API tests (`test_app.py`) and login / data clearing (`test_auth.py`) |
 
 The parser only ever produces a `Plan`. The engine is the only code that touches the data. That separation keeps every result reproducible and every step visible to the user before it runs.
 
@@ -140,7 +142,38 @@ python -m pytest
 
 ## Data handling
 
-- Uploaded files are held **in memory only**, one session per upload, and are lost when the server restarts. Nothing is written to disk.
+- **Everyone logs in**, and each person can only open their own uploads. Another user's session ID behaves exactly like one that doesn't exist.
+- **Uploaded files are held in memory only**, never written to disk.
+- **Uploaded data is deleted automatically**:
+  - after **60 minutes without activity**, checked every minute even when nobody is using the app;
+  - **immediately on "Log out"**;
+  - on server restart.
+
+### Accounts
+
+Accounts are created by an administrator. There is no self-signup.
+
+```bash
+python users.py add priya       # prompts for the password
+python users.py remove priya    # also ends their current login
+python users.py list
+```
+
+- **Passwords are stored as salted PBKDF2-SHA256 hashes** (600,000 rounds) in `users.json` next to the app. `users.json` is in `.gitignore`, so it never goes to git.
+- **Usernames are not case-sensitive.**
+- **A login lasts 8 hours**, in an HTTP-only, SameSite=Strict cookie.
+- **5 wrong passwords lock that username for 5 minutes.** The error message never reveals whether a username exists.
+
+### Settings (environment variables)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SHEET_ASSISTANT_IDLE_MINUTES` | `60` | Delete uploaded data after this many minutes without activity |
+| `SHEET_ASSISTANT_LOGIN_HOURS` | `8` | How long a login lasts |
+| `SHEET_ASSISTANT_USERS` | `users.json` next to the app | Where accounts are stored |
+| `SHEET_ASSISTANT_HTTPS` | off | Set to `1` when served over HTTPS, so the login cookie is only ever sent encrypted |
+
+Run it as **one server process** (don't use `--workers`). Logins and uploaded data live in that process's memory.
 - `.gitignore` blocks all `.csv` / `.xlsx` / `.xls` / `.zip` files and the `samples/` folder, so no data can be committed by accident. The repository is code only.
 
 ## Known limitations
@@ -153,10 +186,10 @@ python -m pytest
 
 ## Before company-wide rollout
 
-The current version is fine for single-user or small-team use on a trusted network. Before offering it to the whole company:
-- **Login / access control.** Anyone who can reach the server can currently use it.
-- **Session expiry.** Uploaded data stays in memory until the server restarts.
-- **Hosting.** Run it on an internal server behind HTTPS rather than a laptop.
+Login and automatic data clearing are in place. Still to do before offering it to the whole company:
+- **Hosting.** Run it on an internal server behind HTTPS rather than a laptop, and set `SHEET_ASSISTANT_HTTPS=1`.
+- **Limits on upload size and on sessions per user**, so one huge file can't slow the server for everyone.
 - **Load testing** with the largest real files people will use.
+- **Optional: company single sign-on** (Microsoft/Google) instead of separate passwords. This needs the app registered by IT.
 
 Background and product thinking: [excel-assistant-concept.md](excel-assistant-concept.md). It was written before the no-AI decision, so its LLM-based technical approach has been replaced by the rule-based parser.

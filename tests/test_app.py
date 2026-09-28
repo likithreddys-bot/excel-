@@ -2,14 +2,9 @@
 import io
 
 import pandas as pd
-from fastapi.testclient import TestClient
-
-import app
-
-client = TestClient(app.app)
 
 
-def upload_two_sheet_workbook():
+def upload_two_sheet_workbook(client):
     """A data sheet plus a summary sheet that shares some column names, like an API-output export."""
     output = pd.DataFrame({
         "pan": [f"PAN{i:05d}" for i in range(200)],
@@ -25,27 +20,27 @@ def upload_two_sheet_workbook():
     return r
 
 
-def run(sid, message):
+def run(client, sid, message):
     r = client.post("/api/plan", json={"session_id": sid, "message": message}).json()
     assert "error" not in r and "clarification_question" not in r, r
     return client.post("/api/execute", json={"session_id": sid}).json()
 
 
-def test_works_on_main_sheet_and_keeps_the_rest():
-    r = upload_two_sheet_workbook()
+def test_works_on_main_sheet_and_keeps_the_rest(client):
+    r = upload_two_sheet_workbook(client)
     assert [s["name"] for s in r["sheets"]] == ["Output"]
     assert r["kept_sheets"] == ["Summary"]
 
-    state = run(r["session_id"], "result code 101")  # Summary has result_code but must not be filtered
+    state = run(client, r["session_id"], "result code 101")  # Summary has result_code but must not be filtered
     assert state["sheets"][0]["rows"] == 50
 
-    state = run(r["session_id"], "keep columns pan, response")  # Summary has neither column
+    state = run(client, r["session_id"], "keep columns pan, response")  # Summary has neither column
     assert state["sheets"][0]["columns"] == ["pan", "response"]
 
 
-def test_split_then_download_includes_kept_sheet():
-    r = upload_two_sheet_workbook()
-    state = run(r["session_id"], "split by result code")
+def test_split_then_download_includes_kept_sheet(client):
+    r = upload_two_sheet_workbook(client)
+    state = run(client, r["session_id"], "split by result code")
     assert [(s["name"], s["rows"]) for s in state["sheets"]] == [("101", 50), ("109", 150)]
 
     xlsx = client.get(f"/api/download/{r['session_id']}?fmt=xlsx").content
