@@ -54,10 +54,15 @@ class Aggregation(BaseModel):
     func: Literal["count", "sum", "mean", "min", "max", "nunique"]
 
 
+CALCULATED_HELP = ("name -> formula over columns, worked out on each group's totals like an Excel pivot "
+                   "calculated field: '[b0_amt] * 100 / [alloc_amt]' = total b0_amt * 100 / total alloc_amt")
+
+
 class GroupByStep(BaseModel):
     op: Literal["group_by"]
     columns: list[str]
     aggregations: list[Aggregation]
+    calculated: dict[str, str] = Field(default_factory=dict, description=CALCULATED_HELP)
 
 
 class SplitByStep(BaseModel):
@@ -72,6 +77,7 @@ class PivotStep(BaseModel):
     values: str | None = Field(None, description="Column to aggregate; None = count rows")
     func: Literal["count", "sum", "mean", "min", "max", "nunique"]
     totals: bool = True
+    calculated: dict[str, str] = Field(default_factory=dict, description=CALCULATED_HELP + "; used instead of values/func")
 
 
 class TopNStep(BaseModel):
@@ -235,3 +241,4 @@ class Plan(BaseModel):
     )
     summary: str = Field(description="One or two plain-English sentences describing what will be done.")
     steps: list[Step]
+    awaits_columns: bool = Field(False, description="The question can be answered by replying with column names")

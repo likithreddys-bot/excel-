@@ -23,16 +23,6 @@ from plan import (
     Step, TopNStep,
 )
 
-EXAMPLES = [
-    "only debits over 5000",
-    "transactions in the last 30 days",
-    "remove rows where description contains ATM",
-    "split by category",
-    "sort by amount descending",
-    "keep columns date, description, amount",
-    "total amount by category",
-    "remove duplicates by transaction id",
-]
 
 STOP = {
     "a", "an", "the", "and", "or", "by", "of", "in", "on", "to", "for", "with", "where", "is",
@@ -61,20 +51,26 @@ VERB = (r"(?:sort|order|arrange|split|segregate|separate|keep|remove|drop|delete
         r"|rename|replace|trim|fill|merge|combine|convert|change|make|capitali[sz]e"
         r"|create|insert|set|update|round|label|tag|flag|mark"
         r"|bring|look\s*up|lookup|vlookup|xlookup|fetch|pull|append|compare|match"
-        r"|highlight|colou?r|shade|format|display|draw|plot)")
+        r"|highlight|colou?r|shade|format|display|draw|plot|do)")
 CLAUSE_SPLIT = re.compile(
-    rf"\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|then|also|and)\s+(?={VERB}\b)"
+    rf"\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|and\s+now|then|also|now|and)\s+(?={VERB}\b)"
     rf"|,\s*(?={VERB}\b))\s*", re.I)
+# Before a second "name = ..." in the same clause: "B0% = a/b and repay% = c/b" is two formulas.
+NEXT_ASSIGNMENT = re.compile(r"(?:\s*,\s*|\s+)(?:and\s+)?(?=[A-Za-z_][\w%.]*\s*=(?!=))", re.I)
 
 
-GROUP_MARKER = re.compile(r"\b(?:grouped\s+by|group\s+by|by|per|for\s+each|for\s+every|across|each)\b", re.I)
+GROUP_MARKER = re.compile(r"\b(?:grouped\s+by|group\s+by|by|per|for\s+each|for\s+every|across|each|wrt"
+                          r"|with\s+respect\s+to)\b", re.I)
 PIVOT = re.compile(r"\bpivot\w*|\bcross[\s-]?tab\w*|\bmatrix\b|\b(?:as|in)\s+(?:the\s+)?columns\b|\bacross\b", re.I)
-PERCENT = re.compile(r"(?:,?\s*\b(?:with|and|plus|including)\s+(?:a\s+|the\s+)?)?(?:%|\bpercent(?:age)?s?\b|\bshare\b)"
+# "(?<!\w)%": the % in a column name like "B0%" or a number like "18%" isn't "% of total".
+PERCENT = re.compile(r"(?:,?\s*\b(?:with|and|plus|including)\s+(?:a\s+|the\s+)?)?(?:(?<!\w)%|\bpercent(?:age)?s?\b|\bshare\b)"
                      r"(?:\s+of\s+(?:the\s+)?(?:grand\s+)?total)?", re.I)
 TOP_N = re.compile(r"\b(top|bottom|first|last|highest|lowest|largest|smallest|biggest|latest|newest|oldest|earliest)"
                    r"\s+(\d+)\b(?!\s*(?:days?|weeks?|months?|years?)\b)", re.I)
 DATE_PART = re.compile(r"\b(year|quarter|month|weekday|week|day\s+of\s+(?:the\s+)?week|day)(?:s|ly)?\b"
                        r"|\b(daily|annual(?:ly)?)\b", re.I)
+PREFIXED_DATE_PART = re.compile(r"(?<![A-Za-z0-9_])(?P<pre>[A-Za-z0-9]+)[_ ](?P<part>year|quarter|month|weekday|week|day)"
+                                r"(?![A-Za-z0-9_])", re.I)
 
 
 SMART_QUOTES = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
@@ -120,7 +116,12 @@ FILE_VERBS = re.compile(r"\b(?:look\s*up|lookup|v\s*lookup|x\s*lookup|match(?:in
 
 
 class ParseError(Exception):
-    """Raised with a user-facing message when a command can't be understood."""
+    """Raised with a user-facing message when a command can't be understood. `awaits_columns`: the
+    question can be answered by replying with just column names."""
+
+    def __init__(self, message: str, awaits_columns: bool = False):
+        super().__init__(message)
+        self.awaits_columns = awaits_columns
 
 
 def _key(s) -> str:
@@ -182,6 +183,10 @@ def _fmt(v: float) -> str:
     return str(int(v)) if float(v).is_integer() else str(v)
 
 
+def _fmt_key_plain(v) -> str:
+    return _fmt(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)
+
+
 @dataclass
 class Mention:
     start: int
@@ -190,7 +195,12 @@ class Mention:
 
 
 class Parser:
-    def __init__(self, sheets: Sheets, files: dict[str, pd.DataFrame] | None = None):
+    def __init__(self, sheets: Sheets, files: dict[str, pd.DataFrame] | None = None,
+                 computed: dict[str, str] | None = None, answer: list[str] | None = None):
+        """`computed`: formulas behind columns made with "x = ..." (for calculated-field totals).
+        `answer`: columns the user gave in reply to a "which column?" question."""
+        self.computed = computed or {}
+        self.answer = answer or []
         self.files = files or {}
         self._file_parsers: dict[str, Parser] = {}
         frames = list(sheets.values())
@@ -243,6 +253,34 @@ class Parser:
             rest = rest[:m.start] + rest[m.end:]
         leftover = [w for w in re.findall(r"[a-z0-9]+", rest.lower()) if w not in FILLER_WORDS | {"column", "columns", "field", "fields"}]
         return ms[0].column if len(ms) == 1 and not leftover else None
+
+    def examples(self) -> list[str]:
+        """Example commands that use this file's own columns and values."""
+        ids = {c for c in self.numeric_cols if set(_col_words(c)) & (ID_WORDS | {"num"})}
+        nums = [c for c in self.numeric_cols if c not in ids] or self.numeric_cols
+        nums.sort(key=lambda c: not set(_col_words(c)) & AMOUNT_WORDS)  # amount-like columns first
+        cats = [c for c in self.columns if c not in self.numeric_cols and c not in self.date_cols
+                and 2 <= self.df[c].nunique() <= 50] or [c for c in self.numeric_cols if 2 <= self.df[c].nunique() <= 50]
+        cats.sort(key=lambda c: self.df[c].nunique())
+        num, cat = (nums[0] if nums else None), (cats[0] if cats else None)
+        out = []
+        if num and cat:
+            out.append(f"total {num} by {cat}")
+        if num and self.date_cols:
+            date = self.date_cols[0]
+            words = [w for w in _col_words(date) if w not in ("date", "dt", "on", "at")]
+            out.append(f"pivot {num} by {words[0]}_month" if words else f"total {num} by month")
+        if num:
+            median = pd.to_numeric(self.df[num], errors="coerce").median()
+            threshold = _fmt(float(f"{median:.2g}")) if pd.notna(median) and median else "0"
+            out += [f"only rows where {num} > {threshold}", f"sort by {num} descending", f"top 10 by {num}"]
+        if cat:
+            value = self.df[cat].mode().iloc[0]
+            out += [f"only rows where {cat} is {_fmt_key_plain(value)}", f"split by {cat}"]
+        if len(nums) >= 2:
+            out.append(f"add column ratio = {nums[1]} * 100 / {nums[0]}")
+        out.append("keep columns " + ", ".join(self.columns[:3]))
+        return out[:8]
 
     def value_index(self) -> dict[str, dict[str, str]]:
         """singular key of each text value -> {column: original value}."""
@@ -299,14 +337,17 @@ class Parser:
         return sorted(set(found), key=len, reverse=True)
 
     def default_number_column(self) -> str:
+        numbers = [c for c in self.answer if c in self.numeric_cols]
+        if numbers:
+            return numbers[0]
         cands = [c for c in self.numeric_cols if not set(_col_words(c)) & ID_WORDS]
         amountish = [c for c in cands if set(_col_words(c)) & AMOUNT_WORDS]
         if len(cands) == 1:
             return cands[0]
         if len(amountish) == 1:
             return amountish[0]
-        raise ParseError("Which column should the number apply to? Numeric columns: "
-                         + ", ".join(cands or self.numeric_cols or ["(none)"]))
+        raise ParseError("Which column should the number apply to? Reply with the column name(s). Numeric columns: "
+                         + ", ".join(cands or self.numeric_cols or ["(none)"]), awaits_columns=True)
 
     def default_date_column(self, text: str) -> str:
         for m in self.find_columns(text):
@@ -398,17 +439,53 @@ class Parser:
         for m in self.find_columns(text):
             if m.column not in cols:
                 cols.append(m.column)
-        if not cols:
-            raise ParseError(f"Which column should I {what}? Columns: " + ", ".join(self.columns))
-        return cols
+        return cols or self.answered(f"I {what}")
+
+    def answered(self, what: str) -> list[str]:
+        """The columns given in reply to this question, or the question itself."""
+        if self.answer:
+            return list(self.answer)
+        raise ParseError(f"Which column should {what}? Reply with the column name(s). Columns: "
+                         + ", ".join(self.columns), awaits_columns=True)
+
+    def _calculated(self, values: list[str], funcs: list[str]) -> dict[str, str]:
+        """Values worked out from each group's totals, like an Excel pivot calculated field: columns made by
+        a formula ("B0% = b0_amt*100/alloc_amt" -> total b0_amt*100/total alloc_amt), and several columns
+        totalled side by side. {} means the ordinary one-column summary."""
+        if funcs and funcs[0] != "sum":
+            return {}  # "average B0% by month" really means the average of the row values
+
+        def formula(col: str, depth: int = 0) -> str:
+            expr = self.computed.get(col)
+            if expr is None or re.search(r"[a-z_]+\s*\(", expr) or depth > 5:  # no functions: round(), days()...
+                return f"[{col}]"
+            return re.sub(r"\[([^\]]+)\]", lambda m: f"({formula(m.group(1), depth + 1)})"
+                          if m.group(1) in self.computed else m.group(0), expr)
+
+        if len(values) < 2 and not any(formula(v) != f"[{v}]" for v in values):
+            return {}
+        return {v: formula(v) for v in values}
 
     def dims(self, text: str) -> tuple[list[DatePartStep], list[Mention]]:
         """Columns to group/split/pivot by, including date parts: "by month" -> month of the date column."""
         steps: list[DatePartStep] = []
         found: list[Mention] = []
         real = self.find_columns(text)
-        for m in DATE_PART.finditer(text):
+        for m in PREFIXED_DATE_PART.finditer(text):
+            # "due_month" / "due month": the month of the date column whose name has "due" in it (due_date).
             if any(r.start < m.end() and m.start() < r.end for r in real):
+                continue
+            pre = _singular(_key(m.group("pre")))
+            srcs = [c for c in self.date_cols if pre in {_singular(w) for w in _col_words(c)}]
+            if len(srcs) != 1:
+                continue
+            part = m.group("part").lower()
+            name = m.group(0) if m.group(0) not in self.columns else f"{srcs[0]} {part}"
+            if all(s.name != name for s in steps):
+                steps.append(DatePartStep(op="date_part", column=srcs[0], part=part, name=name))
+            found.append(Mention(m.start(), m.end(), name))
+        for m in DATE_PART.finditer(text):
+            if any(r.start < m.end() and m.start() < r.end for r in real + found):
                 continue  # part of a real column name, e.g. "year" in "assessment year"
             word = m.group(0).lower()
             part = ("weekday" if "day" in word and "week" in word else "day" if word.startswith(("day", "daily"))
@@ -476,26 +553,31 @@ class Parser:
         if pct:
             cl = cl[:pct.start()] + " " + cl[pct.end():]
         cl, filters = self.extra_filters(cl)  # "how many debits per branch": debits is a row filter
-        funcs = self._funcs(cl.lower()) or ["count"]
+        explicit = self._funcs(cl.lower())
+        funcs = explicit or ["count"]
         m = GROUP_MARKER.search(cl)
         head, tail = _move_period_words(cl[:m.start()], cl[m.end():])
         tail, more = self._trailing_filter(tail)
         filters += more
         prefix, found = self.dims(tail)
-        group_cols = list(dict.fromkeys(x.column for x in found))
-        if not group_cols:
-            raise ParseError("Which column should I group by? Columns: " + ", ".join(self.columns))
+        group_cols = list(dict.fromkeys(x.column for x in found)) or self.answered("I group by")
         value_cols = [x.column for x in self.find_columns(head) if x.column not in group_cols]
+        if not value_cols and funcs != ["count"]:
+            value_cols = [c for c in self.answer if c in self.numeric_cols and c not in group_cols]
+        # Formula columns (B0% = ...) are totalled the calculated-field way, not by adding row percentages.
+        formulas = [c for c in value_cols if c in self.computed]
+        calculated = self._calculated(formulas, explicit) if formulas else {}
         aggs = []
         for f in funcs:
             if f == "count" and not value_cols:
                 aggs.append(Aggregation(column=group_cols[0], func="count"))
                 continue
-            for c in value_cols or [self.default_number_column()]:
+            for c in [c for c in value_cols if c not in calculated] or ([] if calculated else [self.default_number_column()]):
                 aggs.append(Aggregation(column=c, func=f))
-        steps: list[Step] = filters + prefix + [GroupByStep(op="group_by", columns=group_cols, aggregations=aggs)]
+        steps: list[Step] = filters + prefix + [GroupByStep(op="group_by", columns=group_cols, aggregations=aggs,
+                                                            calculated=calculated)]
         if pct:
-            out = f"{aggs[0].func}_{aggs[0].column}"
+            out = f"{aggs[0].func}_{aggs[0].column}" if aggs else next(iter(calculated))
             steps.append(CalculateStep(op="calculate", kind="percent_of_total", column=out, name=f"% of total {out}"))
         return steps
 
@@ -504,13 +586,24 @@ class Parser:
         funcs = self._funcs(cl.lower())
         if len(funcs) > 1:
             raise ParseError("A pivot shows one calculation at a time. Which one: " + ", ".join(funcs) + "?")
-        m = re.search(r"\b(?:by|per|for\s+each|across)\b", cl, re.I)
+        m = re.search(r"\b(?:by|per|for\s+each|across|on|wrt|with\s+respect\s+to|against)\b", cl, re.I)
         if m:
             head, rest = _move_period_words(cl[:m.start()], cl[m.end():])
             marker = len(head) + 1
             text = f"{head} {m.group(0)} {rest}"
         else:
             text, marker = cl, None
+        # "... with (these) columns B0% and overall_repay%": the values to show.
+        shown: list[str] = []
+        vm = re.search(r"\b(?:with|showing|show|using)\s+(?:the\s+|these\s+|those\s+)?(?P<w>(?:columns?|values?|fields?|measures?|metrics?)\s+)?"
+                       r"(?P<v>.+)$", text, re.I)
+        if vm and not re.search(r"\b(?:in|as|on)\s+(?:the\s+)?(?:rows?|columns?)\b|\bacross\b", vm.group("v"), re.I):
+            try:
+                shown = self._column_list(vm.group("v"), "show in the pivot")
+                text = text[:vm.start()]
+            except ParseError:
+                if vm.group("w"):
+                    raise  # they said "with columns ..." but named something that isn't a column
         prefix, found = self.dims(text)
         across = re.search(r"\bacross\s+(?:the\s+top\s+)?(?:by\s+)?", text, re.I)
         rows, cols, head_cols = [], [], []
@@ -528,12 +621,19 @@ class Parser:
         if not cols and len(rows) >= 2:
             cols = [rows.pop()]  # "pivot amount by category and txn type": last one goes across the top
         rows, cols = list(dict.fromkeys(rows)), list(dict.fromkeys(cols))
-        values = [c for c in dict.fromkeys(head_cols) if c not in rows + cols]
-        if len(values) > 1:
-            raise ParseError("A pivot summarises one column at a time. Which one: " + ", ".join(values) + "?")
+        values = [c for c in dict.fromkeys(head_cols + shown) if c not in rows + cols]
         if not rows:
-            raise ParseError("Which column should go down the side of the pivot? Columns: " + ", ".join(self.columns))
+            rows = self.answered("go down the side of the pivot")
         self._check_width(cols, prefix, "pivot columns")
+        calculated = self._calculated(values, funcs)
+        if calculated:
+            if cols:
+                raise ParseError("Columns like " + ", ".join(calculated) + " can't have another column across the top yet. "
+                                 f"Try: pivot by {', '.join(rows)} with columns {', '.join(calculated)}")
+            return filters + prefix + [PivotStep(op="pivot", rows=rows, columns=[], func="sum", calculated=calculated)]
+        if len(values) > 1:
+            raise ParseError("Several columns in one pivot can only be shown as totals (e.g. 'pivot total "
+                             + " and ".join(values) + " by ...'). For " + funcs[0] + ", pivot one column at a time: which one?")
         value = values[0] if values else None
         func = funcs[0] if funcs else ("sum" if value else "count")
         if func != "count" and value is None:
@@ -891,6 +991,12 @@ class Parser:
             if self.column(m.group("name")) and verb_word not in ("set", "update"):
                 return None  # "txn_type = DEBIT" is a filter on an existing column
             return [self._compute(m.group("name"), m.group("rhs"), explicit=False, verb=verb_word)]
+        m = re.match(r"^\s*(?:please\s+)?(?:add|create|insert|make)\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?)?\s*"
+                     r"(?:for\s+|called\s+|named\s+)?(?P<x>[^=:]+?)\s*$", text, re.I)
+        if m:
+            prefix, found = self.dims(m.group("x"))  # "add column due_month" -> month of due_date
+            if prefix and len(found) == 1:
+                return prefix
         return None
 
     def _compute(self, name: str, rhs: str, explicit: bool, verb: str | None) -> Step:
@@ -1198,7 +1304,7 @@ class Parser:
             got = self.parse_fragment(frag, conds[-1] if conds else None)
             if not got:
                 raise ParseError(f"I couldn't understand '{frag.strip()}'.\n\nTry commands like:\n- "
-                                 + "\n- ".join(EXAMPLES))
+                                 + "\n- ".join(self.examples()))
             conds.extend(got)
         conds, match = _merge_same_column(conds, match)
         if negate:
@@ -1488,6 +1594,15 @@ OP_TEXT = {"equals": "is", "not_equals": "is not", "contains": "contains", "not_
            "within_last_days": "is within the last", "older_than_days": "is older than"}
 
 
+def _describe_calculated(name: str, expr: str, keys: list[str]) -> str:
+    if expr == f"[{name}]":
+        return f"total {name}"
+    return f"{name} = " + re.sub(r"\[([^\]]+)\]", r"total \1", expr)
+
+
+CALCULATED_NOTE = " (worked out from each group's totals, like an Excel calculated field, not an average of row values)"
+
+
 def describe(step: Step) -> str:
     match step.op:
         case "filter":
@@ -1508,10 +1623,17 @@ def describe(step: Step) -> str:
             by = f" by {', '.join(step.columns)}" if step.columns else " (whole row)"
             return f"Remove duplicate rows{by}, keeping the {step.keep}"
         case "group_by":
-            aggs = ", ".join(f"{a.func} of {a.column}" for a in step.aggregations)
-            return f"Group by {', '.join(step.columns)} with {aggs}"
+            parts = [f"{a.func} of {a.column}" for a in step.aggregations]
+            parts += [_describe_calculated(n, e, step.columns) for n, e in step.calculated.items()]
+            note = CALCULATED_NOTE if any(e != f"[{n}]" for n, e in step.calculated.items()) else ""
+            return f"Group by {', '.join(step.columns)} with {', '.join(parts)}{note}"
         case "split_by":
             return f"Split into one sheet per {step.column}"
+        case "pivot" if step.calculated:
+            fields = "; ".join(_describe_calculated(n, e, step.rows) for n, e in step.calculated.items())
+            note = CALCULATED_NOTE if any(e != f"[{n}]" for n, e in step.calculated.items()) else ""
+            return (f"Pivot with {', '.join(step.rows)} down the side: {fields}"
+                    + (", with a Total row" if step.totals else "") + note)
         case "pivot":
             what = f"{step.func} of {step.values}" if step.values else "count of rows"
             across = f", {', '.join(step.columns)} across the top" if step.columns else ""
@@ -1590,24 +1712,83 @@ def describe(step: Step) -> str:
 
 def split_clauses(request: str) -> list[str]:
     text = request.strip().translate(SMART_QUOTES)
+    text = re.sub(r"\bw\s*\.\s*r\s*\.\s*t\b\.?", "wrt", text, flags=re.I)  # "w.r.t." must not end a sentence
     # Quoted text ('"Rs. "', '", "') is set aside so the splitting below can't break it up.
     quoted: list[str] = []
     text = QUOTED.sub(lambda m: quoted.append(m.group()) or f"__Q{len(quoted) - 1}__", text)
     text = re.sub(r",(?=[^\s\d])", ", ", text)  # "date,amount" -> "date, amount"; not "5,000"
     clauses = []
-    for clause in CLAUSE_SPLIT.split(text):
-        if not clause or not clause.strip(" ,."):
-            continue
-        clause = re.sub(r"^(?:(?:and|also|then|now|please|actually|next|finally)\b[\s,]*)+", "", clause.strip(" ,."), flags=re.I)
-        clauses.append(re.sub(r"__Q(\d+)__", lambda m: quoted[int(m.group(1))], clause))
+    for part in CLAUSE_SPLIT.split(text):
+        for clause in _split_assignments(part or ""):
+            if not clause.strip(" ,."):
+                continue
+            clause = re.sub(r"^(?:(?:and|also|then|now|please|actually|next|finally|do)\b[\s,]*)+", "", clause.strip(" ,."), flags=re.I)
+            clauses.append(re.sub(r"__Q(\d+)__", lambda m: quoted[int(m.group(1))], clause))
     return clauses
 
 
-def make_plan(sheets: Sheets, request: str, files: dict[str, pd.DataFrame] | None = None) -> Plan:
+def _split_assignments(clause: str) -> list[str]:
+    first = re.search(r"(?<![<>!=])=(?!=)", clause)
+    if not first:
+        return [clause]
+    parts, start = [], 0
+    for m in NEXT_ASSIGNMENT.finditer(clause, first.end()):
+        if re.search(r"\bor\s*$", clause[:m.start()], re.I):
+            continue  # "type = DEBIT or type = CREDIT" is one filter
+        parts.append(clause[start:m.start()])
+        start = m.end()
+    return parts + [clause[start:]]
+
+
+def examples(sheets: Sheets) -> list[str]:
+    return Parser(sheets).examples()
+
+
+def reply_columns(sheets: Sheets, text: str) -> tuple[list[str], list[str]] | None:
+    """If `text` is only a list of column names (a reply to "which column?"): (columns found,
+    unrecognised items with a suggestion, e.g. "bo_amt (did you mean b0_amt?)"). None otherwise."""
+    parser = Parser(sheets)
+    items = [i.strip() for i in re.split(r",|\band\b|&|\s{2,}", split_clauses(text)[0] if text.strip() else "", flags=re.I)
+             if i.strip()]
+    if not items or len(items) > 20 or any(len(i.split()) > 3 for i in items):
+        return None
+    look_alike = str.maketrans("oil", "011")  # "bo_amt" typed for "b0_amt"
+    found, unknown = [], []
+    for item in items:
+        col = parser.column(item)
+        extra = set(re.findall(r"[a-z0-9]+", item.lower().replace("_", " "))) - set(_col_words(col or ""))
+        if col and not {_singular(w) for w in extra} - {_singular(w) for w in _col_words(col)}:
+            found.append(col)  # nothing but the column's own words: "txn date", "alloc_amt"
+            continue
+        if " " in item or col:
+            return None  # a phrase like "rank by amount" is a command, not a mistyped column
+        guess = next((c for c in parser.columns if _key(c).translate(look_alike) == _key(item).translate(look_alike)), None)
+        if guess is None:
+            close = difflib.get_close_matches(_key(item), [_key(c) for c in parser.columns], n=1, cutoff=0.75)
+            guess = next((c for c in parser.columns if close and _key(c) == close[0]), None)
+        if guess is None:
+            return None  # not a column list after all
+        unknown.append(f"'{item}' (did you mean {guess}?)")
+    return list(dict.fromkeys(found)), unknown
+
+
+def make_plan(sheets: Sheets, request: str, files: dict[str, pd.DataFrame] | None = None,
+              computed: dict[str, str] | None = None, answer: list[str] | None = None) -> Plan:
+    """`computed`: formulas of columns made by earlier commands; `answer`: columns the user replied with
+    when this request last came back with a "which column?" question."""
+    computed = dict(computed or {})
     try:
         clauses = split_clauses(request)
         if not clauses:
             raise ParseError("Tell me what you'd like to do with the data.")
+        just_columns = None if answer else reply_columns(sheets, request)
+        if just_columns:
+            cols, unknown = just_columns
+            if unknown:
+                raise ParseError("I couldn't find " + ", ".join(unknown) + ".")
+            c = cols[0]
+            raise ParseError(f"What should I do with {', '.join(cols)}? For example:\n- total {c} by <column>\n"
+                             f"- sort by {c} descending\n- keep columns {', '.join(cols)}\n- top 10 by {c}")
         if files:
             # "match with customers on pan and bring email": a bring/fetch part that names no file
             # continues the lookup before it rather than starting a new command.
@@ -1620,13 +1801,14 @@ def make_plan(sheets: Sheets, request: str, files: dict[str, pd.DataFrame] | Non
             clauses = merged
         steps: list[Step] = []
         for i, clause in enumerate(clauses):
-            new = Parser(sheets, files).parse_clause(clause)
+            new = Parser(sheets, files, computed, answer).parse_clause(clause)
             steps += new
+            computed.update({s.name: s.expr for s in new if s.op == "compute"})
             if i < len(clauses) - 1:
                 # Later parts see the result so far: "add column gst = ... and sort by gst".
                 sheets = apply_plan(sheets, Plan(summary="", steps=new), files=files)
         return Plan(summary="; ".join(describe(s) for s in steps) + ".", steps=steps)
     except ParseError as e:
-        return Plan(clarification_question=str(e), summary="", steps=[])
+        return Plan(clarification_question=str(e), summary="", steps=[], awaits_columns=e.awaits_columns)
     except PlanError as e:
         return Plan(clarification_question=f"That can't run on this data: {e}", summary="", steps=[])

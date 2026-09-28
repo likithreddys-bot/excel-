@@ -35,6 +35,8 @@ python -c "import sys; sys.path.insert(0, 'tests'); from test_planner import mak
 5. **Download** as XLSX, or CSV (a `.zip` of CSVs when there are several sheets).
 
 If a command can't be understood confidently, it asks instead of guessing: for example, it names the values that exist in a column, or the columns you could split by.
+- **When it asks "Which column…?", you can reply with just the column names** (`alloc_amt, b0_amt`). Typos get a suggestion ("did you mean b0_amt?").
+- **The example chips and the "try commands like…" suggestions use your file's own columns.**
 
 ### What you can say
 
@@ -47,8 +49,8 @@ If a command can't be understood confidently, it asks instead of guessing: for e
 | Sort | `sort by amount descending` · `sort by date newest first` · `order by balance high to low` |
 | Choose columns | `keep columns date, description, amount` · `keep only description and amount` · `drop the balance column` |
 | Totals / counts | `total amount by category` · `count transactions per category` · `average and max amount by txn type` · `how many debits per branch` · `count by assessment year for result code 101` |
-| Pivot / cross-tab | `pivot amount by category and txn type` · `total amount by category with txn type as columns` · `count by branch across txn type` · `pivot of total amount with branch in rows and category in columns` (row and column totals included) |
-| By period | `total amount by month` · `monthly totals by category` · `quarterly total amount by txn type` · `count transactions by weekday` · `split by year` · `pivot amount by month and txn type` |
+| Pivot / cross-tab | `pivot amount by category and txn type` · `pivot wrt due_month with these columns B0% and overall_repay%` · `total amount by category with txn type as columns` · `count by branch across txn type` · `pivot of total amount with branch in rows and category in columns` (row and column totals included) |
+| By period | `total amount by month` · `pivot by due_month` (the month of `due_date`; also `disb_year`, `due week`…) · `monthly totals by category` · `quarterly total amount by txn type` · `count transactions by weekday` · `split by year` · `pivot amount by month and txn type` |
 | Top / bottom N | `top 10 debits by amount` · `bottom 5 by balance` · `lowest 3 amounts per category` · `latest 5 transactions` · `first 10 rows` |
 | % of total | `total amount by category with % of total` · `percentage share of amount by category` · `add % of total` (after a grouping) |
 | Running total | `add running total of amount` · `running total of amount per category` · `cumulative sum of amount sorted by date` |
@@ -61,7 +63,7 @@ If a command can't be understood confidently, it asks instead of guessing: for e
 | Merge columns | `merge first and last into full name` · `combine city and state with ", " into location` |
 | Rename | `rename amt to amount` · `rename city to City Name and amt to Amount` |
 | Change type | `convert amt to number` (understands ₹, Rs., INR, commas) · `change txn date to date` · `make pan text` |
-| Calculated columns | `add column gst = amount * 0.18` · `add gst as 18% of amount` · `add column net = credit - debit` · `add column with tax = amount + 18%` (increase by 18%) · `add column per unit = amount / qty` · `add column double = [Amount (INR)] * 2` (brackets for names with symbols) |
+| Calculated columns | `add column gst = amount * 0.18` · `B0% = b0_amt*100/alloc_amt and overall_repay% = tot_amt*100/alloc_amt` (several at once) · `add gst as 18% of amount` · `add column net = credit - debit` · `add column with tax = amount + 18%` (increase by 18%) · `add column per unit = amount / qty` · `add column double = [Amount (INR)] * 2` (brackets for names with symbols) |
 | Rounding | `round amount to 2 decimals` · `add column k = round(amount / 3, 1)` |
 | If / else labels | `add column size = high if amount > 50000 else low` · `add band: high if amount > 1 lakh, medium if amount > 10000, else low` · `add column status = 'Record Found' if result code is 101 otherwise 'Not Found'` · `add column big = amount > 100000` (Yes/No) · `label amount over 1 lakh as large, otherwise small` · `flag rows where amount > 50000` |
 | Dates | `add days since txn date` · `add column duration = days between start date and end date` · `add column m = months between start date and end date` · `add age from dob` |
@@ -85,6 +87,10 @@ Understood automatically:
 - **Type conversion stops instead of blanking values it can't read.** It shows examples, e.g. `'abc'`, so you can fix or remove them first.
 - **Find & replace ignores case and matches inside text** in text columns, like Excel's default. In number columns it matches whole values only, so `replace 0 with blank` won't turn 10 into 1.
 - **Put text in quotes when it has spaces or punctuation:** `replace "Rs. " with ""`.
+
+**Formula columns in pivots and totals use the totals, like an Excel calculated field.** After `B0% = b0_amt*100/alloc_amt`:
+- `pivot by due_month with B0%` shows, for each month, **total b0_amt × 100 ÷ total alloc_amt**. It doesn't average the row percentages, which would count a ₹1,000 loan as much as a ₹50,000 one. The preview says which way it's calculated.
+- If you really want the plain average of the row values, say `average B0% by due_month`.
 
 **Formulas are restricted by design.** A command becomes a small formula such as `[amount] * 0.18`, which the engine's own calculator evaluates. It never uses Python `eval`, so a formula can only do arithmetic, `round`, `abs` and date differences.
 - **Math on a text column stops and says to convert it first**, rather than treating the text as blank.

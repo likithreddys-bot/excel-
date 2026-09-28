@@ -25,7 +25,7 @@ import auth
 import engine
 from engine import PlanError, Sheets
 from plan import FORMAT_OPS, Plan
-from planner import describe, make_plan
+from planner import describe, examples, make_plan, reply_columns
 
 PREVIEW_ROWS = 100
 IDLE_MINUTES = float(os.environ.get("SHEET_ASSISTANT_IDLE_MINUTES", 60))
@@ -44,6 +44,7 @@ class Session:
     applied: list[tuple[str, Plan]] = field(default_factory=list)  # (request, plan)
     pointer: int = 0  # applied[:pointer] are active; the rest can be redone
     pending: tuple[str, Plan] | None = None
+    asked: str | None = None  # a request waiting for the user to reply with column names
     last_used: float = field(default_factory=time.time)
     current: Sheets = field(init=False)
 
@@ -53,6 +54,10 @@ class Session:
     def formats(self) -> list:
         """Active formatting steps (highlights, number formats, charts), applied in the Excel download."""
         return [st for _, p in self.applied[: self.pointer] for st in p.steps if st.op in FORMAT_OPS]
+
+    def computed(self) -> dict[str, str]:
+        """Formulas behind columns made by earlier commands ("B0% = ..."), for calculated-field totals."""
+        return {st.name: st.expr for _, p in self.applied[: self.pointer] for st in p.steps if st.op == "compute"}
 
     def recompute(self):
         sheets = self.original
@@ -192,7 +197,7 @@ async def upload(request: Request, file: UploadFile):
     kept = {n: df for n, df in sheets.items() if n != main}
     sid = uuid.uuid4().hex
     sessions[sid] = Session(filename=file.filename, original={main: sheets[main]}, owner=request.state.user, kept=kept)
-    return {"session_id": sid, **state(sessions[sid])}
+    return {"session_id": sid, **state(sessions[sid]), "examples": examples(sessions[sid].current)}
 
 
 @app.post("/api/files")
@@ -216,10 +221,21 @@ class PlanRequest(BaseModel):
 @app.post("/api/plan")
 def plan(req: PlanRequest, request: Request):
     s = get_session(req.session_id, request)
-    p = make_plan(s.current, req.message, s.files)
+    # A reply that is only column names answers the question asked just before ("Which column ...?").
+    reply = reply_columns(s.current, req.message) if s.asked else None
+    if reply and reply[1]:
+        return {"clarification_question": "I couldn't find " + ", ".join(reply[1]) + ". Reply again with the column names."}
+    if reply:
+        request_text = f"{s.asked} → {req.message}"
+        p = make_plan(s.current, s.asked, s.files, s.computed(), answer=reply[0])
+    else:
+        request_text = req.message
+        p = make_plan(s.current, req.message, s.files, s.computed())
     if p.clarification_question:
         s.pending = None
+        s.asked = (s.asked if reply else req.message) if p.awaits_columns else None
         return {"clarification_question": p.clarification_question}
+    s.asked = None
 
     # Dry run: execute on the real data so the preview shows exact numbers.
     notes: list[str] = []
@@ -229,7 +245,7 @@ def plan(req: PlanRequest, request: Request):
         s.pending = None
         return {"error": f"This plan can't run on your data: {e}", "plan": p.model_dump()}
 
-    s.pending = (req.message, p)
+    s.pending = (request_text, p)
     return {
         "summary": p.summary,
         "steps": [describe(step) for step in p.steps],

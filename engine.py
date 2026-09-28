@@ -44,11 +44,19 @@ def _as_number(s: pd.Series) -> pd.Series:
 def _as_date(s: pd.Series) -> pd.Series:
     if pd.api.types.is_datetime64_any_dtype(s):
         return s
-    # ISO (yyyy-mm-dd) as-is; anything else is read day-first (dd/mm/yyyy).
+    # ISO (yyyy-mm-dd) as-is; anything else is read day-first (dd/mm/yyyy). The common fixed layouts are
+    # parsed in one go (fast on 700K+ rows); only values they miss are parsed one by one.
     text = s.astype(str)
     iso = text.str.match(r"\d{4}-\d{1,2}-\d{1,2}")
-    out = pd.to_datetime(text.where(iso), errors="coerce", format="mixed")
-    return out.fillna(pd.to_datetime(text.where(~iso), errors="coerce", format="mixed", dayfirst=True))
+    out = pd.to_datetime(text.where(iso), errors="coerce", format="ISO8601")
+    out = out.fillna(pd.to_datetime(text.where(~iso), errors="coerce", format="%d/%m/%Y"))
+    rest = out.isna() & s.notna() & text.str.strip().ne("")
+    if rest.any():
+        slow = text[rest]
+        slow_iso = iso[rest]
+        out[rest] = pd.to_datetime(slow.where(slow_iso), errors="coerce", format="mixed").fillna(
+            pd.to_datetime(slow.where(~slow_iso), errors="coerce", format="mixed", dayfirst=True))
+    return out
 
 
 def _sort_key(s: pd.Series) -> pd.Series:
@@ -72,14 +80,21 @@ def date_part(s: pd.Series, part: str) -> pd.Series:
         case "quarter":
             return (d.dt.year.astype("Int64").astype(str) + "-Q" + d.dt.quarter.astype("Int64").astype(str)).where(d.notna())
         case "month":
-            return d.dt.strftime("%Y-%m")
+            return _format_dates(d, "%Y-%m")
         case "week":
-            return d.dt.strftime("%G-W%V")
+            return _format_dates(d, "%G-W%V")
         case "weekday":
             return pd.Series(pd.Categorical(d.dt.day_name(), categories=WEEKDAYS, ordered=True), index=s.index)
         case "day":
-            return d.dt.strftime("%Y-%m-%d")
+            return _format_dates(d, "%Y-%m-%d")
     raise PlanError(f"Unknown date part {part}")
+
+
+def _format_dates(d: pd.Series, fmt: str) -> pd.Series:
+    """strftime on each distinct day only: 740K rows usually hold a few hundred distinct dates."""
+    codes, days = pd.factorize(d.dt.normalize())
+    text = pd.DatetimeIndex(days).strftime(fmt).to_numpy(dtype=object)
+    return pd.Series([text[c] if c >= 0 else None for c in codes], index=d.index, dtype=object)
 
 
 def _blank_to_label(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -90,8 +105,30 @@ def _blank_to_label(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df
 
 
+def calculated_totals(df: pd.DataFrame, keys: list[str], calculated: dict[str, str]) -> pd.DataFrame:
+    """Each formula worked out on each group's totals, like an Excel pivot calculated field:
+    "[b0_amt] * 100 / [alloc_amt]" gives total b0_amt * 100 / total alloc_amt per group - not an
+    average of the row-level percentages, which would weigh a small loan the same as a big one."""
+    refs = sorted({r for expr in calculated.values() for r in re.findall(r"\[([^\]]+)\]", expr)})
+    _check_columns(df, keys + refs)
+    numbers = pd.DataFrame({r: _num(df[r]) for r in refs}, index=df.index)
+    if keys:
+        sums = numbers.groupby([df[k] for k in keys], dropna=False, observed=True).sum(min_count=1)
+    else:
+        sums = numbers.sum(min_count=1).to_frame().T
+    return pd.DataFrame({name: evaluate(sums, expr) for name, expr in calculated.items()}, index=sums.index)
+
+
 def _pivot(df: pd.DataFrame, step) -> pd.DataFrame:
     df = _blank_to_label(df, step.rows + step.columns)
+    if step.calculated:
+        body = calculated_totals(df, step.rows, step.calculated).reset_index()
+        if step.totals:
+            total = calculated_totals(df, [], step.calculated)
+            label = {c: "" for c in step.rows}
+            label[step.rows[0]] = "Total"
+            body = pd.concat([body, total.assign(**label)[body.columns]], ignore_index=True)
+        return body
 
     def agg(keys):
         g = df.groupby(keys, observed=True) if keys else None
@@ -207,7 +244,11 @@ def _apply_step(df: pd.DataFrame, step: Step) -> Sheets | pd.DataFrame:
         case "group_by":
             _check_columns(df, step.columns + [a.column for a in step.aggregations])
             agg = {f"{a.func}_{a.column}": (a.column, a.func) for a in step.aggregations}
-            return df.groupby(step.columns, dropna=False, observed=True).agg(**agg).reset_index()
+            out = df.groupby(step.columns, dropna=False, observed=True).agg(**agg) if agg else None
+            if step.calculated:
+                calc = calculated_totals(df, step.columns, step.calculated)
+                out = calc if out is None else out.join(calc)
+            return out.reset_index()
         case "split_by":
             _check_columns(df, [step.column])
             groups = df.groupby(df[step.column], sort=True, dropna=False, observed=True)
