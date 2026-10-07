@@ -1,9 +1,10 @@
 import { describe as describeStep } from "./engine/describe";
 import { applyPlan, PlanError, rowCounts } from "./engine/engine";
+import { FormatStep, chartTable, highlightMask, isFormatStep, liveFormats } from "./engine/format";
 import { Parser, makePlan, replyColumns } from "./engine/parser";
 import { profile } from "./engine/profile";
 import type { Plan } from "./engine/plan";
-import type { Cell, Sheets, Table } from "./engine/table";
+import { Cell, Sheets, Table, combine } from "./engine/table";
 import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
 import { ExcelHost } from "./excel/io";
@@ -12,7 +13,7 @@ import { Host, HostError, SourceRef } from "./host";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const num = (n: number) => n.toLocaleString("en-IN");
 
-interface Pending { text: string; plan: Plan; result: Sheets; before: number; using: string; notes: string[] }
+interface Pending { text: string; plan: Plan; result: Sheets; before: number; using: string; notes: string[]; formats: FormatStep[] }
 
 const state = {
   host: null as Host | null,
@@ -55,7 +56,7 @@ function cellText(t: Table, j: number, i: number): string {
   return typeof v === "number" ? String(Math.round(v * 1e6) / 1e6) : String(v);
 }
 
-function miniTable(t: Table, limit = 5): HTMLElement {
+function miniTable(t: Table, limit = 5, paint?: (row: number, col: number) => string | null): HTMLElement {
   const wrap = el("div", "mini");
   const table = el("table");
   const head = el("tr");
@@ -63,7 +64,12 @@ function miniTable(t: Table, limit = 5): HTMLElement {
   table.append(head);
   for (let i = 0; i < Math.min(limit, t.nrows); i++) {
     const tr = el("tr");
-    t.columns.forEach((_, j) => tr.append(el("td", "", cellText(t, j, i))));
+    t.columns.forEach((_, j) => {
+      const td = el("td", "", cellText(t, j, i));
+      const colour = paint?.(i, j);
+      if (colour) { td.style.background = "#" + colour; td.style.color = "#1f2328"; }
+      tr.append(td);
+    });
     table.append(tr);
   }
   wrap.append(table);
@@ -185,7 +191,7 @@ async function preview(text: string): Promise<void> {
     if (e instanceof PlanError) { post("err", `This can't run on your data: ${e.message}`); return; }
     throw e;
   }
-  state.pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(notes)] };
+  state.pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(notes)], formats: plan.steps.filter(isFormatStep) };
   renderPreview(state.pending);
 }
 
@@ -211,8 +217,14 @@ function renderPreview(p: Pending): void {
   card.append(out);
   for (const note of p.notes) card.append(el("div", "note", note));
   const first = p.result.get(names[0])!;
-  if (first.nrows) card.append(miniTable(first), el("div", "muted", names.length > 1 ? `First rows of “${names[0]}”` : "First rows of the result"));
+  const paint = highlightPainter(first, liveFormats(p.formats, p.result));
+  if (first.nrows) card.append(miniTable(first, 5, paint), el("div", "muted", names.length > 1 ? `First rows of “${names[0]}”` : "First rows of the result"));
   else card.append(el("div", "note", "No rows match. Nothing would be written."));
+  for (const f of liveFormats(p.formats, p.result)) {
+    if (f.op !== "chart") continue;
+    const data = chartTable(combine(p.result), f);
+    card.append(el("div", "muted", `The chart “${f.title}” will draw these ${data.nrows} values:`), miniTable(data, 8));
+  }
   card.append(el("div", "note", "Your original data is never changed. The result goes onto new sheet(s)."));
 
   const actions = el("div", "actions");
@@ -227,9 +239,20 @@ function renderPreview(p: Pending): void {
   run.addEventListener("click", () => { lock(); void guarded(() => execute(p)); });
 }
 
+/** Colours for the preview rows, so the user sees what a highlight will mark. */
+function highlightPainter(t: Table, formats: FormatStep[]): ((row: number, col: number) => string | null) | undefined {
+  const marks = formats.flatMap((f) => (f.op === "highlight" ? [{ mask: highlightMask(t, f), col: f.column ? t.columns.findIndex((c) => c.name === f.column) : -1, color: f.color }] : []));
+  if (!marks.length) return undefined;
+  return (row, col) => {
+    let out: string | null = null;
+    for (const m of marks) if (m.mask[row] && (m.col < 0 || m.col === col)) out = m.color;
+    return out;
+  };
+}
+
 async function execute(p: Pending): Promise<void> {
   if (state.pending !== p) return;
-  const made = await state.host!.writeResult(p.result);
+  const made = await state.host!.writeResult(p.result, p.formats);
   state.pending = null;
   const card = post("bot");
   card.classList.add("ok");

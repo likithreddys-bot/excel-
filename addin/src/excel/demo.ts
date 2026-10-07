@@ -50,7 +50,7 @@ export class DemoHost implements Host {
     return { ref: { sheet, address: "A1" }, label: `${sheet}!A1:H${table.nrows + 1}`, table };
   }
 
-  async writeResult(sheets: Sheets): Promise<Created[]> {
+  async writeResult(sheets: Sheets, _formats?: unknown): Promise<Created[]> {
     const out: Created[] = [];
     for (const [wanted, table] of sheets) {
       let name = wanted, n = 2;

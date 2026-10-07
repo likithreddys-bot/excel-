@@ -44,7 +44,7 @@ def make_bank_df(n=2000, seed=0) -> pd.DataFrame:
 SUPPORTED = {"filter", "select_columns", "drop_columns", "sort", "dedupe", "split_by", "date_part",
              "group_by", "pivot", "top_n", "calculate", "compute", "label",
              "clean_text", "fill_blanks", "drop_blank_rows", "replace", "split_column", "merge_columns", "rename", "convert",
-             "lookup", "append", "compare"}
+             "lookup", "append", "compare", "highlight", "number_format", "chart"}
 
 COMMANDS = [
     # filters
@@ -103,8 +103,18 @@ COMMANDS = [
     # calculated columns on the bank file
     "add column gst = amount * 0.18", "add column net = balance - amount", "round amount to 2 decimals",
     "add column size = high if amount > 50000 else low",
-    # not yet in the add-in (must be recognised, not guessed)
-    "highlight debits in red", "trim spaces", "bar chart of total amount by category", "rename amount to amt",
+    # formatting
+    "highlight debits in red", "highlight rows where amount > 1 lakh in red", "highlight amount above 150000",
+    "highlight debits in green", "highlight duplicates in description", "highlight blanks in branch",
+    "highlight rows where amount > 150000 in red, then keep only debits", "show amount in rupees",
+    "format balance with commas", "show balance with 0 decimals", "show balance as whole numbers",
+    "show balance to 1 decimal", "show txn date as dd-mmm-yyyy", "show description in rupees",
+    "highlight rows where amount > 100000 in dark blue and show amount in rupees",
+    "show amount and balance as percent",
+    "bar chart of total amount by category", "line chart of amount by month", "pie chart of count by txn type",
+    "horizontal bar chart of average amount by branch", "plot total balance by year",
+    "chart debits amount by category", "chart amount by txn id", "chart amount",
+    "total amount by category and add a pie chart of it by category", "trim spaces", "rename amount to amt",
 ]
 
 LEDGER_COMMANDS = [
@@ -305,8 +315,13 @@ def build(df, commands, files=None):
             case["runnable"] = True
             try:
                 notes: list[str] = []
-                case["result"] = result_of(engine.apply_plan(sheets, plan, files=files, notes=notes), plan)
+                result = engine.apply_plan(sheets, plan, files=files, notes=notes)
+                case["result"] = result_of(result, plan)
                 case["notes"] = notes
+                # What each chart is drawn from.
+                case["charts"] = [{"columns": [str(c) for c in f.columns], "cells": cells_of(f)} for f in (
+                    engine.chart_data(pd.concat(list(result.values()), ignore_index=True), st)
+                    for st in plan.steps if st.op == "chart")]
             except engine.PlanError as e:  # parses fine but can't run on this data: the add-in must refuse too
                 case["run_error"] = str(e)
         cases.append(case)

@@ -4,6 +4,7 @@ import { calculate, groupBy, pivot, topN } from "./aggregate";
 import { cleanText, convertColumns, dropBlankRows, fillBlanks, mergeColumns, renameColumns, replaceText, splitColumn } from "./clean";
 import { evaluate } from "./evaluate";
 import { append, compare as compareSheets, lookup } from "./files";
+import { checkFormat } from "./format";
 import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
 import { Cell, Column, Sheets, Table, getColumn, makeColumn, pick, timesOf } from "./table";
 import { DAY_MS, isoDay, parseDateText, todayMs } from "./util";
@@ -217,6 +218,7 @@ function applyStep(t: Table, step: Step, files: Files, notes: string[]): Table |
     case "merge_columns": return mergeColumns(t, step);
     case "rename": return renameColumns(t, step);
     case "convert": return convertColumns(t, step);
+    case "highlight": case "number_format": case "chart": checkFormat(t, step, notes); return t; // data unchanged
     case "lookup": return lookup(t, step, otherSheet(files, step.file), notes);
     case "append": return append(t, step, otherSheet(files, step.file), notes);
     case "compare": return compareSheets(t, step, otherSheet(files, step.file), notes);

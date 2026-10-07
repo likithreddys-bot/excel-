@@ -1,4 +1,5 @@
 /** What the task pane needs from the spreadsheet it runs in. Excel implements it; a demo implements it for browsers. */
+import type { FormatStep } from "./engine/format";
 import type { Sheets, Table } from "./engine/table";
 
 export interface SourceRef {
@@ -29,7 +30,7 @@ export interface Host {
   /** The whole used range of a sheet, first row as headers. */
   readSheet(name: string): Promise<Table>;
   /** Write each sheet as a new worksheet (never over existing ones). */
-  writeResult(sheets: Sheets): Promise<Created[]>;
+  writeResult(sheets: Sheets, formats?: FormatStep[]): Promise<Created[]>;
   removeSheets(names: string[]): Promise<void>;
   /** Where to read next if the user wants to carry on from the new sheet. */
   refOf(sheetName: string): Promise<SourceRef>;

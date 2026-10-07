@@ -1,5 +1,7 @@
 /** Reads and writes real Excel worksheets through Office.js. */
+import { FormatStep, liveFormats } from "../engine/format";
 import { Cell, Sheets, Table, makeTable } from "../engine/table";
+import { addCharts, formatSheet } from "./format";
 import { Created, Host, HostError, Source, SourceRef } from "../host";
 
 const READ_CELLS_PER_CHUNK = 100_000;
@@ -100,7 +102,7 @@ export class ExcelHost implements Host {
     }).catch(rethrow);
   }
 
-  async writeResult(sheets: Sheets): Promise<Created[]> {
+  async writeResult(sheets: Sheets, formats: FormatStep[] = []): Promise<Created[]> {
     return Excel.run(async (ctx) => {
       const existing = ctx.workbook.worksheets;
       existing.load("items/name");
@@ -111,13 +113,19 @@ export class ExcelHost implements Host {
       const created: Created[] = [];
       let first: Excel.Worksheet | null = null;
 
+      const live = liveFormats(formats, sheets);
       for (const [wanted, table] of sheets) {
         const name = freeName(wanted, taken);
         const ws = ctx.workbook.worksheets.add(name);
         first ??= ws;
         await writeTable(ctx, ws, table, tableNames);
+        ws.load("name");
+        formatSheet(ws, table, live);
+        await ctx.sync();
         created.push({ name, rows: table.nrows });
       }
+      created.push(...(await addCharts(ctx, sheets, live, taken)));
+      await ctx.sync();
       first?.activate();
       await ctx.sync();
       return created;

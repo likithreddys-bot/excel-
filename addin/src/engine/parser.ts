@@ -3,7 +3,7 @@
  * A line-by-line port of planner.py (the Python reference), covering filter, sort, split, dedupe and
  * column choice. Commands the add-in can't run yet are recognised and answered honestly instead of guessed at.
  */
-import { describe } from "./describe";
+import { COLORS, describe } from "./describe";
 import { applyPlan, PlanError } from "./engine";
 import type { Aggregation, Condition, DatePartStep, FilterStep, GroupByStep, PivotStep, Plan, SortStep, Step, TopNStep } from "./plan";
 import { Cell, Sheets, Table, combine, isBlankCell } from "./table";
@@ -55,10 +55,10 @@ const CONVERT = new RegExp(
   String.raw`(?<cols>.+?)\s+(?:(?:to|as|into)\s+)?(?:an?\s+)?(?:proper\s+|real\s+)?` +
   String.raw`(?<to>numbers?|numeric|integers?|decimals?|dates?|text|strings?)(?:\s+(?:format|type|values?))?\s*$`, "i");
 const NUMBER_FORMAT = new RegExp(
-  String.raw`^\s*(?:please\s+)?(?:format|show|display|make|set|put)\s+(?:the\s+)?(.+?)\s+(?:as|in|with|to|using)\s+(?:an?\s+)?` +
-  String.raw`(rupees?|inr|₹|indian\s+(?:rupees?|format|currency)|currency|money|commas?|comma\s+separators?` +
-  String.raw`|thousands?\s+separators?|percent(?:age)?s?|%|(?:\d+|no|zero|one|two|three)\s+decimals?(?:\s+places?)?` +
-  String.raw`|whole\s+numbers?|integers?|(?:(?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)))` +
+  String.raw`^\s*(?:please\s+)?(?:format|show|display|make|set|put)\s+(?:the\s+)?(?<cols>.+?)\s+(?:as|in|with|to|using)\s+(?:an?\s+)?` +
+  String.raw`(?<style>rupees?|inr|₹|indian\s+(?:rupees?|format|currency)|currency|money|commas?|comma\s+separators?` +
+  String.raw`|thousands?\s+separators?|percent(?:age)?s?|%|(?<dec>\d+|no|zero|one|two|three)\s+decimals?(?:\s+places?)?` +
+  String.raw`|whole\s+numbers?|integers?|(?<date>(?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)))` +
   String.raw`(?:\s+format)?\s*$`, "i");
 
 const NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
@@ -348,9 +348,8 @@ export class Parser {
       if (fm) return this.parseFileCommand(cl, fm);
     }
     // Formatting first: "highlight duplicates in pan" must colour rows, never remove them.
-    if (/^\s*(?:please\s+)?(?:highlight|colou?r|shade)\b/.test(low)) return soon("Highlighting");
-    if (/\b(?:chart|graph|plot)\b/.test(low)) return soon("Charts");
-    if (NUMBER_FORMAT.test(cl)) return soon("Number formatting");
+    const formatting = this.formatCommand(cl);
+    if (formatting !== null) return formatting;
     if (/\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b/.test(low)) return [this.parseDedupe(cl)];
     const formula = this.formulaCommand(cl);
     if (formula !== null) return formula;
@@ -670,6 +669,105 @@ export class Parser {
     const cols = this.columnList(body, "merge");
     if (cols.length < 2) throw new ParseError("Merge which columns? e.g. merge first and last into full name");
     return { op: "merge_columns", columns: cols, separator, name: name || cols.join(" ") };
+  }
+
+  // ---------- formatting: highlight, number formats, charts ----------
+
+  /** Commands that only change how the result looks. Null if `cl` isn't one. */
+  private formatCommand(cl: string): Step[] | null {
+    const low = cl.toLowerCase();
+    if (/^\s*(?:please\s+)?(?:highlight|colou?r|shade)\b/.test(low)) return [this.parseHighlight(cl)];
+    if (/\b(?:chart|graph|plot)\b/.test(low)) return [this.parseChart(cl)];
+    const m = NUMBER_FORMAT.exec(cl);
+    return m ? this.parseNumberFormat(m) : null;
+  }
+
+  private parseHighlight(cl: string): Step {
+    let color = COLORS.yellow;
+    const cm = /\s*\b(?:in|with|as|using)?\s*(?<shade>light|pale|dark|bright)?\s*(?<c>yellow|red|green|blue|orange|purple|pink|gr[ae]y)\b(?:\s+colou?r)?/i.exec(cl);
+    if (cm) {
+      const base = cm.groups!.c.toLowerCase().replace("gray", "grey");
+      color = COLORS[(["dark", "bright"].includes((cm.groups!.shade ?? "").toLowerCase()) ? "dark " : "") + base];
+      cl = cl.slice(0, cm.index) + " " + cl.slice(cm.index! + cm[0].length);
+    }
+    let body = cl.replace(/^\s*(?:please\s+)?(?:highlight|colou?r|shade)\s+(?:all\s+)?(?:the\s+)?/i, "").trim();
+    const rows = /^(?:rows?|records?|transactions?|entries|lines)\b/i.test(body);
+    body = body.replace(/^(?:rows?|records?|transactions?|entries|lines)\s+(?:where|with|that\s+have|having|which\s+have|whose|if|for)?\s*/i, "");
+    let m = /^(?:the\s+)?(?:duplicates?|duplicate\s+values?|repeated\s+values?|repeats?)\s+(?:in|of|on)\s+(?<c>.+)$/i.exec(body)
+      ?? /^(?:duplicate|repeated)\s+(?<c>.+)$/i.exec(body);
+    if (m) {
+      const c = this.column(m.groups!.c);
+      if (c === null) throw new ParseError(`Which column should I check for duplicates? Columns: ${this.columns.join(", ")}`);
+      return { op: "highlight", when: null, duplicates_in: c, column: rows ? null : c, color };
+    }
+    m = /^(?:the\s+)?(?:blanks?|empty(?:\s+cells?)?|missing(?:\s+values?)?)\s+(?:in|of)\s+(?<c>.+)$/i.exec(body)
+      ?? /^(?:blank|empty|missing)\s+(?<c>.+)$/i.exec(body);
+    if (m) {
+      const c = this.column(m.groups!.c);
+      if (c === null) throw new ParseError(`Which column should I check for blanks? Columns: ${this.columns.join(", ")}`);
+      return { op: "highlight", when: { op: "filter", conditions: [{ column: c, operator: "is_empty" }], match: "all" }, duplicates_in: null, column: rows ? null : c, color };
+    }
+    const when = this.parseFilter(body);
+    // "highlight amount above 50000" colours those cells; "highlight debits" (no column named) colours rows.
+    const startsWithColumn = this.findColumns(body).some((x) => x.start === 0);
+    const column = rows || !startsWithColumn ? null : when.conditions[0].column;
+    return { op: "highlight", when, duplicates_in: null, column, color };
+  }
+
+  private parseNumberFormat(m: RegExpExecArray): Step[] {
+    const g = m.groups!;
+    const styleText = g.style.toLowerCase();
+    let style: "rupees" | "commas" | "percent" | "decimals" | "date";
+    let decimals = 2;
+    let pattern: string | null = null;
+    if (g.date) { style = "date"; pattern = g.date.toUpperCase(); }
+    else if (/^(?:rupee|inr|₹|indian|currency|money)/.test(styleText)) style = "rupees";
+    else if (/^(?:comma|thousand)/.test(styleText)) style = "commas";
+    else if (/^(?:percent|%)/.test(styleText)) style = "percent";
+    else {
+      style = "decimals";
+      const d = g.dec;
+      decimals = !d || ["no", "zero"].includes(d.toLowerCase()) ? 0 : NUMBER_WORDS[d.toLowerCase()] ?? parseInt(d, 10);
+    }
+    const cols = /^\s*(?:all\s+)?(?:the\s+)?(?:numbers?|number\s+columns?|numeric\s+columns?|values?|everything)\s*$/i.test(g.cols)
+      ? null : this.columnList(g.cols, "format");
+    const steps: Step[] = [];
+    if (style === "date") {
+      // "15/11/2024" stored as text can't take a date format; convert it first (shown in the preview).
+      const textDates = (cols ?? []).filter((c) => this.dateCols.includes(c) && this.col(c).values.some((v) => typeof v === "string"));
+      if (textDates.length) steps.push({ op: "convert", columns: textDates, to: "date" });
+    }
+    steps.push({ op: "number_format", columns: cols, style, decimals, date_pattern: pattern ?? "DD/MM/YYYY" });
+    return steps;
+  }
+
+  private parseChart(cl: string): Step {
+    const low = cl.toLowerCase();
+    const kind = low.includes("pie") ? "pie" : /\b(?:line|trend)\b/.test(low) ? "line" : low.includes("horizontal") ? "bar" : "column";
+    let body = cl.replace(/\b(?:(?:make|create|add|draw|show|give\s+me|insert|plot)\s+)?(?:(?:as|in)\s+)?(?:an?\s+)?(?:(?:horizontal|vertical)\s+)?(?:bar|column|line|pie|trend)?\s*(?:chart|graph|plot)\b\s*(?:of|for|showing|with)?/gi, " ");
+    let filters: FilterStep[];
+    [body, filters] = this.extraFilters(body);
+    const m = GROUP_MARKER.exec(body);
+    if (!m) throw new ParseError("Chart by what? e.g. 'bar chart of total amount by category' or 'line chart of amount by month'");
+    const [head, tail] = movePeriodWords(body.slice(0, m.index), body.slice(m.index + m[0].length));
+    const funcs = Parser.funcsIn(head.toLowerCase());
+    let values = this.findColumns(head).map((x) => x.column);
+    if (values.length > 1) throw new ParseError("A chart shows one column at a time. Which one: " + values.join(", ") + "?");
+    if (!values.length && /\b(?:it|that|this|them|those|the\s+result|the\s+totals?)\b/i.test(head)) values = [this.defaultNumberColumn()];
+    const [prefix, found] = this.dims(tail);
+    const xs = unique(found.map((x) => x.column));
+    if (xs.length !== 1) throw new ParseError("Chart by which one column? e.g. '... by category' or '... by month'");
+    let func = (funcs[0] ?? (values.length ? "sum" : "count")) as string;
+    if (func === "nunique") func = "count";
+    let y: string | null = func === "count" && !values.length ? null : (values[0] ?? this.defaultNumberColumn());
+    if (func === "count") y = null;
+    let x = xs[0], xPart: DatePartStep["part"] | null = null;
+    if (prefix.length) { x = prefix[0].column; xPart = prefix[0].part; } // "by month": chart by the month of the date column
+    this.checkWidth([xs[0]], prefix, "chart bars");
+    let title = ({ sum: "Total", mean: "Average", count: "Count", min: "Minimum", max: "Maximum" } as Record<string, string>)[func];
+    title += y ? ` ${y}` : "";
+    title += ` by ${xPart ?? x}`;
+    return { op: "chart", kind, x, x_part: xPart, y, func: func as "sum", title: title[0].toUpperCase() + title.slice(1), when: filters[0] ?? null };
   }
 
   // ---------- another sheet: lookup, append, compare ----------

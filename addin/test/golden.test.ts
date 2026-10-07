@@ -2,8 +2,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { applyPlan } from "../src/engine/engine";
+import { chartTable } from "../src/engine/format";
+import type { ChartStep } from "../src/engine/plan";
 import { makePlan } from "../src/engine/parser";
-import { Sheets, makeTable } from "../src/engine/table";
+import { Sheets, combine, makeTable } from "../src/engine/table";
 import { isoDay } from "../src/engine/util";
 
 type Data = Record<string, (string | number | null)[]>;
@@ -11,7 +13,7 @@ interface Suite {
   data: Data;
   files?: Record<string, Data>;
   cases: {
-    command: string; question: string | null; plan: unknown[]; summary: string; runnable: boolean; run_error?: string; notes?: string[];
+    command: string; question: string | null; plan: unknown[]; summary: string; runnable: boolean; run_error?: string; notes?: string[]; charts?: { columns: string[]; cells: unknown[][] }[];
     result?: Record<string, { rows: number; ids: number[] | null; columns: string[]; order?: unknown[][]; cells?: unknown[][] | null }>;
   }[];
 }
@@ -56,7 +58,7 @@ for (const [suiteName, suite] of Object.entries(golden.suites)) describe(`matche
       }
       expect(plan.clarification_question).toBeNull();
       expect(clean(plan.steps)).toEqual(c.plan);
-      expect(plan.summary).toBe(c.summary);
+      expect(plan.summary).toBe(c.summary.replace(/ \(Excel download\)/g, "")); // the add-in writes to the sheet, not a download
 
       if (c.run_error) {
         expect(() => applyPlan(sheets, plan, files)).toThrow(c.run_error.slice(0, 50));
@@ -64,7 +66,15 @@ for (const [suiteName, suite] of Object.entries(golden.suites)) describe(`matche
       }
       const notes: string[] = [];
       const out = applyPlan(sheets, plan, files, notes);
-      if (c.notes) expect(notes).toEqual(c.notes);
+      const wording = (list: string[]) => list.filter((x) => !x.startsWith("Formatting and charts"));
+      if (c.notes) expect(wording(notes)).toEqual(wording(c.notes));
+      const chartSteps = plan.steps.filter((x) => x.op === "chart") as ChartStep[];
+      (c.charts ?? []).forEach((expectedChart, i) => {
+        const data = chartTable(combine(out), chartSteps[i]);
+        expect(data.columns.map((x) => x.name)).toEqual(expectedChart.columns);
+        const got = Array.from({ length: data.nrows }, (_, r) => data.columns.map((x) => (typeof x.values[r] === "number" ? Math.round((x.values[r] as number) * 1e6) / 1e6 : x.values[r] ?? null)));
+        expect(got).toEqual(expectedChart.cells.map((row) => row.map((v) => (typeof v === "number" ? Math.round(v * 1e6) / 1e6 : v ?? null))));
+      });
       expect(sameSet([...out.keys()], Object.keys(c.result!))).toBe(true);
       for (const [name, expected] of Object.entries(c.result!)) {
         const t = out.get(name)!;
