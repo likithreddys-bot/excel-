@@ -22,13 +22,14 @@ async function locate(ctx: Excel.RequestContext, ref?: SourceRef): Promise<Excel
   const sel = ctx.workbook.getSelectedRange();
   sel.load("rowCount,columnCount");
   await ctx.sync();
-  const range = sel.rowCount === 1 && sel.columnCount === 1
-    ? sel.getSurroundingRegion() // one cell inside a table: take the whole table around it
-    : sel.getUsedRangeOrNullObject(true); // a bigger selection (even a whole column): just the part with data
-  range.load("isNullObject");
+  if (sel.rowCount === 1 && sel.columnCount === 1) {
+    return sel.getSurroundingRegion(); // one cell inside a table: take the whole table around it
+  }
+  const used = sel.getUsedRangeOrNullObject(true); // a bigger selection (even a whole column): just the part with data
+  used.load("isNullObject");
   await ctx.sync();
-  if (range.isNullObject) throw new HostError("I can't see any data there. Click a cell inside your table first.");
-  return range;
+  if (used.isNullObject) throw new HostError("I can't see any data there. Click a cell inside your table first.");
+  return used;
 }
 
 export class ExcelHost implements Host {
