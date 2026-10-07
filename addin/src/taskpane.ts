@@ -1,6 +1,7 @@
 import { describe as describeStep } from "./engine/describe";
 import { applyPlan, PlanError, rowCounts } from "./engine/engine";
 import { Parser, makePlan, replyColumns } from "./engine/parser";
+import { profile } from "./engine/profile";
 import type { Plan } from "./engine/plan";
 import type { Cell, Sheets, Table } from "./engine/table";
 import { isoDay, key, singular } from "./engine/util";
@@ -82,7 +83,33 @@ function showSource(label: string, t: Table): void {
     ? `Heads up: in ${mixed.join(", ")}, some dates are real Excel dates and some are plain text. I read both, but check them: Excel may have swapped day and month when they were typed or pasted.`
     : "";
   $("source-warning").classList.toggle("hidden", mixed.length === 0);
+  showFindings(t);
   showExamples(t);
+}
+
+/** Beginner mode: tell the user what looks wrong with their table, with a one-click way to start each fix. */
+function showFindings(t: Table): void {
+  const box = $("findings");
+  const found = t.nrows <= 300_000 ? profile(t) : [];
+  box.replaceChildren();
+  if (t.nrows > 300_000) { box.classList.add("hidden"); return; }
+  box.classList.remove("hidden");
+  if (!found.length) {
+    box.append(el("div", "muted", "Your table looks tidy: no repeats, stray spaces or odd blanks."));
+    return;
+  }
+  box.append(el("div", "label", `I noticed ${found.length === 1 ? "something" : `${found.length} things`} you may want to fix:`));
+  const ul = el("ul");
+  for (const f of found) {
+    const li = el("li");
+    const fix = el("button", "", "Fix…");
+    fix.type = "button";
+    fix.title = `Preview: ${f.command}`;
+    fix.addEventListener("click", () => { if (!state.busy) void guarded(() => preview(f.command)); });
+    li.append(el("span", "", f.message), fix);
+    ul.append(li);
+  }
+  box.append(ul);
 }
 
 function showExamples(t: Table): void {
