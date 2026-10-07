@@ -5,7 +5,7 @@
  */
 import { describe } from "./describe";
 import { applyPlan, PlanError } from "./engine";
-import type { Condition, DatePartStep, FilterStep, Plan, SortStep, Step } from "./plan";
+import type { Aggregation, Condition, DatePartStep, FilterStep, GroupByStep, PivotStep, Plan, SortStep, Step, TopNStep } from "./plan";
 import { Cell, Sheets, Table, combine, isBlankCell } from "./table";
 import {
   MONTHS, DAY_MS, closeMatch, colWords, fmt, isoDay, key, parseDate, parseNumber, similarity, singular, utcDay,
@@ -131,6 +131,14 @@ const distinct = (values: Cell[]): number => new Set(values.filter((v) => !isBla
 const localIso = (d: Date): string =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
+/** In "monthly total amount by category" the period word joins the group-by columns. */
+function movePeriodWords(head: string, tail: string): [string, string] {
+  const re = /\b(?:daily|weekly|monthly|quarterly|yearly|annual(?:ly)?)\b/gi;
+  const words = head.match(re);
+  if (!words) return [head, tail];
+  return [head.replace(re, " "), words.join(" ") + " " + tail];
+}
+
 export class Parser {
   readonly table: Table;
   readonly columns: string[];
@@ -213,14 +221,17 @@ export class Parser {
     if (!cats.length) cats = this.numericCols.filter((c) => nun(c) >= 2 && nun(c) <= 50);
     cats.sort((a, b) => nun(a) - nun(b));
     const num = nums[0], cat = cats[0];
-    // Only commands this version can run. (The Python reference also suggests totals, pivots, top N and
-    // calculated columns; they come back here as those features arrive.)
     const out: string[] = [];
+    if (num && cat) out.push(`total ${num} by ${cat}`);
+    if (num && this.dateCols.length) {
+      const words = colWords(this.dateCols[0]).filter((w) => !["date", "dt", "on", "at"].includes(w));
+      out.push(words.length ? `pivot ${num} by ${words[0]}_month` : `total ${num} by month`);
+    }
     if (num) {
       const xs = this.col(num).values.filter((v): v is number => typeof v === "number").sort((a, b) => a - b);
       const median = xs.length ? (xs.length % 2 ? xs[(xs.length - 1) / 2] : (xs[xs.length / 2 - 1] + xs[xs.length / 2]) / 2) : NaN;
       const threshold = Number.isFinite(median) && median ? fmt(Number(median.toPrecision(2))) : "0";
-      out.push(`only rows where ${num} > ${threshold}`, `sort by ${num} descending`);
+      out.push(`only rows where ${num} > ${threshold}`, `sort by ${num} descending`, `top 10 by ${num}`);
     }
     if (cat) {
       const counts = new Map<string, { v: Cell; n: number }>();
@@ -231,7 +242,7 @@ export class Parser {
       const best = [...counts.values()].sort((a, b) => b.n - a.n || (a.v! < b.v! ? -1 : 1))[0];
       out.push(`only rows where ${cat} is ${typeof best.v === "number" ? fmt(best.v) : String(best.v)}`, `split by ${cat}`);
     }
-    out.push("remove duplicate rows");
+    if (nums.length >= 2) out.push(`add column ratio = ${nums[1]} * 100 / ${nums[0]}`);
     out.push("keep columns " + this.columns.slice(0, 3).join(", "));
     return out.slice(0, 8);
   }
@@ -323,13 +334,13 @@ export class Parser {
     if (/\b(?:split|segregate|separate|seperate|segment|divide|partition)\b|\bbreak\b.*\b(?:up|down|into)\b|\b(?:sheets?|tabs?|files?)\s+(?:per|for\s+each|by)\b/.test(low)) {
       return this.parseSplit(cl);
     }
-    if (TOP_N.test(low)) return soon("Top / bottom N");
+    if (TOP_N.test(low)) return this.parseTopN(cl);
     if (/\brank(?:ed|ing)?\b|\b(?:running|cumulative)\b/.test(low) || (PERCENT.test(low) && !this.isGroup(low.replace(new RegExp(PERCENT.source, "gi"), " ")))) {
-      return soon("Ranking, running totals and percent of total");
+      return this.parseCalculate(cl);
     }
     if (/\b(?:sort|sorted|arrange)\b|\border(?:ed)?\s+(?:\w+\s+)?by\b/.test(low)) return [this.parseSort(cl)];
-    if (PIVOT.test(low)) return soon("Pivot tables");
-    if (this.isGroup(low)) return soon("Totals and counts by group");
+    if (PIVOT.test(low)) return this.parsePivot(cl);
+    if (this.isGroup(low)) return this.parseGroup(cl);
     const step = this.parseColumns(cl);
     if (step) return [step];
     return [this.parseFilter(cl)];
@@ -391,6 +402,236 @@ export class Parser {
     if (TRIM.test(low)) soon("Trimming spaces");
     if (/^\s*(?:please\s+)?fill\b/.test(low)) soon("Filling blanks");
     if (CONVERT.test(cl)) soon("Converting column types");
+  }
+
+  // ---------- totals, pivots, top N, running totals ----------
+
+  private static funcsIn(low: string): Aggregation["func"][] {
+    const found: Aggregation["func"][] = [];
+    const table: [RegExp, Aggregation["func"]][] = [
+      [/\b(?:totals?|sums?)\b/, "sum"], [/\b(?:averages?|avg|mean)\b/, "mean"],
+      [/\b(?:counts?|how\s+many|number\s+of)\b/, "count"], [/\b(?:min|minimum|lowest|smallest)\b/, "min"],
+      [/\b(?:max|maximum|highest|largest|biggest)\b/, "max"], [/\b(?:unique|distinct)\b/, "nunique"],
+    ];
+    for (const [re, f] of table) if (re.test(low)) found.push(f);
+    return found;
+  }
+
+  /** Row filters mentioned inside another command, e.g. "top 10 *debits* by amount *in the last 30 days*". */
+  private extraFilters(text: string): [string, FilterStep[]] {
+    let conds: Condition[];
+    [text, conds] = this.datePhrases(text);
+    const [rest, vconds] = this.bareValues(text);
+    conds = conds.concat(vconds);
+    return [rest, conds.length ? [{ op: "filter", conditions: conds, match: "all" }] : []];
+  }
+
+  /** In "count by year for result code 101", the part after for/where/with is a row filter. */
+  private trailingFilter(text: string): [string, FilterStep[]] {
+    const m = /\b(?:for(?!\s+(?:each|every)\b)|where|with|when|if|having)\b/i.exec(text);
+    if (!m || !text.slice(m.index + m[0].length).trim()) return [text, []];
+    return [text.slice(0, m.index), [this.parseFilter(text.slice(m.index + m[0].length))]];
+  }
+
+  private columnsIn(text: string, what: string): string[] {
+    const cols = unique(this.findColumns(text).map((m) => m.column));
+    return cols.length ? cols : this.answered(`I ${what}`);
+  }
+
+  /** The columns given in reply to this question, or the question itself. */
+  private answered(what: string): string[] {
+    if (this.answer.length) return [...this.answer];
+    throw new ParseError(`Which column should ${what}? Reply with the column name(s). Columns: ` + this.columns.join(", "), true);
+  }
+
+  /** Several columns totalled side by side become a "calculated" pivot of plain totals. */
+  private calculated(values: string[], funcs: string[]): Record<string, string> {
+    if (funcs.length && funcs[0] !== "sum") return {}; // "average B0% by month" really means the average of the row values
+    if (values.length < 2) return {};
+    return Object.fromEntries(values.map((v) => [v, `[${v}]`]));
+  }
+
+  private checkPivotWidth(cols: string[], steps: DatePartStep[], what: string): void {
+    this.checkWidth(cols, steps, what);
+  }
+
+  private parseGroup(cl: string): Step[] {
+    const pct = new RegExp(PERCENT.source, "i").exec(cl);
+    if (pct) cl = cl.slice(0, pct.index) + " " + cl.slice(pct.index + pct[0].length);
+    let filters: FilterStep[];
+    [cl, filters] = this.extraFilters(cl); // "how many debits per branch": debits is a row filter
+    const explicit = Parser.funcsIn(cl.toLowerCase());
+    const funcs = explicit.length ? explicit : (["count"] as Aggregation["func"][]);
+    const m = GROUP_MARKER.exec(cl)!;
+    let head: string, tail: string;
+    [head, tail] = movePeriodWords(cl.slice(0, m.index), cl.slice(m.index + m[0].length));
+    let more: FilterStep[];
+    [tail, more] = this.trailingFilter(tail);
+    filters = filters.concat(more);
+    const [prefix, found] = this.dims(tail);
+    const groupCols = unique(found.map((x) => x.column));
+    if (!groupCols.length) groupCols.push(...this.answered("I group by"));
+    let valueCols = this.findColumns(head).map((x) => x.column).filter((c) => !groupCols.includes(c));
+    if (!valueCols.length && !(funcs.length === 1 && funcs[0] === "count")) {
+      valueCols = this.answer.filter((c) => this.numericCols.includes(c) && !groupCols.includes(c));
+    }
+    const aggs: Aggregation[] = [];
+    for (const f of funcs) {
+      if (f === "count" && !valueCols.length) { aggs.push({ column: groupCols[0], func: "count" }); continue; }
+      for (const c of valueCols.length ? unique(valueCols) : [this.defaultNumberColumn()]) aggs.push({ column: c, func: f });
+    }
+    const steps: Step[] = [...filters, ...prefix, { op: "group_by", columns: groupCols, aggregations: aggs, calculated: {} } as GroupByStep];
+    if (pct) {
+      const out = `${aggs[0].func}_${aggs[0].column}`;
+      steps.push({ op: "calculate", kind: "percent_of_total", column: out, per: null, descending: true, name: `% of total ${out}` });
+    }
+    return steps;
+  }
+
+  private parsePivot(cl: string): Step[] {
+    let filters: FilterStep[];
+    [cl, filters] = this.extraFilters(cl);
+    const funcs = Parser.funcsIn(cl.toLowerCase());
+    if (funcs.length > 1) throw new ParseError("A pivot shows one calculation at a time. Which one: " + funcs.join(", ") + "?");
+    const m = /\b(?:by|per|for\s+each|across|on|wrt|with\s+respect\s+to|against)\b/i.exec(cl);
+    let text: string, marker: number | null;
+    if (m) {
+      const [head, rest] = movePeriodWords(cl.slice(0, m.index), cl.slice(m.index + m[0].length));
+      marker = head.length + 1;
+      text = `${head} ${m[0]} ${rest}`;
+    } else { text = cl; marker = null; }
+    // "... with (these) columns B0% and overall_repay%": the values to show.
+    let shown: string[] = [];
+    const vm = /\b(?:with|showing|show|using)\s+(?:the\s+|these\s+|those\s+)?((?:columns?|values?|fields?|measures?|metrics?)\s+)?(.+)$/i.exec(text);
+    if (vm && !/\b(?:in|as|on)\s+(?:the\s+)?(?:rows?|columns?)\b|\bacross\b/i.test(vm[2])) {
+      try {
+        shown = this.columnList(vm[2], "show in the pivot");
+        text = text.slice(0, vm.index);
+      } catch (e) {
+        if (!(e instanceof ParseError)) throw e;
+        if (vm[1]) throw e; // they said "with columns ..." but named something that isn't a column
+      }
+    }
+    const [prefix, found] = this.dims(text);
+    const across = /\bacross\s+(?:the\s+top\s+)?(?:by\s+)?/i.exec(text);
+    let rows: string[] = [], cols: string[] = [];
+    const headCols: string[] = [];
+    for (const d of found) {
+      const after = text.slice(d.end);
+      if (/^\s*(?:(?:as|in|on)\s+(?:the\s+)?columns?\b|across\s+the\s+top)/i.test(after) || (across && d.start >= across.index! + across[0].length)) cols.push(d.column);
+      else if (/^\s*(?:(?:as|in|on)\s+(?:the\s+)?rows?\b|down\s+the\s+side)/i.test(after)) rows.push(d.column);
+      else if (marker === null || d.end <= marker) headCols.push(d.column); // before "by": the column to summarise
+      else rows.push(d.column);
+    }
+    if (!cols.length && rows.length >= 2) cols = [rows.pop()!]; // "pivot amount by category and txn type": last one goes across the top
+    rows = unique(rows); cols = unique(cols);
+    const values = unique([...headCols, ...shown]).filter((c) => ![...rows, ...cols].includes(c));
+    if (!rows.length) rows = this.answered("go down the side of the pivot");
+    this.checkPivotWidth(cols, prefix, "pivot columns");
+    const calculated = this.calculated(values, funcs);
+    if (Object.keys(calculated).length) {
+      if (cols.length) {
+        throw new ParseError("Columns like " + Object.keys(calculated).join(", ") + " can't have another column across the top yet. "
+          + `Try: pivot by ${rows.join(", ")} with columns ${Object.keys(calculated).join(", ")}`);
+      }
+      return [...filters, ...prefix, { op: "pivot", rows, columns: [], values: null, func: "sum", totals: true, calculated } as PivotStep];
+    }
+    if (values.length > 1) {
+      throw new ParseError("Several columns in one pivot can only be shown as totals (e.g. 'pivot total "
+        + values.join(" and ") + " by ...'). For " + funcs[0] + ", pivot one column at a time: which one?");
+    }
+    let value: string | null = values[0] ?? null;
+    const func = funcs[0] ?? (value ? "sum" : "count");
+    if (func !== "count" && value === null) value = this.defaultNumberColumn();
+    return [...filters, ...prefix, { op: "pivot", rows, columns: cols, values: value, func, totals: true, calculated: {} } as PivotStep];
+  }
+
+  /** 'a, b and c' -> exact columns; anything that isn't a column is an error, not ignored. */
+  private columnList(text: string, what: string): string[] {
+    text = text.replace(/\b(?:the|columns?|fields?|cols?)\b/gi, " ");
+    const items = text.split(/,|\band\b|&/i).map((i) => i.trim()).filter(Boolean);
+    const cols: string[] = [];
+    for (const item of items) {
+      const c = this.column(item);
+      if (c === null) throw new ParseError(`Which column should I ${what}? I couldn't find '${item}'. Columns: ` + this.columns.join(", "));
+      cols.push(c);
+    }
+    if (!cols.length) throw new ParseError(`Which column should I ${what}? Columns: ` + this.columns.join(", "));
+    return unique(cols);
+  }
+
+  private parseTopN(cl: string): Step[] {
+    const m = TOP_N.exec(cl)!;
+    const word = m[1].toLowerCase(), n = parseInt(m[2], 10);
+    let rest = cl.slice(0, m.index) + " " + cl.slice(m.index + m[0].length);
+    let filters: FilterStep[];
+    [rest, filters] = this.extraFilters(rest);
+    let per: string[] | null = null;
+    const pm = /\b(?:per|within|for\s+each|in\s+each|each)\b/i.exec(rest);
+    if (pm) {
+      const ptail = rest.slice(pm.index + pm[0].length);
+      const bm = /\bby\b/i.exec(ptail);
+      per = this.columnsIn(bm ? ptail.slice(0, bm.index) : ptail, "group by");
+      rest = rest.slice(0, pm.index) + (bm ? ptail.slice(bm.index) : "");
+    }
+    const by = /\bby\b/i.exec(rest);
+    const cols = this.findColumns(by ? rest.slice(by.index + by[0].length) : rest).map((x) => x.column).filter((c) => !(per ?? []).includes(c));
+    if (new Set(cols).size > 1) throw new ParseError("Which column should decide the top rows: " + unique(cols).join(", ") + "?");
+    let column: string | null = cols[0] ?? null;
+    const dateish = /\b(?:latest|newest|oldest|earliest|recent)\b/i.test(cl);
+    if (column === null && (word === "first" || word === "last") && !dateish) {
+      return [...filters, { op: "top_n", n, column: null, largest: word === "first", per: null } as TopNStep];
+    }
+    if (column === null) column = dateish ? this.defaultDateColumn(cl) : this.defaultNumberColumn();
+    const lowest = /\b(?:bottom|lowest|smallest|least|oldest|earliest)\b/i.test(cl) || word === "first";
+    const largest = word === "last" || !lowest;
+    return [...filters, { op: "top_n", n, column, largest, per } as TopNStep];
+  }
+
+  private parseCalculate(cl: string): Step[] {
+    const steps: Step[] = [];
+    const sm = /\b(?:sorted|ordered|sort|order)\s+by\b.*$/i.exec(cl);
+    if (sm) { // "cumulative sum of amount sorted by date": sort first, then calculate
+      steps.push(this.parseSort(sm[0]));
+      cl = cl.slice(0, sm.index);
+    }
+    let low = cl.toLowerCase();
+    const kind = /\brank/.test(low) ? "rank" : /\b(?:running|cumulative)\b/.test(low) ? "running_total" : "percent_of_total";
+    if (kind === "percent_of_total" && /\bby\b/.test(low) && !/\b(?:within|per|each)\b/.test(low)) {
+      return steps.concat(this.parseGroup("total " + cl)); // "percentage share of amount by category"
+    }
+    let filters: FilterStep[];
+    [cl, filters] = this.extraFilters(cl);
+    low = cl.toLowerCase();
+    if (kind === "rank") {
+      const by = /\bby\b/i.exec(cl);
+      const entity = by ? this.findColumns(cl.slice(0, by.index)).map((x) => x.column) : [];
+      if (by && entity.length) {
+        const after = cl.slice(by.index + by[0].length);
+        const funcs = Parser.funcsIn(after.toLowerCase());
+        const value = funcs.length ? this.column(after.replace(/\b(?:total|sum|average|avg|mean|count|min|max|highest|lowest)\b/gi, " ")) : null;
+        if (!funcs.length || !value) {
+          throw new ParseError(`Rank each row, or rank each ${entity[0]} by a total? Try 'rank ${entity[0]} by total amount' or 'rank by amount'.`);
+        }
+        // "rank branches by total amount": total per branch, then rank the totals.
+        const out = `${funcs[0]}_${value}`;
+        return [...filters, ...steps,
+          { op: "group_by", columns: entity, aggregations: [{ column: value, func: funcs[0] }], calculated: {} },
+          { op: "calculate", kind: "rank", column: out, per: null, descending: true, name: `rank by ${out}` },
+          { op: "sort", columns: [out], ascending: false }];
+      }
+    }
+    const perMarker = kind === "rank" ? /\b(?:within|per|for\s+each|in\s+each|each)\b/i : /\b(?:within|per|for\s+each|in\s+each|each|by)\b/i;
+    const pm = perMarker.exec(cl);
+    let head = pm ? cl.slice(0, pm.index) : cl;
+    const tail = pm ? cl.slice(pm.index + pm[0].length) : "";
+    const per = pm ? this.columnsIn(tail, "calculate within") : null;
+    if (kind === "rank") head = this.afterPattern(head, String.raw`\bby\b`);
+    const cols = this.findColumns(head).map((x) => x.column).filter((c) => !(per ?? []).includes(c));
+    const column = cols[0] ?? this.defaultNumberColumn();
+    const descending = !/\b(?:lowest|smallest|least|asc|ascending|oldest|earliest)\b/.test(low);
+    const name = { rank: `rank by ${column}`, running_total: `running total ${column}`, percent_of_total: `% of total ${column}` }[kind];
+    return [...filters, ...steps, { op: "calculate", kind, column, per, descending, name }];
   }
 
   private afterPattern(cl: string, pattern: string): string {

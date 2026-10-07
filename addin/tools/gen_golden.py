@@ -41,7 +41,8 @@ def make_bank_df(n=2000, seed=0) -> pd.DataFrame:
     df.loc[5] = df.loc[4]  # one exact duplicate row
     return df
 
-SUPPORTED = {"filter", "select_columns", "drop_columns", "sort", "dedupe", "split_by", "date_part"}
+SUPPORTED = {"filter", "select_columns", "drop_columns", "sort", "dedupe", "split_by", "date_part",
+             "group_by", "pivot", "top_n", "calculate"}
 
 COMMANDS = [
     # filters
@@ -78,9 +79,27 @@ COMMANDS = [
     # asks
     "make it pretty", "category is groceries", "amount is lots", "", "txn_id", "amount, balance",
     "amnt, balanc", "category is travel and amount > 100 or branch is pune",
+    # totals and counts
+    "total amount by category", "count transactions per category", "average and max amount by txn type",
+    "how many debits per branch", "total amount by month", "monthly totals by category",
+    "quarterly total amount by txn type", "count transactions by weekday", "total amount and balance by branch",
+    "sum of amount for each category", "min amount by category", "unique branch count by category",
+    "how many transactions by txn type in 2025", "total amount by category with % of total",
+    "percentage share of amount by category", "count by branch",
+    # pivots
+    "pivot amount by category and txn type", "total amount by category with txn type as columns",
+    "count by branch across txn type", "pivot of total amount with branch in rows and category in columns",
+    "pivot amount by month and txn type", "pivot by category", "average amount by category and txn type",
+    "pivot total amount and balance by branch",
+    # top / bottom
+    "top 10 debits by amount", "bottom 5 by balance", "lowest 3 amounts per category", "latest 5 transactions",
+    "first 10 rows", "last 5 rows", "top 3 by amount per branch", "oldest 4 transactions",
+    # percent of total, running total, rank
+    "add % of total amount", "add running total of amount", "running total of amount per category",
+    "rank by amount", "rank by amount within category lowest first", "rank branches by total amount",
+    "cumulative sum of amount sorted by date", "percent of total amount per category",
     # not yet in the add-in (must be recognised, not guessed)
-    "total amount by category", "pivot amount by category and txn type", "top 10 by amount",
-    "rank by amount", "highlight debits in red", "trim spaces", "add column gst = amount * 0.18",
+    "highlight debits in red", "trim spaces", "add column gst = amount * 0.18",
     "bar chart of total amount by category", "rename amount to amt", "round amount to 2 decimals",
 ]
 
@@ -102,14 +121,26 @@ def cell(v):
     return v
 
 
+def cells_of(df):
+    """The whole result for small tables (summaries), so values and order are compared exactly."""
+    if len(df) > 60:
+        return None
+    return [[cell(v) for v in row] for row in df.itertuples(index=False)]
+
+
 def result_of(sheets, plan):
     out = {}
+    # "order": the result's sort/top-N columns in result order. Rows that tie on them can come out in any
+    # order (pandas' sort is not stable), so for those plans only this order is compared, not whole rows.
     sort_cols = [s.columns for s in plan.steps if s.op == "sort"]
+    top_cols = [(s.per or []) + [s.column] for s in plan.steps if s.op == "top_n" and s.column]
+    order_cols = top_cols or sort_cols
     for name, df in sheets.items():
-        entry = {"rows": int(len(df)), "ids": sorted(int(i) for i in df["txn_id"]) if "txn_id" in df else None,
-                 "columns": [str(c) for c in df.columns]}
-        if sort_cols:
-            entry["order"] = [[cell(v) for v in row] for row in df[sort_cols[-1]].itertuples(index=False)]
+        entry = {"rows": int(len(df)), "columns": [str(c) for c in df.columns],
+                 "ids": None if top_cols or "txn_id" not in df else sorted(int(i) for i in df["txn_id"]),
+                 "cells": None if top_cols else cells_of(df)}
+        if order_cols:
+            entry["order"] = [[cell(v) for v in row] for row in df[order_cols[-1]].itertuples(index=False)]
         out[name] = entry
     return out
 

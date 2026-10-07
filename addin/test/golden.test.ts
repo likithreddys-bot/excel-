@@ -9,7 +9,7 @@ interface Golden {
   data: Record<string, (string | number | null)[]>;
   cases: {
     command: string; question: string | null; plan: unknown[]; summary: string; runnable: boolean;
-    result?: Record<string, { rows: number; ids: number[] | null; columns: string[]; order?: unknown[][] }>;
+    result?: Record<string, { rows: number; ids: number[] | null; columns: string[]; order?: unknown[][]; cells?: unknown[][] | null }>;
   }[];
 }
 
@@ -59,11 +59,22 @@ describe("matches the Python reference parser", () => {
           const ids = t.columns.find((x) => x.name === "txn_id")!.values as number[];
           expect([...ids].sort((a, b) => a - b)).toEqual(expected.ids);
         }
+        if (expected.cells) {
+          // Summaries are compared cell by cell (numbers to 6 decimals; Python NaN is a blank here).
+          const norm = (v: unknown) => (typeof v === "number" ? Math.round(v * 1e6) / 1e6 : v ?? null);
+          const got = Array.from({ length: t.nrows }, (_, i) => t.columns.map((x) => norm(x.values[i])));
+          expect(got).toEqual(expected.cells.map((r) => r.map(norm)));
+        }
         if (expected.order) {
-          const sortStep = plan.steps.filter((s) => s.op === "sort").pop() as { columns: string[] };
-          const cols = sortStep.columns.map((cn) => t.columns.find((x) => x.name === cn)!);
+          const tops = plan.steps.filter((s) => s.op === "top_n" && s.column) as { per: string[] | null; column: string }[];
+          const names = tops.length
+            ? [...(tops[tops.length - 1].per ?? []), tops[tops.length - 1].column]
+            : (plan.steps.filter((s) => s.op === "sort").pop() as { columns: string[] }).columns;
+          const cols = names.map((cn) => t.columns.find((x) => x.name === cn)!);
           const got = Array.from({ length: t.nrows }, (_, i) => cols.map((x) => x.values[i]));
-          expect(got).toEqual(expected.order);
+          // Within one value, tied rows of different groups may swap places (pandas' sort isn't stable).
+          const byKey = (rows: unknown[][]) => (tops.some((x) => x.per) ? [...rows].sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : 1) : rows);
+          expect(byKey(got)).toEqual(byKey(expected.order));
         }
       }
     });

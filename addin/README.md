@@ -6,11 +6,15 @@ Describe what you want done with your table in plain English, inside Excel. The 
 - **Data never leaves the machine.** Everything runs inside the task pane. There is no server to send data to, only static files to host.
 - **Preview first.** Every command shows what it will do, with exact row counts, before anything is written.
 
-## What it can do so far (v0.1)
+## What it can do so far (v0.2)
 
-Filter rows, sort, split into one sheet per value (including by month / year / weekday), remove duplicates, keep or drop columns, and several of these in one sentence: `only debits over 5000, split by category and sort by amount descending`.
+- **Rows and columns:** filter rows, sort, split into one sheet per value (including by month / year / weekday), remove duplicates, keep or drop columns.
+- **Summaries:** `total amount by category`, `how many debits per branch`, `monthly totals by category`, `pivot amount by category and txn type` (with totals), `top 10 by amount`, `lowest 3 amounts per category`, `add % of total amount`, `running total of amount per category`, `rank by amount`.
+- **Several at once:** `only debits over 5000, split by category and sort by amount descending`.
 
-Totals, pivots, calculated columns, cleaning, lookups and charts follow. The Python app in the repo root already has them, and the add-in is being brought up to the same level step by step. Until a command is ported, the add-in says so instead of guessing.
+Results are written as values (so they match the preview exactly), not yet as live PivotTables or formulas.
+
+Calculated columns, cleaning, lookups and charts follow. The Python app in the repo root already has them, and the add-in is being brought up to the same level step by step. Until a command is ported, the add-in says so instead of guessing.
 
 ## Run it
 

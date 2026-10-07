@@ -244,7 +244,11 @@ def _apply_step(df: pd.DataFrame, step: Step) -> Sheets | pd.DataFrame:
         case "group_by":
             _check_columns(df, step.columns + [a.column for a in step.aggregations])
             agg = {f"{a.func}_{a.column}": (a.column, a.func) for a in step.aggregations}
-            out = df.groupby(step.columns, dropna=False, observed=True).agg(**agg) if agg else None
+            grouped = df.groupby(step.columns, dropna=False, observed=True)
+            out = grouped.agg(**agg) if agg else None
+            for a in step.aggregations:
+                if a.func == "count" and a.column in step.columns:
+                    out[f"count_{a.column}"] = grouped.size()  # counting rows: a blank group must not count as 0
             if step.calculated:
                 calc = calculated_totals(df, step.columns, step.calculated)
                 out = calc if out is None else out.join(calc)

@@ -1,32 +1,17 @@
 /** Runs a Plan on tables. Pure functions: the only code that touches the data. */
 import type { Condition, DatePart, DatePartStep, FilterStep, Plan, Step } from "./plan";
+import { calculate, groupBy, pivot, topN } from "./aggregate";
+import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
 import { Cell, Column, Sheets, Table, getColumn, makeColumn, pick, timesOf } from "./table";
-import { DAY_MS, cmpText, isoDay, parseDateText, todayMs } from "./util";
+import { DAY_MS, isoDay, parseDateText, todayMs } from "./util";
 
-export class PlanError extends Error {}
+export { PlanError };
 
 const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-
-function need(t: Table, cols: string[]): void {
-  const missing = cols.filter((c) => !getColumn(t, c));
-  if (missing.length) throw new PlanError(`Unknown column(s): ${missing.join(", ")}`);
-}
-
-function col(t: Table, name: string): Column {
-  need(t, [name]);
-  return getColumn(t, name)!;
-}
 
 // ---------- filtering ----------
 
 const textOf = (v: Cell): string => (v === null ? "" : String(v).trim().toLowerCase());
-
-/** A cell as a number: numbers as-is, numeric-looking text read like pandas to_numeric, else NaN. */
-function numberOf(v: Cell): number {
-  if (typeof v === "number") return v;
-  if (typeof v === "string" && v.trim() !== "") return Number(v.trim());
-  return NaN;
-}
 
 function compare(c: Column, op: "gt" | "gte" | "lt" | "lte", value: string): boolean[] {
   const cmp = (a: number, b: number) =>
@@ -84,38 +69,6 @@ export function filterMask(t: Table, step: FilterStep): boolean[] {
 
 const where = (flags: boolean[]): number[] => flags.flatMap((f, i) => (f ? [i] : []));
 
-// ---------- sorting ----------
-
-type SortKey = number | string | null;
-
-function sortKeys(c: Column): SortKey[] {
-  if (c.kind === "date") return timesOf(c);
-  if (c.kind === "number") return c.values.map((v) => (typeof v === "number" && !Number.isNaN(v) ? v : null));
-  const rank = c.order ? new Map(c.order.map((v, i) => [v, i])) : null;
-  return c.values.map((v) => (v === null ? null : rank ? (rank.get(String(v)) ?? c.order!.length) : String(v)));
-}
-
-function compareKeys(a: SortKey, b: SortKey): number {
-  return typeof a === "number" && typeof b === "number" ? a - b : cmpText(String(a), String(b));
-}
-
-function sortRows(t: Table, cols: string[], ascending: boolean): number[] {
-  const keys = cols.map((n) => sortKeys(col(t, n)));
-  const idx = Array.from({ length: t.nrows }, (_, i) => i);
-  return idx.sort((i, j) => {
-    for (const k of keys) {
-      const a = k[i], b = k[j];
-      if (a === null || b === null) {
-        if (a === b) continue;
-        return a === null ? 1 : -1; // blanks always last
-      }
-      const d = compareKeys(a, b);
-      if (d !== 0) return ascending ? d : -d;
-    }
-    return 0;
-  });
-}
-
 // ---------- dates ----------
 
 function isoWeek(ms: number): { year: number; week: number } {
@@ -166,12 +119,6 @@ function dedupe(t: Table, cols: string[] | null, keep: "first" | "last"): Table 
   return pick(t, [...seen.values()].sort((a, b) => a - b));
 }
 
-const keyLabel = (c: Column, v: Cell, i: number): string => {
-  if (v === null || (typeof v === "string" && v.trim() === "")) return "(blank)";
-  if (c.kind === "date" && c.time?.[i] != null) return isoDay(c.time[i]!);
-  return typeof v === "number" ? String(v) : String(v);
-};
-
 function sheetName(parent: string, key: string, totalParents: number): string {
   let name = totalParents === 1 ? key : `${parent}-${key}`;
   name = name.replace(/[[\]:*?/\\]/g, "_").replace(/^'+|'+$/g, "");
@@ -213,6 +160,10 @@ function applyStep(t: Table, step: Step): Table | [string, Table][] {
     case "dedupe": need(t, step.columns ?? []); return dedupe(t, step.columns, step.keep);
     case "split_by": return splitBy(t, step.column);
     case "date_part": return addDatePart(t, step);
+    case "group_by": return groupBy(t, step);
+    case "pivot": return pivot(t, step);
+    case "top_n": return topN(t, step);
+    case "calculate": return calculate(t, step);
     default: return unsupported(step);
   }
 }
