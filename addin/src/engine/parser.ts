@@ -76,6 +76,11 @@ const DELIMITERS: Record<string, string> = {
   tab: "\t", nothing: "", "no space": "",
 };
 
+const IDENTIFIER_WORDS = set(`id pan email account acct ref key uid gstin aadhaar mobile phone customer client employee emp`);
+const FILE_VERBS = new RegExp(
+  String.raw`\b(?:look\s*up|lookup|v\s*lookup|x\s*lookup|match(?:ing|ed)?|bring|fetch|pull|get|add|map|join|merge|enrich|append|stack|compare` +
+  String.raw`|not\s+in|missing|only\s+in|in\s+both|common|also\s+in|present\s+in|found\s+in|difference|diff|not\s+here|but\s+not)\b`, "i");
+
 const WHAT_IT_CAN_DO = "Right now the add-in can filter rows, sort, split into sheets, remove duplicates and choose columns.";
 
 export class ParseError extends Error {
@@ -164,7 +169,7 @@ export class Parser {
   private values: Map<string, Map<string, string>> | null = null;
 
   /** `answer`: columns the user gave in reply to a "which column?" question. */
-  constructor(sheets: Sheets | Table, private answer: string[] = [], private computed: Record<string, string> = {}) {
+  constructor(sheets: Sheets | Table, private answer: string[] = [], private computed: Record<string, string> = {}, private files: Record<string, Table> = {}) {
     this.table = sheets instanceof Map ? combine(sheets) : sheets;
     this.columns = this.table.columns.map((c) => String(c.name));
     this.colKeys = new Map(this.columns.map((c) => [c, key(c)]));
@@ -338,6 +343,10 @@ export class Parser {
 
   parseClause(cl: string): Step[] {
     const low = cl.toLowerCase();
+    if (Object.keys(this.files).length && FILE_VERBS.test(cl)) {
+      const fm = this.findFile(cl);
+      if (fm) return this.parseFileCommand(cl, fm);
+    }
     // Formatting first: "highlight duplicates in pan" must colour rows, never remove them.
     if (/^\s*(?:please\s+)?(?:highlight|colou?r|shade)\b/.test(low)) return soon("Highlighting");
     if (/\b(?:chart|graph|plot)\b/.test(low)) return soon("Charts");
@@ -661,6 +670,103 @@ export class Parser {
     const cols = this.columnList(body, "merge");
     if (cols.length < 2) throw new ParseError("Merge which columns? e.g. merge first and last into full name");
     return { op: "merge_columns", columns: cols, separator, name: name || cols.join(" ") };
+  }
+
+  // ---------- another sheet: lookup, append, compare ----------
+
+  private fileParserCache = new Map<string, Parser>();
+
+  private fileParser(name: string): Parser {
+    if (!this.fileParserCache.has(name)) this.fileParserCache.set(name, new Parser(this.files[name]));
+    return this.fileParserCache.get(name)!;
+  }
+
+  /** Where `text` names another sheet. A name that is also a column here only counts when it's clearly a sheet:
+   * "from customers", "customers.xlsx", "customers sheet". */
+  findFile(text: string): Mention | null {
+    const toks = [...text.matchAll(/\S+/g)].map((m) => ({ start: m.index!, end: m.index! + m[0].length, text: m[0] }));
+    const ext = /\.(?:xlsx|xlsm|xls|csv)\W*$/i;
+    for (let i = 0; i < toks.length; i++) {
+      for (let j = Math.min(i + 4, toks.length); j > i; j--) {
+        const phrase = text.slice(toks[i].start, toks[j - 1].end);
+        const hasExt = ext.test(phrase);
+        const k = key(phrase.replace(ext, ""));
+        for (const name of Object.keys(this.files)) {
+          const fk = key(name);
+          if (!(k === fk || singular(k) === singular(fk) || (j === i + 1 && k.length >= 5 && similarity(k, fk) >= 0.88))) continue;
+          const nxt = j < toks.length ? strip(toks[j].text.toLowerCase(), ".,") : "";
+          const prev = toks.slice(Math.max(0, i - 2), i).map((t) => t.text.toLowerCase()).filter((w) => w !== "the" && w !== "my");
+          const sheetWord = ["file", "sheet", "list", "table", "data", "workbook"].includes(nxt);
+          const fileish = hasExt || sheetWord
+            || (prev.length > 0 && ["from", "with", "against", "in", "into", "to", "onto", "and", "vs", "versus"].includes(prev[prev.length - 1]));
+          if (fileish || this.column(phrase) === null) {
+            return { start: toks[i].start, end: sheetWord ? toks[j].end : toks[j - 1].end, column: name };
+          }
+        }
+      }
+    }
+    const m = /\b(?:the\s+)?(?:other|second|lookup|new|that|another)\s+(?:file|sheet|list|table|data)\b|\bboth\s+(?:files|sheets)\b/i.exec(text);
+    const names = Object.keys(this.files);
+    if (m && names.length === 1) return { start: m.index!, end: m.index! + m[0].length, column: names[0] };
+    return null;
+  }
+
+  private parseFileCommand(cl: string, fm: Mention): Step[] {
+    const name = fm.column;
+    const low = (cl.slice(0, fm.start) + " __FILE__ " + cl.slice(fm.end)).toLowerCase();
+    let rest = cl.slice(0, fm.start) + " " + cl.slice(fm.end);
+    if (/\bappend|\bstack\b|\badd\s+(?:the\s+|all\s+)?(?:rows|records|data)\b|\b(?:below|underneath|at\s+the\s+(?:end|bottom))\b/.test(low)) {
+      return [{ op: "append", file: name }];
+    }
+    let keep: "only_here" | "only_there" | "both" | null = null;
+    if (/(?:in|from)\s+(?:the\s+)?__file__.*\bnot\s+(?:in\s+)?(?:here|this|mine|ours|main|current|my)\b|\bonly\s+in\s+(?:the\s+)?__file__|\bmissing\s+(?:from|in)\s+(?:here|this|mine|my|the\s+main|current)\b|__file__\s+(?:rows\s+|records\s+)?(?:that\s+are\s+|which\s+are\s+)?not\s+(?:in\s+)?(?:here|this|mine|my)\b/.test(low)) {
+      keep = "only_there";
+    } else if (/\bnot\s+(?:in|present\s+in|found\s+in|matching)\s+(?:the\s+)?__file__|\bmissing\s+(?:from|in)\s+(?:the\s+)?__file__|\bonly\s+(?:in\s+)?(?:here|this|mine|my\s+data)\b|\bnot\s+matched\b/.test(low)) {
+      keep = "only_here";
+    } else if (/\bin\s+both\b|\bcommon\b|\balso\s+in\s+(?:the\s+)?__file__|\b(?:present|found|exist\w*)\s+in\s+(?:the\s+)?__file__|\b(?:that\s+are|which\s+are)\s+in\s+(?:the\s+)?__file__/.test(low)
+      || /\bboth\s+(?:files|sheets)\b/i.test(cl)) {
+      keep = "both";
+    } else if (/\bcompare|\bdifference|\bdiff\b/.test(low)) {
+      throw new ParseError(`What should the comparison show: rows not in ${name}, rows of ${name} that are not here, or rows in both? e.g. 'rows not in ${name} on pan'`);
+    }
+
+    const km = /\b(?:on|using|based\s+on|matching(?:\s+on)?|match(?:ing)?\s+by|by|via)\s+(?:the\s+)?(?:column\s+)?(?<k>.+?)(?=\s+(?:and\s+)?(?:bring|get|fetch|pull|return|add|from|in|to\s+get)\b|\s*$)/i.exec(rest);
+    // "pan with pan number" names both keys; a trailing "with" (sheet already removed) doesn't.
+    const keyText = km ? km.groups!.k.replace(/\s+(?:with|and)\s*$/, "") : null;
+    const pair = this.fileKey(keyText, name, keep === null);
+    if (km) rest = rest.slice(0, km.index) + " " + rest.slice(km.index! + km[0].length);
+    if (keep) {
+      const [left, right] = pair ?? [null, null];
+      return [{ op: "compare", file: name, left_on: left, right_on: right, keep }];
+    }
+    const fp = this.fileParser(name);
+    const wanted = rest.replace(/\b(?:look\s*up|lookup|v\s*lookup|x\s*lookup|match(?:ing)?|bring|fetch|pull|get|add|map|join|merge|enrich|with|from|and|the|their|its|columns?|details?|info|information|data|also)\b/gi, " ");
+    let cols = fp.findColumns(wanted).map((m) => m.column).filter((c) => c !== pair![1]);
+    if (!cols.length || /\b(?:all|every(?:thing)?)\b/i.test(rest)) cols = fp.columns.filter((c) => c !== pair![1]);
+    return [{ op: "lookup", file: name, left_on: pair![0], right_on: pair![1], columns: unique(cols) }];
+  }
+
+  /** (column here, column in the other sheet) to match rows on. */
+  private fileKey(text: string | null, name: string, required: boolean): [string, string] | null {
+    const fp = this.fileParser(name);
+    if (text) {
+      const parts = text.trim().split(/\s*(?:==|=|<->)\s*|\s+(?:with|to|and)\s+/i);
+      const [leftT, rightT] = parts.length >= 2 ? [parts[0], parts.slice(1).join(" ")] : [parts[0], parts[0]];
+      const left = this.column(leftT) ?? this.columns.find((c) => key(c) === key(fp.column(leftT) ?? "")) ?? null;
+      const right = fp.column(rightT) ?? fp.columns.find((c) => key(c) === key(left ?? "")) ?? null;
+      if (left && right) return [left, right];
+      const missing = !left ? `'${leftT}' here` : `'${rightT}' in ${name}`;
+      throw new ParseError(`I couldn't find ${missing}. Columns here: ${this.columns.join(", ")}. Columns in ${name}: ${fp.columns.join(", ")}`);
+    }
+    const common = this.columns.flatMap((c) => fp.columns.filter((fc) => key(c) === key(fc)).map((fc): [string, string] => [c, fc]));
+    // Real identifiers first (pan, id, email...), then codes/numbers.
+    const ids = common.filter((p) => colWords(p[0]).some((w) => IDENTIFIER_WORDS.has(w)));
+    const codes = common.filter((p) => colWords(p[0]).some((w) => ["code", "no", "num", "number"].includes(w)));
+    if (ids.length === 1) return ids[0];
+    if (!required) return null; // compare whole rows rather than guess a weak key
+    for (const group of [codes, common]) if (group.length === 1) return group[0];
+    const options = (ids.length ? ids : codes.length ? codes : common).map((p) => p[0]).join(", ") || "(no columns in common)";
+    throw new ParseError(`Which column should I match on? Try: '... on pan'. Columns in both: ${options}`);
   }
 
   // ---------- totals, pivots, top N, running totals ----------
@@ -1342,7 +1448,7 @@ export function replyColumns(sheets: Sheets | Table, text: string): [string[], s
 
 export const examples = (sheets: Sheets | Table): string[] => new Parser(sheets).examples();
 
-export function makePlan(sheets: Sheets, request: string, answer: string[] = [], computed: Record<string, string> = {}): Plan {
+export function makePlan(sheets: Sheets, request: string, answer: string[] = [], computed: Record<string, string> = {}, files: Record<string, Table> = {}): Plan {
   computed = { ...computed };
   const empty = (q: string, awaits = false): Plan => ({ clarification_question: q, summary: "", steps: [], awaits_columns: awaits });
   try {
@@ -1356,14 +1462,24 @@ export function makePlan(sheets: Sheets, request: string, answer: string[] = [],
       throw new ParseError(`What should I do with ${cols.join(", ")}? For example:\n- total ${c} by <column>\n`
         + `- sort by ${c} descending\n- keep columns ${cols.join(", ")}\n- top 10 by ${c}`);
     }
+    if (Object.keys(files).length) {
+      // "match with customers on pan and bring email": a bring/fetch part that names no sheet continues the lookup before it.
+      const finder = new Parser(sheets, [], {}, files);
+      const merged: string[] = [];
+      for (const c of clauses) {
+        if (merged.length && /^(?:bring|fetch|pull|return|get)\b/i.test(c) && !finder.findFile(c)) merged[merged.length - 1] += " and " + c;
+        else merged.push(c);
+      }
+      clauses.splice(0, clauses.length, ...merged);
+    }
     const steps: Step[] = [];
     let current = sheets;
     clauses.forEach((clause, i) => {
-      const made = new Parser(current, answer, computed).parseClause(clause);
+      const made = new Parser(current, answer, computed, files).parseClause(clause);
       steps.push(...made);
       for (const st of made) if (st.op === "compute") computed[st.name] = st.expr;
       // Later parts see the result so far: "add column gst = ... and sort by gst".
-      if (i < clauses.length - 1) current = applyPlan(current, { clarification_question: null, summary: "", awaits_columns: false, steps: made });
+      if (i < clauses.length - 1) current = applyPlan(current, { clarification_question: null, summary: "", awaits_columns: false, steps: made }, files);
     });
     return { clarification_question: null, summary: steps.map(describe).join("; ") + ".", steps, awaits_columns: false };
   } catch (e) {

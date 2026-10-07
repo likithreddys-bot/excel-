@@ -3,6 +3,7 @@ import type { ComputeStep, Condition, DatePart, DatePartStep, FilterStep, LabelS
 import { calculate, groupBy, pivot, topN } from "./aggregate";
 import { cleanText, convertColumns, dropBlankRows, fillBlanks, mergeColumns, renameColumns, replaceText, splitColumn } from "./clean";
 import { evaluate } from "./evaluate";
+import { append, compare as compareSheets, lookup } from "./files";
 import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
 import { Cell, Column, Sheets, Table, getColumn, makeColumn, pick, timesOf } from "./table";
 import { DAY_MS, isoDay, parseDateText, todayMs } from "./util";
@@ -145,6 +146,14 @@ function splitBy(t: Table, name: string): [string, Table][] {
   return labels.map((l) => [l, pick(t, groups.get(l)!)]);
 }
 
+export type Files = Record<string, Table>;
+
+function otherSheet(files: Files, name: string): Table {
+  const t = files[name];
+  if (!t) throw new PlanError(`The sheet '${name}' isn't available.`);
+  return t;
+}
+
 function checkNew(t: Table, name: string, replace: boolean): void {
   if (getColumn(t, name) && !replace) throw new PlanError(`There is already a column called ${name}. Use 'set ${name} = ...' to overwrite it.`);
 }
@@ -183,7 +192,7 @@ function unsupported(step: Step): never {
   throw new PlanError(`The '${step.op}' step isn't available in this version of the add-in yet.`);
 }
 
-function applyStep(t: Table, step: Step): Table | [string, Table][] {
+function applyStep(t: Table, step: Step, files: Files, notes: string[]): Table | [string, Table][] {
   switch (step.op) {
     case "filter": return pick(t, where(filterMask(t, step)));
     case "select_columns":
@@ -208,6 +217,9 @@ function applyStep(t: Table, step: Step): Table | [string, Table][] {
     case "merge_columns": return mergeColumns(t, step);
     case "rename": return renameColumns(t, step);
     case "convert": return convertColumns(t, step);
+    case "lookup": return lookup(t, step, otherSheet(files, step.file), notes);
+    case "append": return append(t, step, otherSheet(files, step.file), notes);
+    case "compare": return compareSheets(t, step, otherSheet(files, step.file), notes);
     case "compute": return compute(t, step);
     case "label": return label(t, step);
     default: return unsupported(step);
@@ -215,13 +227,15 @@ function applyStep(t: Table, step: Step): Table | [string, Table][] {
 }
 
 /** Run every step on every sheet. Splitting creates several sheets, later steps apply to each. */
-export function applyPlan(sheets: Sheets, plan: Plan): Sheets {
+export function applyPlan(sheets: Sheets, plan: Plan, files: Files = {}, notes: string[] = []): Sheets {
   let current = sheets;
   for (const step of plan.steps) {
     const next: Sheets = new Map();
     const used = new Set<string>();
     for (const [name, table] of current) {
-      const out = applyStep(table, step);
+      const mine: string[] = [];
+      const out = applyStep(table, step, files, mine);
+      notes.push(...mine.map((m) => (current.size > 1 ? `${name}: ${m}` : m)));
       if (Array.isArray(out)) {
         for (const [key, part] of out) {
           let n = sheetName(name, key, current.size), base = n, i = 2;

@@ -43,7 +43,8 @@ def make_bank_df(n=2000, seed=0) -> pd.DataFrame:
 
 SUPPORTED = {"filter", "select_columns", "drop_columns", "sort", "dedupe", "split_by", "date_part",
              "group_by", "pivot", "top_n", "calculate", "compute", "label",
-             "clean_text", "fill_blanks", "drop_blank_rows", "replace", "split_column", "merge_columns", "rename", "convert"}
+             "clean_text", "fill_blanks", "drop_blank_rows", "replace", "split_column", "merge_columns", "rename", "convert",
+             "lookup", "append", "compare"}
 
 COMMANDS = [
     # filters
@@ -187,6 +188,60 @@ CLEAN_COMMANDS = [
 ]
 
 
+def main_df() -> pd.DataFrame:
+    """Same files as tests/test_files.py."""
+    return pd.DataFrame({
+        "pan": ["ABCDE1234F", "XYZAB9876K", "PQRST1111A", None, "LMNOP2222B"],
+        "result_code": [101.0, 109.0, 101.0, 101.0, 109.0],
+        "amount": [100, 200, 300, 400, 500],
+    })
+
+
+def customers() -> pd.DataFrame:
+    return pd.DataFrame({
+        "PAN": ["abcde1234f", " xyzab9876k", "XYZAB9876K", "NEWPN0000Z"],
+        "email": ["a@x.com", "b@y.com", "dup@y.com", "n@z.com"],
+        "city": ["Pune", "Delhi", "Delhi", "Goa"],
+        "amount": [1, 2, 3, 4],
+    })
+
+
+def march() -> pd.DataFrame:
+    return pd.DataFrame({"PAN": ["ABCDE1234F", "NEWPN0000Z"], "Result Code": [101, 101],
+                         "amount": [100, 999], "branch": ["Pune", "Goa"]})
+
+
+FILE_SUITES = [
+    ("files", main_df, {"customers": customers, "march": march}, [
+        "bring email from customers on pan", "lookup email from customers using pan",
+        "vlookup email from customers.xlsx by pan", "get the email from the customers file matching on pan",
+        "match with customers on pan and bring email", "bring email and city from customers on pan",
+        "match with customers on pan", "bring email from customers", "bring y from other",
+        "append march", "add the rows from march", "rows not in march on pan",
+        "show rows that are also in march on pan", "rows in march but not in this file on pan",
+        "rows not in march on pan", "rows missing from march", "compare with march", "rows in march but not here",
+        "only result code 101 and bring email from customers on pan", "total amount by result code",
+        "add column gst = amount * 0.18", "rows in both files on pan",
+    ]),
+    ("files-codes", main_df, {"codes": lambda: pd.DataFrame({"result_code": ["101", "109"], "meaning": ["Record Found", "No record"]})}, [
+        "bring meaning from codes on result code",
+    ]),
+    ("files-ref", main_df, {"ref": lambda: pd.DataFrame({"PAN Number": ["ABCDE1234F"], "score": [7]})}, [
+        "bring score from ref matching pan with pan number",
+    ]),
+    ("files-one", main_df, {"customers": customers}, [
+        "bring city from the other file on pan", "bring email from customers on pan",
+    ]),
+    ("files-both", main_df, {"march": march}, ["rows in both files on pan"]),
+    ("files-other", main_df, {"other": lambda: pd.DataFrame({"amount": [100, 300], "Result Code": [101, 999]})}, [
+        "rows also in other",
+    ]),
+    ("files-amount", main_df, {"amount": lambda: pd.DataFrame({"pan": ["ABCDE1234F"], "limit": [5]})}, [
+        "add column double = amount * 2", "bring limit from amount file on pan",
+    ]),
+]
+
+
 def clean(o):
     """Drop None values so Python's plan and the TypeScript plan compare equal."""
     if isinstance(o, dict):
@@ -232,28 +287,37 @@ def result_of(sheets, plan):
     return out
 
 
-def build(df, commands):
+def tabulate(df):
+    return {str(c): [cell(v) for v in df[c]] for c in df.columns}
+
+
+def build(df, commands, files=None):
+    files = files or {}
     sheets = {"Sheet1": df}
-    data = {str(c): [cell(v) for v in df[c]] for c in df.columns}
+    data = tabulate(df)
     cases = []
     for cmd in commands:
-        plan = make_plan(sheets, cmd)
+        plan = make_plan(sheets, cmd, files)
         case = {"command": cmd, "question": plan.clarification_question,
                 "plan": clean(plan.model_dump())["steps"] if plan.steps else [],
                 "summary": plan.summary, "runnable": False}
         if plan.steps and all(s.op in SUPPORTED for s in plan.steps):
             case["runnable"] = True
             try:
-                case["result"] = result_of(engine.apply_plan(sheets, plan), plan)
+                notes: list[str] = []
+                case["result"] = result_of(engine.apply_plan(sheets, plan, files=files, notes=notes), plan)
+                case["notes"] = notes
             except engine.PlanError as e:  # parses fine but can't run on this data: the add-in must refuse too
                 case["run_error"] = str(e)
         cases.append(case)
-    return {"data": data, "cases": cases}
+    return {"data": data, "files": {k: tabulate(v) for k, v in files.items()}, "cases": cases}
 
 
 def main():
     suites = {"bank": build(make_bank_df(), COMMANDS), "ledger": build(make_ledger_df(), LEDGER_COMMANDS),
               "messy": build(make_messy_df(), CLEAN_COMMANDS)}
+    for name, main, files, commands in FILE_SUITES:
+        suites[name] = build(main(), commands, {k: f() for k, f in files.items()})
     os.makedirs(os.path.join(HERE, "..", "test", "golden"), exist_ok=True)
     with open(os.path.join(HERE, "..", "test", "golden", "cases.json"), "w") as f:
         json.dump({"suites": suites}, f)

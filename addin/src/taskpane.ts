@@ -3,7 +3,7 @@ import { applyPlan, PlanError, rowCounts } from "./engine/engine";
 import { Parser, makePlan, replyColumns } from "./engine/parser";
 import type { Plan } from "./engine/plan";
 import type { Cell, Sheets, Table } from "./engine/table";
-import { isoDay } from "./engine/util";
+import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
 import { ExcelHost } from "./excel/io";
 import { Host, HostError, SourceRef } from "./host";
@@ -11,7 +11,7 @@ import { Host, HostError, SourceRef } from "./host";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const num = (n: number) => n.toLocaleString("en-IN");
 
-interface Pending { text: string; plan: Plan; result: Sheets; before: number; using: string }
+interface Pending { text: string; plan: Plan; result: Sheets; before: number; using: string; notes: string[] }
 
 const state = {
   host: null as Host | null,
@@ -110,6 +110,21 @@ async function readSource(ref?: SourceRef): Promise<Table> {
 
 // ---------- commands ----------
 
+/** Other sheets the command talks about ("bring email from Customers on PAN"): read only those. */
+async function sheetsMentioned(text: string): Promise<Record<string, Table>> {
+  const here = state.ref?.sheet;
+  const others = (await state.host!.listSheets()).filter((n) => n !== here);
+  const k = key(text);
+  let named = others.filter((n) => key(n).length > 1 && (k.includes(key(n)) || k.includes(singular(key(n)))));
+  // "the other sheet" only makes sense when there is exactly one other sheet.
+  if (!named.length && others.length === 1 && /\b(?:other|second|lookup|new|that|another)\s+(?:file|sheet|list|table|data)\b|\bboth\s+(?:files|sheets)\b/i.test(text)) named = others;
+  const out: Record<string, Table> = {};
+  for (const n of named) {
+    try { out[n] = await state.host!.readSheet(n); } catch { /* an empty or unreadable sheet simply isn't offered */ }
+  }
+  return out;
+}
+
 async function preview(text: string): Promise<void> {
   post("user", text);
   const table = await readSource(state.ref);
@@ -121,7 +136,8 @@ async function preview(text: string): Promise<void> {
     post("bot", "I couldn't find " + reply[1].join(", ") + ". Reply again with the column names.");
     return;
   }
-  const plan = reply ? makePlan(sheets, state.asked!, reply[0]) : makePlan(sheets, text);
+  const files = await sheetsMentioned(reply ? state.asked! : text);
+  const plan = reply ? makePlan(sheets, state.asked!, reply[0], {}, files) : makePlan(sheets, text, [], {}, files);
   if (plan.clarification_question) {
     state.pending = null;
     state.asked = plan.awaits_columns ? (reply ? state.asked : text) : null;
@@ -131,14 +147,15 @@ async function preview(text: string): Promise<void> {
   state.asked = null;
 
   let result: Sheets;
+  const notes: string[] = [];
   try {
-    result = applyPlan(sheets, plan);
+    result = applyPlan(sheets, plan, files, notes);
   } catch (e) {
     state.pending = null;
     if (e instanceof PlanError) { post("err", `This can't run on your data: ${e.message}`); return; }
     throw e;
   }
-  state.pending = { text, plan, result, before: table.nrows, using: state.label };
+  state.pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(notes)] };
   renderPreview(state.pending);
 }
 
@@ -162,6 +179,7 @@ function renderPreview(p: Pending): void {
     out.append(ul);
   }
   card.append(out);
+  for (const note of p.notes) card.append(el("div", "note", note));
   const first = p.result.get(names[0])!;
   if (first.nrows) card.append(miniTable(first), el("div", "muted", names.length > 1 ? `First rows of “${names[0]}”` : "First rows of the result"));
   else card.append(el("div", "note", "No rows match. Nothing would be written."));

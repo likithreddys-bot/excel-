@@ -31,6 +31,17 @@ export class DemoHost implements Host {
   constructor() {
     const names = ["txn_id", "txn_date", "description", "category", "txn_type", "amount", "balance", "branch"];
     this.sheets.set("Transactions", makeTable(names, demoRows()));
+    this.sheets.set("Branches", makeTable(["branch", "manager", "region"], [
+      ["Mumbai", "A. Rao", "West"], ["Pune", "S. Iyer", "West"], ["Delhi", "R. Singh", "North"],
+    ]));
+  }
+
+  async listSheets(): Promise<string[]> {
+    return [...this.sheets.keys()];
+  }
+
+  async readSheet(name: string): Promise<Table> {
+    return this.sheets.get(name)!;
   }
 
   async readSource(ref?: SourceRef): Promise<Source> {

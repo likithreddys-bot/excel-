@@ -6,22 +6,25 @@ import { makePlan } from "../src/engine/parser";
 import { Sheets, makeTable } from "../src/engine/table";
 import { isoDay } from "../src/engine/util";
 
+type Data = Record<string, (string | number | null)[]>;
 interface Suite {
-  data: Record<string, (string | number | null)[]>;
+  data: Data;
+  files?: Record<string, Data>;
   cases: {
-    command: string; question: string | null; plan: unknown[]; summary: string; runnable: boolean; run_error?: string;
+    command: string; question: string | null; plan: unknown[]; summary: string; runnable: boolean; run_error?: string; notes?: string[];
     result?: Record<string, { rows: number; ids: number[] | null; columns: string[]; order?: unknown[][]; cells?: unknown[][] | null }>;
   }[];
 }
 
 const golden: { suites: Record<string, Suite> } = JSON.parse(readFileSync(new URL("./golden/cases.json", import.meta.url), "utf8"));
 
-function sheetsOf(suite: Suite): Sheets {
-  const names = Object.keys(suite.data);
-  const n = suite.data[names[0]].length;
-  const rows = Array.from({ length: n }, (_, i) => names.map((c) => suite.data[c][i]));
-  return new Map([["Sheet1", makeTable(names, rows)]]);
+function tableOf(data: Data) {
+  const names = Object.keys(data);
+  const n = data[names[0]].length;
+  return makeTable(names, Array.from({ length: n }, (_, i) => names.map((c) => data[c][i])));
 }
+const sheetsOf = (suite: Suite): Sheets => new Map([["Sheet1", tableOf(suite.data)]]);
+const filesOf = (suite: Suite) => Object.fromEntries(Object.entries(suite.files ?? {}).map(([k, d]) => [k, tableOf(d)]));
 
 /** Drop null/undefined keys so {value: null} and a missing value compare equal. */
 const clean = (o: unknown): unknown =>
@@ -34,9 +37,10 @@ const sameSet = (a: string[], b: string[]) => JSON.stringify([...a].sort()) === 
 
 for (const [suiteName, suite] of Object.entries(golden.suites)) describe(`matches the Python reference: ${suiteName}`, () => {
   const sheets = sheetsOf(suite);
+  const files = filesOf(suite);
   for (const c of suite.cases) {
     it(JSON.stringify(c.command), () => {
-      const plan = makePlan(sheets, c.command);
+      const plan = makePlan(sheets, c.command, [], {}, files);
       if (c.question !== null) {
         expect(plan.clarification_question, "should ask a question").not.toBeNull();
         expect(plan.steps).toEqual([]);
@@ -55,10 +59,12 @@ for (const [suiteName, suite] of Object.entries(golden.suites)) describe(`matche
       expect(plan.summary).toBe(c.summary);
 
       if (c.run_error) {
-        expect(() => applyPlan(sheets, plan)).toThrow(c.run_error.slice(0, 50));
+        expect(() => applyPlan(sheets, plan, files)).toThrow(c.run_error.slice(0, 50));
         return;
       }
-      const out = applyPlan(sheets, plan);
+      const notes: string[] = [];
+      const out = applyPlan(sheets, plan, files, notes);
+      if (c.notes) expect(notes).toEqual(c.notes);
       expect(sameSet([...out.keys()], Object.keys(c.result!))).toBe(true);
       for (const [name, expected] of Object.entries(c.result!)) {
         const t = out.get(name)!;

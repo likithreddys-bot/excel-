@@ -24,6 +24,10 @@ export interface Host {
   kind: "excel" | "demo";
   /** Read the user's table: from `ref` if given, else from their current selection. */
   readSource(ref?: SourceRef): Promise<Source>;
+  /** Names of the workbook's visible sheets (other sheets can be looked up, appended or compared). */
+  listSheets(): Promise<string[]>;
+  /** The whole used range of a sheet, first row as headers. */
+  readSheet(name: string): Promise<Table>;
   /** Write each sheet as a new worksheet (never over existing ones). */
   writeResult(sheets: Sheets): Promise<Created[]>;
   removeSheets(names: string[]): Promise<void>;

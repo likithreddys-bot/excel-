@@ -35,38 +35,65 @@ async function locate(ctx: Excel.RequestContext, ref?: SourceRef): Promise<{ ran
   return { range: used, region: false };
 }
 
+/** Read a range (first row = headers) into a table, in chunks so big sheets stay under Excel's request size limit. */
+async function readTable(ctx: Excel.RequestContext, range: Excel.Range): Promise<Table> {
+  range.load("rowCount,columnCount");
+  await ctx.sync();
+  const { rowCount, columnCount } = range;
+  if (rowCount < 2) throw new HostError("I need a header row and at least one row of data. Click a cell inside your table first.");
+
+  // The first data row's number formats tell dates from plain numbers.
+  const firstData = range.getRow(1);
+  firstData.load("numberFormat");
+  const header = range.getRow(0);
+  header.load("values");
+  await ctx.sync();
+  const names = headerNames(header.values[0]);
+  const formats = firstData.numberFormat[0].map((f) => String(f));
+
+  const rows: Cell[][] = [];
+  const step = Math.max(1, Math.floor(READ_CELLS_PER_CHUNK / columnCount));
+  for (let r = 1; r < rowCount; r += step) {
+    const part = range.getCell(r, 0).getResizedRange(Math.min(step, rowCount - r) - 1, columnCount - 1);
+    part.load("values");
+    await ctx.sync();
+    for (const row of part.values) rows.push(row as Cell[]);
+  }
+  return makeTable(names, rows, formats);
+}
+
 export class ExcelHost implements Host {
   kind = "excel" as const;
 
   async readSource(ref?: SourceRef): Promise<Source> {
     return Excel.run(async (ctx) => {
       const { range, region } = await locate(ctx, ref);
-      range.load("address,rowCount,columnCount");
+      range.load("address");
       range.worksheet.load("name");
       await ctx.sync();
-      const { rowCount, columnCount } = range;
-      if (rowCount < 2) throw new HostError("I need a header row and at least one row of data. Click a cell inside your table first.");
-
-      // The first data row's number formats tell dates from plain numbers.
-      const firstData = range.getRow(1);
-      firstData.load("numberFormat");
-      const header = range.getRow(0);
-      header.load("values");
-      await ctx.sync();
-      const names = headerNames(header.values[0]);
-      const formats = firstData.numberFormat[0].map((f) => String(f));
-
-      const rows: Cell[][] = [];
-      const step = Math.max(1, Math.floor(READ_CELLS_PER_CHUNK / columnCount));
-      for (let r = 1; r < rowCount; r += step) {
-        const part = range.getCell(r, 0).getResizedRange(Math.min(step, rowCount - r) - 1, columnCount - 1);
-        part.load("values");
-        await ctx.sync();
-        for (const row of part.values) rows.push(row as Cell[]);
-      }
+      const table = await readTable(ctx, range);
       const sheet = range.worksheet.name;
       const address = range.address.split("!").pop()!;
-      return { ref: { sheet, address, region }, label: `${sheet}!${address}`, table: makeTable(names, rows, formats) };
+      return { ref: { sheet, address, region }, label: `${sheet}!${address}`, table };
+    }).catch(rethrow);
+  }
+
+  async listSheets(): Promise<string[]> {
+    return Excel.run(async (ctx) => {
+      const sheets = ctx.workbook.worksheets;
+      sheets.load("items/name,items/visibility");
+      await ctx.sync();
+      return sheets.items.filter((w) => w.visibility === "Visible").map((w) => w.name);
+    }).catch(rethrow);
+  }
+
+  async readSheet(name: string): Promise<Table> {
+    return Excel.run(async (ctx) => {
+      const used = ctx.workbook.worksheets.getItem(name).getUsedRangeOrNullObject(true);
+      used.load("isNullObject");
+      await ctx.sync();
+      if (used.isNullObject) throw new HostError(`The sheet “${name}” is empty.`);
+      return readTable(ctx, used);
     }).catch(rethrow);
   }
 

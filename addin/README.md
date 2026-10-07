@@ -6,15 +6,16 @@ Describe what you want done with your table in plain English, inside Excel. The 
 - **Data never leaves the machine.** Everything runs inside the task pane. There is no server to send data to, only static files to host.
 - **Preview first.** Every command shows what it will do, with exact row counts, before anything is written.
 
-## What it can do so far (v0.2)
+## What it can do so far (v0.3)
 
 - **Rows and columns:** filter rows, sort, split into one sheet per value (including by month / year / weekday), remove duplicates, keep or drop columns.
 - **Summaries:** `total amount by category`, `how many debits per branch`, `monthly totals by category`, `pivot amount by category and txn type` (with totals), `top 10 by amount`, `lowest 3 amounts per category`, `add % of total amount`, `running total of amount per category`, `rank by amount`.
+- **Calculated columns:** `add column gst = amount * 0.18`, `add column net = credit - debit`, `add column size = high if amount > 50000 else low`, `add days since txn date`, `round amount to 2 decimals`, `set amount = amount * 100`, `flag rows where amount > 50000`. A column made by a formula is totalled the Excel "calculated field" way in later totals and pivots.
+- **Cleaning:** `trim spaces`, `make city title case`, `fill blank city with Unknown`, `fill down city`, `remove blank rows`, `replace "UPI/" with "" in description`, `split name into first and last`, `combine city and state into location`, `rename amt to amount`, `convert amt to number` (understands ₹, Rs., INR, commas), `change txn date to date`.
+- **Other sheets in the workbook:** `bring email from Customers on pan` (VLOOKUP), `rows not in March on pan`, `rows also in Customers`, `append March`. The sheet is named in the sentence; only the sheets you mention are read.
 - **Several at once:** `only debits over 5000, split by category and sort by amount descending`.
 
-Results are written as values (so they match the preview exactly), not yet as live PivotTables or formulas.
-
-Calculated columns, cleaning, lookups and charts follow. The Python app in the repo root already has them, and the add-in is being brought up to the same level step by step. Until a command is ported, the add-in says so instead of guessing.
+Results are written as values (so they match the preview exactly), not yet as live PivotTables or formulas. Highlights, number formats and charts follow. The Python app in the repo root already has them, and the add-in is being brought up to the same level step by step. Until a command is ported, the add-in says so instead of guessing.
 
 ## Run it
 
@@ -54,13 +55,13 @@ sentence ──► parser.ts ──► Plan (typed steps) ──► engine.ts �
 npm test
 ```
 
-`npm test` first asks the Python reference (`../planner.py`, `../engine.py`) to answer about 90 commands on a made-up bank file. It then checks that the TypeScript parser produces the **same plans, summaries and results**. This needs Python with pandas, numpy and pydantic.
+`npm test` first asks the Python reference (`../planner.py`, `../engine.py`) to answer about 250 commands on made-up files (bank transactions, a ledger, a messy contact list, and a few files for lookups). It then checks that the TypeScript parser produces the **same plans, summaries and results**. This needs Python with pandas, numpy and pydantic.
 
 When porting a new feature, add its commands to `tools/gen_golden.py` first. Generated data stays out of git.
 
 ## Not done yet
 
-- Ports of the remaining operations: totals, pivots as native PivotTables, calculated columns as live formulas, cleaning, lookup across sheets, compare, highlight, charts.
+- Ports of the remaining operations: highlight, number formats, charts. Native PivotTables and live formulas as an option.
 - Beginner mode (file profile and one-click suggestions) and a guided builder for sentences it can't read.
 - Packaging for company-wide deployment (Microsoft 365 admin center).
 - The Office.js read/write layer (`src/excel/io.ts`) has not yet been run inside a real Excel; the engine and task pane have been tested in a browser only.
