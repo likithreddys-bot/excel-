@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sheet Assistant</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js" onerror="window.__noOffice = true"></script>
+<link rel="stylesheet" href="/src/taskpane.css">
+</head>
+<body>
+<header>
+  <img src="/assets/icon-32.png" width="24" height="24" alt="">
+  <div>
+    <h1>Sheet Assistant</h1>
+    <p>Say what you want done with your table, in plain words.</p>
+  </div>
+</header>
+
+<section id="source" class="card">
+  <div class="row">
+    <div id="source-text" class="grow muted">Click a cell inside your table, then press the button.</div>
+    <button id="use-selection" class="secondary">Use my table</button>
+  </div>
+  <details id="columns-box" class="hidden">
+    <summary>Columns I can see</summary>
+    <div id="columns" class="chips"></div>
+  </details>
+</section>
+
+<main id="thread" aria-live="polite"></main>
+
+<footer id="dock">
+  <section id="examples-box" class="hidden">
+    <div class="label">Try one of these</div>
+    <div id="examples" class="chips"></div>
+  </section>
+  <form id="ask">
+    <textarea id="input" rows="2" placeholder="e.g. only debits over 5000, split by category" disabled></textarea>
+    <button id="send" class="primary" disabled>Preview</button>
+  </form>
+</footer>
+
+<script type="module" src="/src/taskpane.ts"></script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# Made by tools/gen_golden.py from the Python reference (synthetic data); regenerate with `npm run golden`.
+test/golden/

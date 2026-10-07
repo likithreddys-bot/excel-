@@ -6,6 +6,8 @@ Describe what you want done to a spreadsheet in plain English (*"only debits ove
 - **Data stays on the machine that runs it.** Nothing is sent to any external service.
 - **Nothing runs without confirmation.** Every command first shows what will happen, with exact row counts, before it is applied.
 
+> **Excel add-in:** the same assistant, running inside Excel instead of a browser, is being built in [`addin/`](addin/README.md) (TypeScript, no server, data never leaves the machine). This Python app is its reference implementation.
+
 ## Quick start
 
 Requires Python 3.11+ (tested on 3.14).

@@ -1,0 +1,861 @@
+/**
+ * Rule-based parser: turns a plain-English command into a typed Plan. No AI/ML.
+ * A line-by-line port of planner.py (the Python reference), covering filter, sort, split, dedupe and
+ * column choice. Commands the add-in can't run yet are recognised and answered honestly instead of guessed at.
+ */
+import { describe } from "./describe";
+import { applyPlan, PlanError } from "./engine";
+import type { Condition, DatePartStep, FilterStep, Plan, SortStep, Step } from "./plan";
+import { Cell, Sheets, Table, combine, isBlankCell } from "./table";
+import {
+  MONTHS, DAY_MS, closeMatch, colWords, fmt, isoDay, key, parseDate, parseNumber, similarity, singular, utcDay,
+} from "./util";
+
+const set = (s: string): Set<string> => new Set(s.split(/\s+/).filter(Boolean));
+
+const STOP = set(`a an the and or by of in on to for with where is are all any only just keep show rows row records data
+  sheet sheets file last first next past days day month months year years week weeks that this than more less
+  over under each every into from not no be it them`);
+const FILLER_WORDS = new Set([...STOP, ...set(`filter remove exclude delete drop hide out get rid give me
+  find list select include entries lines items ones which whose having if when please everything except excluding
+  without take leave who have has been was were also then now`)]);
+
+const MAX_SPLIT_SHEETS = 50;
+const DATE_UNITS: Record<string, number> = { day: 1, week: 7, month: 30, year: 365 };
+const AMOUNT_WORDS = set("amount amt value price total revenue sales cost");
+const ID_WORDS = set("id no num number code pin zip phone mobile account acct");
+
+const VERB = String.raw`(?:sort|order|arrange|split|segregate|separate|keep|remove|drop|delete|exclude|filter` +
+  String.raw`|show|dedupe|group|select|get|give|calculate|compute|find|hide|add|rank|pivot|top|bottom` +
+  String.raw`|rename|replace|trim|fill|merge|combine|convert|change|make|capitali[sz]e` +
+  String.raw`|create|insert|set|update|round|label|tag|flag|mark` +
+  String.raw`|bring|look\s*up|lookup|vlookup|xlookup|fetch|pull|append|compare|match` +
+  String.raw`|highlight|colou?r|shade|format|display|draw|plot|do)`;
+const CLAUSE_SPLIT = new RegExp(
+  String.raw`\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|and\s+now|then|also|now|and)\s+(?=${VERB}\b)` +
+  String.raw`|,\s*(?=${VERB}\b))\s*`, "i");
+const NEXT_ASSIGNMENT = /(?:\s*,\s*|\s+)(?:and\s+)?(?=[A-Za-z_][\w%.]*\s*=(?!=))/gi;
+
+const GROUP_MARKER = /\b(?:grouped\s+by|group\s+by|by|per|for\s+each|for\s+every|across|each|wrt|with\s+respect\s+to)\b/i;
+const PIVOT = /\bpivot\w*|\bcross[\s-]?tab\w*|\bmatrix\b|\b(?:as|in)\s+(?:the\s+)?columns\b|\bacross\b/i;
+const PERCENT = /(?:,?\s*\b(?:with|and|plus|including)\s+(?:a\s+|the\s+)?)?(?:(?<!\w)%|\bpercent(?:age)?s?\b|\bshare\b)(?:\s+of\s+(?:the\s+)?(?:grand\s+)?total)?/i;
+const TOP_N = /\b(top|bottom|first|last|highest|lowest|largest|smallest|biggest|latest|newest|oldest|earliest)\s+(\d+)\b(?!\s*(?:days?|weeks?|months?|years?)\b)/i;
+const DATE_PART_SRC = String.raw`\b(year|quarter|month|weekday|week|day\s+of\s+(?:the\s+)?week|day)(?:s|ly)?\b|\b(daily|annual(?:ly)?)\b`;
+const PREFIXED_DATE_PART = /(?<![A-Za-z0-9_])(?<pre>[A-Za-z0-9]+)[_ ](?<part>year|quarter|month|weekday|week|day)(?![A-Za-z0-9_])/gi;
+
+const SMART_QUOTES: Record<string, string> = { "“": '"', "”": '"', "‘": "'", "’": "'" };
+const QUOTED = /"[^"]*"|(?<!\w)'[^']*'(?!\w)/g;
+const CASE = /\b(?:upper|lower|title|proper|sentence)[\s-]*case[sd]?\b|\b(?:uppercase|lowercase|capitali[sz]e[sd]?|all\s+caps|in\s+caps)\b/i;
+const TRIM = new RegExp(
+  String.raw`\btrim(?:med)?\b(?:\s+(?:the\s+)?(?:extra\s+)?(?:white\s*)?spaces?)?` +
+  String.raw`|\b(?:strip|remove|clean(?:\s+up)?|fix|delete)\s+(?:all\s+)?(?:the\s+)?` +
+  String.raw`(?:(?:extra|leading|trailing|double|unnecessary|additional)\s+(?:and\s+)?)*(?:white\s*)?spaces?\b`, "i");
+const CONVERT = new RegExp(
+  String.raw`^\s*(?:please\s+)?(?:convert|change|make|set|treat|format|turn|cast)\s+(?:the\s+)?(?:columns?\s+)?` +
+  String.raw`(.+?)\s+(?:(?:to|as|into)\s+)?(?:an?\s+)?(?:proper\s+|real\s+)?` +
+  String.raw`(numbers?|numeric|integers?|decimals?|dates?|text|strings?)(?:\s+(?:format|type|values?))?\s*$`, "i");
+const NUMBER_FORMAT = new RegExp(
+  String.raw`^\s*(?:please\s+)?(?:format|show|display|make|set|put)\s+(?:the\s+)?(.+?)\s+(?:as|in|with|to|using)\s+(?:an?\s+)?` +
+  String.raw`(rupees?|inr|₹|indian\s+(?:rupees?|format|currency)|currency|money|commas?|comma\s+separators?` +
+  String.raw`|thousands?\s+separators?|percent(?:age)?s?|%|(?:\d+|no|zero|one|two|three)\s+decimals?(?:\s+places?)?` +
+  String.raw`|whole\s+numbers?|integers?|(?:(?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)))` +
+  String.raw`(?:\s+format)?\s*$`, "i");
+
+const WHAT_IT_CAN_DO = "Right now the add-in can filter rows, sort, split into sheets, remove duplicates and choose columns.";
+
+export class ParseError extends Error {
+  constructor(message: string, public awaitsColumns = false) {
+    super(message);
+  }
+}
+
+const soon = (what: string): never => {
+  throw new ParseError(`${what} is coming to the add-in in the next update. ${WHAT_IT_CAN_DO}`);
+};
+
+interface Mention { start: number; end: number; column: string }
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const strip = (s: string, chars: string): string => {
+  let a = 0, b = s.length;
+  while (a < b && chars.includes(s[a])) a++;
+  while (b > a && chars.includes(s[b - 1])) b--;
+  return s.slice(a, b);
+};
+const unique = <T>(xs: T[]): T[] => [...new Set(xs)];
+const sortedText = (xs: string[]) => [...xs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+const unquote = (v: string): string => {
+  v = v.trim();
+  return v.length >= 2 && v[0] === v[v.length - 1] && `"'`.includes(v[0]) ? v.slice(1, -1) : v;
+};
+
+const cleanValue = (v: string): string => {
+  v = strip(v.trim(), ".,");
+  v = v.replace(/\s+(?:only|rows?|records?|entries|transactions?|ones)$/i, "");
+  return strip(v.trim(), `'"`);
+};
+
+const splitList = (raw: string): string[] =>
+  raw.split(/\s*,\s*|\s+or\s+|\s+and\s+|\s*\/\s*/i).map((p) => strip(p.trim(), `'"`)).filter((p) => p.trim());
+
+const NEGATIONS: Record<string, Condition["operator"]> = {
+  equals: "not_equals", contains: "not_contains", in: "not_in", is_empty: "not_empty",
+  gt: "lte", gte: "lt", within_last_days: "older_than_days",
+};
+for (const [k, v] of Object.entries({ ...NEGATIONS })) NEGATIONS[v] = k as Condition["operator"];
+
+const negate = (c: Condition): Condition => ({ ...c, operator: NEGATIONS[c.operator] });
+
+function mergeSameColumn(conds: Condition[], match: "all" | "any"): [Condition[], "all" | "any"] {
+  if (match !== "all") return [conds, match];
+  const groups = new Map<string, Condition[]>();
+  for (const c of conds) if (c.operator === "equals" || c.operator === "in") groups.set(c.column, [...(groups.get(c.column) ?? []), c]);
+  const out: Condition[] = [];
+  const done = new Set<string>();
+  for (const c of conds) {
+    const g = groups.get(c.column) ?? [];
+    if ((c.operator === "equals" || c.operator === "in") && g.length > 1) {
+      if (!done.has(c.column)) {
+        const vals = g.flatMap((x) => x.values ?? [x.value as string]);
+        out.push({ column: c.column, operator: "in", values: unique(vals) });
+        done.add(c.column);
+      }
+    } else out.push(c);
+  }
+  return [out, match];
+}
+
+const distinct = (values: Cell[]): number => new Set(values.filter((v) => !isBlankCell(v)).map((v) => JSON.stringify(v))).size;
+
+const localIso = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+export class Parser {
+  readonly table: Table;
+  readonly columns: string[];
+  readonly colKeys: Map<string, string>;
+  readonly wordCols = new Map<string, string[]>();
+  readonly dateCols: string[];
+  readonly numericCols: string[];
+  private values: Map<string, Map<string, string>> | null = null;
+
+  /** `answer`: columns the user gave in reply to a "which column?" question. */
+  constructor(sheets: Sheets | Table, private answer: string[] = []) {
+    this.table = sheets instanceof Map ? combine(sheets) : sheets;
+    this.columns = this.table.columns.map((c) => String(c.name));
+    this.colKeys = new Map(this.columns.map((c) => [c, key(c)]));
+    for (const c of this.columns) {
+      for (const w of colWords(c)) {
+        const k = singular(w);
+        this.wordCols.set(k, [...(this.wordCols.get(k) ?? []), c]);
+      }
+    }
+    this.dateCols = this.table.columns.filter((c) => c.kind === "date").map((c) => c.name);
+    this.numericCols = this.table.columns.filter((c) => c.kind === "number").map((c) => c.name);
+  }
+
+  private col(name: string) {
+    return this.table.columns.find((c) => c.name === name)!;
+  }
+
+  // ---------- column / value lookup ----------
+
+  findColumns(text: string): Mention[] {
+    const toks = [...text.matchAll(/\S+/g)].map((m) => ({ start: m.index!, end: m.index! + m[0].length, k: key(m[0]) }));
+    const cands: { level: number; len: number; i: number; j: number; column: string }[] = [];
+    for (let i = 0; i < toks.length; i++) {
+      for (let j = i + 1; j < Math.min(i + 5, toks.length + 1); j++) {
+        const words = toks.slice(i, j).map((t) => t.k);
+        if (!words.every(Boolean) || words.every((w) => STOP.has(w))) continue;
+        const k = words.join("");
+        for (const [c, ck] of this.colKeys) {
+          if (k === ck || singular(k) === singular(ck)) cands.push({ level: 3, len: j - i, i, j, column: c });
+          else if (k.length >= 5 && similarity(k, ck) >= 0.88) cands.push({ level: 2, len: j - i, i, j, column: c });
+        }
+        if (j === i + 1 && k.length >= 4 && !STOP.has(k)) {
+          const cols = this.wordCols.get(singular(k)) ?? [];
+          if (cols.length === 1) cands.push({ level: 1, len: 1, i, j, column: cols[0] });
+        }
+      }
+    }
+    cands.sort((a, b) => b.level - a.level || b.len - a.len || a.i - b.i);
+    const used = new Set<number>();
+    const out: Mention[] = [];
+    for (const c of cands) {
+      let free = true;
+      for (let t = c.i; t < c.j; t++) if (used.has(t)) free = false;
+      if (!free) continue;
+      for (let t = c.i; t < c.j; t++) used.add(t);
+      out.push({ start: toks[c.i].start, end: toks[c.j - 1].end, column: c.column });
+    }
+    return out.sort((a, b) => a.start - b.start);
+  }
+
+  /** The single column that `text` names, or null. */
+  column(text: string): string | null {
+    const ms = this.findColumns(text);
+    let rest = text;
+    for (const m of [...ms].reverse()) rest = rest.slice(0, m.start) + rest.slice(m.end);
+    const ignore = new Set([...FILLER_WORDS, "column", "columns", "field", "fields"]);
+    const leftover = (rest.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((w) => !ignore.has(w));
+    return ms.length === 1 && !leftover.length ? ms[0].column : null;
+  }
+
+  /** Example commands that use this file's own columns and values. */
+  examples(): string[] {
+    const ids = new Set(this.numericCols.filter((c) => colWords(c).some((w) => ID_WORDS.has(w) || w === "num")));
+    let nums = this.numericCols.filter((c) => !ids.has(c));
+    if (!nums.length) nums = [...this.numericCols];
+    nums.sort((a, b) => Number(!colWords(a).some((w) => AMOUNT_WORDS.has(w))) - Number(!colWords(b).some((w) => AMOUNT_WORDS.has(w))));
+    const nun = (c: string) => distinct(this.col(c).values);
+    let cats = this.columns.filter((c) => !this.numericCols.includes(c) && !this.dateCols.includes(c) && nun(c) >= 2 && nun(c) <= 50);
+    if (!cats.length) cats = this.numericCols.filter((c) => nun(c) >= 2 && nun(c) <= 50);
+    cats.sort((a, b) => nun(a) - nun(b));
+    const num = nums[0], cat = cats[0];
+    // Only commands this version can run. (The Python reference also suggests totals, pivots, top N and
+    // calculated columns; they come back here as those features arrive.)
+    const out: string[] = [];
+    if (num) {
+      const xs = this.col(num).values.filter((v): v is number => typeof v === "number").sort((a, b) => a - b);
+      const median = xs.length ? (xs.length % 2 ? xs[(xs.length - 1) / 2] : (xs[xs.length / 2 - 1] + xs[xs.length / 2]) / 2) : NaN;
+      const threshold = Number.isFinite(median) && median ? fmt(Number(median.toPrecision(2))) : "0";
+      out.push(`only rows where ${num} > ${threshold}`, `sort by ${num} descending`);
+    }
+    if (cat) {
+      const counts = new Map<string, { v: Cell; n: number }>();
+      for (const v of this.col(cat).values) if (!isBlankCell(v)) {
+        const k = JSON.stringify(v);
+        counts.set(k, { v, n: (counts.get(k)?.n ?? 0) + 1 });
+      }
+      const best = [...counts.values()].sort((a, b) => b.n - a.n || (a.v! < b.v! ? -1 : 1))[0];
+      out.push(`only rows where ${cat} is ${typeof best.v === "number" ? fmt(best.v) : String(best.v)}`, `split by ${cat}`);
+    }
+    out.push("remove duplicate rows");
+    out.push("keep columns " + this.columns.slice(0, 3).join(", "));
+    return out.slice(0, 8);
+  }
+
+  /** singular key of each text value -> {column: original value}. */
+  valueIndex(): Map<string, Map<string, string>> {
+    if (this.values) return this.values;
+    const index = new Map<string, Map<string, string>>();
+    for (const c of this.table.columns) {
+      if (c.kind !== "text") continue;
+      const uniques = unique(c.values.filter((v) => v !== null).map(String));
+      if (uniques.length > 20000) continue;
+      for (const v of uniques) {
+        const k = singular(key(v));
+        if (k.length < 2) continue;
+        if (!index.has(k)) index.set(k, new Map());
+        index.get(k)!.set(c.name, v);
+      }
+    }
+    return (this.values = index);
+  }
+
+  /** Map a typed value to the actual value in `col` (case/plural/typo tolerant). */
+  resolveValue(col: string, raw: string): string {
+    const c = this.col(col);
+    if (c.kind === "number") {
+      const n = parseNumber(raw);
+      if (n === null) throw new ParseError(`'${raw}' is not a number, but '${col}' is a numeric column.`);
+      return fmt(n);
+    }
+    const uniques = unique(c.values.filter((v) => v !== null).map(String));
+    const byKey = new Map(uniques.map((v) => [singular(key(v)), v]));
+    const k = singular(key(raw));
+    const hit = byKey.get(k);
+    if (hit !== undefined) return hit;
+    const close = byKey.size <= 20000 ? closeMatch(k, [...byKey.keys()], 0.85) : null;
+    if (close !== null) return byKey.get(close)!;
+    throw new ParseError(`'${raw}' doesn't appear in column '${col}'. Values there include: ${sortedText(uniques).slice(0, 15).join(", ")}`);
+  }
+
+  /** One value ("Food and Dining") if it exists as-is, otherwise a list ("food, travel"). */
+  resolveValues(col: string, raw: string): string[] {
+    try {
+      return [this.resolveValue(col, raw)];
+    } catch (e) {
+      if (!(e instanceof ParseError)) throw e;
+      const parts = splitList(raw);
+      if (parts.length === 1) throw e;
+      return parts.map((v) => this.resolveValue(col, v));
+    }
+  }
+
+  andOrPhrases(): string[] {
+    const found = this.columns.filter((c) => /\s(?:and|or)\s/i.test(c));
+    for (const hits of this.valueIndex().values()) for (const v of hits.values()) if (/\s(?:and|or)\s/i.test(v)) found.push(v);
+    return unique(found).sort((a, b) => b.length - a.length);
+  }
+
+  defaultNumberColumn(): string {
+    const answered = this.answer.filter((c) => this.numericCols.includes(c));
+    if (answered.length) return answered[0];
+    const cands = this.numericCols.filter((c) => !colWords(c).some((w) => ID_WORDS.has(w)));
+    const amountish = cands.filter((c) => colWords(c).some((w) => AMOUNT_WORDS.has(w)));
+    if (cands.length === 1) return cands[0];
+    if (amountish.length === 1) return amountish[0];
+    throw new ParseError("Which column should the number apply to? Reply with the column name(s). Numeric columns: "
+      + (cands.length ? cands : this.numericCols.length ? this.numericCols : ["(none)"]).join(", "), true);
+  }
+
+  defaultDateColumn(text: string): string {
+    for (const m of this.findColumns(text)) if (this.dateCols.includes(m.column)) return m.column;
+    if (this.dateCols.length === 1) return this.dateCols[0];
+    if (!this.dateCols.length) throw new ParseError("I couldn't find a date column in this file.");
+    throw new ParseError("Which date column do you mean? Date columns: " + this.dateCols.join(", "));
+  }
+
+  // ---------- clauses ----------
+
+  parseClause(cl: string): Step[] {
+    const low = cl.toLowerCase();
+    // Formatting first: "highlight duplicates in pan" must colour rows, never remove them.
+    if (/^\s*(?:please\s+)?(?:highlight|colou?r|shade)\b/.test(low)) return soon("Highlighting");
+    if (/\b(?:chart|graph|plot)\b/.test(low)) return soon("Charts");
+    if (NUMBER_FORMAT.test(cl)) return soon("Number formatting");
+    if (/\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b/.test(low)) return [this.parseDedupe(cl)];
+    const formula = this.formulaCommand(cl);
+    if (formula !== null) return formula;
+    this.cleaningCommand(cl);
+    if (/\b(?:split|segregate|separate|seperate|segment|divide|partition)\b|\bbreak\b.*\b(?:up|down|into)\b|\b(?:sheets?|tabs?|files?)\s+(?:per|for\s+each|by)\b/.test(low)) {
+      return this.parseSplit(cl);
+    }
+    if (TOP_N.test(low)) return soon("Top / bottom N");
+    if (/\brank(?:ed|ing)?\b|\b(?:running|cumulative)\b/.test(low) || (PERCENT.test(low) && !this.isGroup(low.replace(new RegExp(PERCENT.source, "gi"), " ")))) {
+      return soon("Ranking, running totals and percent of total");
+    }
+    if (/\b(?:sort|sorted|arrange)\b|\border(?:ed)?\s+(?:\w+\s+)?by\b/.test(low)) return [this.parseSort(cl)];
+    if (PIVOT.test(low)) return soon("Pivot tables");
+    if (this.isGroup(low)) return soon("Totals and counts by group");
+    const step = this.parseColumns(cl);
+    if (step) return [step];
+    return [this.parseFilter(cl)];
+  }
+
+  private isGroup(low: string): boolean {
+    return /\b(?:totals?|sums?|counts?|averages?|avg|mean|how\s+many|number\s+of|min|max|minimum|maximum|lowest|highest|smallest|largest|biggest|unique|distinct|summar\w*|group(?:ed)?)\b/i.test(low)
+      && GROUP_MARKER.test(low);
+  }
+
+  /** Commands that make a new column. Returns steps we can run (date parts), null if `cl` isn't one, or says "coming soon". */
+  private formulaCommand(cl: string): Step[] | null {
+    const text = cl.trim().replace(/\.+$/, "");
+    let m = /^\s*(?:please\s+)?round(?:\s+off)?\s+(?:the\s+)?(?:column\s+)?(.+?)(?:\s+to\s+(?:\d+|one|two|three|four)\s+(?:decimals?|decimal\s+places?|places?|digits?))?\s*$/i.exec(text);
+    if (m) {
+      if (this.column(m[1]) === null) throw new ParseError("Which column should I round? Columns: " + this.numericCols.join(", "));
+      return soon("Rounding");
+    }
+    if (/^\s*(?:please\s+)?(?:label|tag|flag|mark)\s+(?:the\s+)?(?:rows?\s+|transactions?\s+|records?\s+)?(?:where\s+|with\s+|that\s+have\s+|if\s+)?(.+?)(?:\s+as\s+("[^"]*"|'[^']*'|[^,]+?))?(?:\s*,?\s*\b(?:else|otherwise)\b[\s,:]*(.+))?\s*$/i.test(text)) {
+      return soon("Labelling rows");
+    }
+    if (/^\s*(?:please\s+)?(?:add|calculate|compute|show|create)\s+(?:a\s+column\s+(?:for|with)\s+)?(?:the\s+)?((?:number\s+of\s+)?(?:days?|weeks?|months?|years?)\s+(?:since|from|after|between|until|till|before)\b.+|age\s+(?:from|of|using|based\s+on)\s+.+)$/i.test(text)) {
+      return soon("Date calculations");
+    }
+    const verb = String.raw`(?:add|create|make|insert|calculate|compute|new|set|update)`;
+    if (new RegExp(String.raw`^\s*(?:please\s+)?(${verb})\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?|col)\s+(?:called\s+|named\s+)?("[^"]*"|'[^']*'|.+?)\s*(?:=|:|\bas\b|\bequal\s+to\b|\bequals\b|\bwhich\s+is\b|\bthat\s+is\b|\bwith\b)\s*(.+)$`, "i").test(text)
+      || /^\s*(?:please\s+)?(?:add|calculate|compute|create)\s+(.+?)\s+as\s+(.+)$/i.test(text)) {
+      return soon("Calculated columns");
+    }
+    m = new RegExp(String.raw`^\s*(?:please\s+)?(?:(${verb})\s+)?([^=:<>!]+?)\s*[=:]\s*([^=].*)$`, "i").exec(text);
+    if (m && m[2].split(/\s+/).filter(Boolean).length <= 4) {
+      const verbWord = (m[1] ?? "").toLowerCase();
+      if (this.column(m[2]) && verbWord !== "set" && verbWord !== "update") return null; // "txn_type = DEBIT" is a filter
+      return soon("Calculated columns");
+    }
+    m = /^\s*(?:please\s+)?(?:add|create|insert|make)\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?)?\s*(?:for\s+|called\s+|named\s+)?([^=:]+?)\s*$/i.exec(text);
+    if (m) {
+      const [prefix, found] = this.dims(m[1]);
+      if (prefix.length && found.length === 1) return prefix;
+    }
+    return null;
+  }
+
+  /** Cleaning commands aren't available yet; recognise them so they aren't mistaken for filters. */
+  private cleaningCommand(cl: string): void {
+    const low = cl.toLowerCase();
+    if (/^\s*(?:please\s+)?rename\b/.test(low)) soon("Renaming columns");
+    if (/^\s*(?:please\s+)?(?:replace|substitute)\b/.test(low)
+      || /^\s*(?:please\s+)?(?:remove|delete|strip|erase|get\s+rid\s+of|take\s+out)\s+(?:the\s+)?(?:text\s+)?["']/.test(cl)) soon("Find and replace");
+    const split = /^\s*(?:please\s+)?(?:split|separate|break)\s+(?:up\s+)?(?:the\s+)?(?:column\s+)?(.+?)\s+((?:into|by|on|at|using|with)\b.*)$/i.exec(cl);
+    if (split && !/^(?:by|per|on|for|according|based|into|each)\b/i.test(split[1])
+      && !/\b(?:sheets?|tabs?|files?|workbooks?)\b/i.test(split[2]) && this.column(split[1]) !== null) soon("Splitting text into columns");
+    if (/^\s*(?:please\s+)?(?:merge|combine|concatenate|concat|join)\b/.test(low)) soon("Merging columns");
+    if (/^\s*(?:please\s+)?(?:remove|delete|drop|exclude)\b/.test(low)) {
+      if (/\b(?:blank|empty)\s+(?:rows|lines)\b/.test(low)
+        || /\brows?\s+(?:with|having|that\s+have|containing)\s+(?:any\s+)?(?:blank|empty|missing)(?:\s+(?:values?|cells?|fields?|data))?\s*$/.test(low)) soon("Removing blank rows");
+    }
+    if (CASE.test(low)) soon("Changing text case");
+    if (TRIM.test(low)) soon("Trimming spaces");
+    if (/^\s*(?:please\s+)?fill\b/.test(low)) soon("Filling blanks");
+    if (CONVERT.test(cl)) soon("Converting column types");
+  }
+
+  private afterPattern(cl: string, pattern: string): string {
+    const m = new RegExp(pattern, "i").exec(cl);
+    return m ? cl.slice(m.index + m[0].length) : cl;
+  }
+
+  private dims(text: string): [DatePartStep[], Mention[]] {
+    const steps: DatePartStep[] = [];
+    let found: Mention[] = [];
+    const real = this.findColumns(text);
+    const overlaps = (s: number, e: number, list: Mention[]) => list.some((r) => r.start < e && s < r.end);
+    for (const m of text.matchAll(new RegExp(PREFIXED_DATE_PART.source, "gi"))) {
+      const start = m.index!, end = start + m[0].length;
+      if (overlaps(start, end, real)) continue;
+      const pre = singular(key(m.groups!.pre));
+      const srcs = this.dateCols.filter((c) => colWords(c).map(singular).includes(pre));
+      if (srcs.length !== 1) continue;
+      const part = m.groups!.part.toLowerCase() as DatePartStep["part"];
+      const name = !this.columns.includes(m[0]) ? m[0] : `${srcs[0]} ${part}`;
+      if (steps.every((s) => s.name !== name)) steps.push({ op: "date_part", column: srcs[0], part, name });
+      found.push({ start, end, column: name });
+    }
+    for (const m of text.matchAll(new RegExp(DATE_PART_SRC, "gi"))) {
+      const start = m.index!, end = start + m[0].length;
+      if (overlaps(start, end, [...real, ...found])) continue; // part of a real column name, e.g. "year" in "assessment year"
+      const word = m[0].toLowerCase();
+      const part = (word.includes("day") && word.includes("week") ? "weekday"
+        : word.startsWith("day") || word.startsWith("daily") ? "day"
+        : word.startsWith("annual") ? "year"
+        : new RegExp(`^(?:${DATE_PART_SRC})`, "i").exec(word)![1]) as DatePartStep["part"];
+      const src = this.defaultDateColumn(text);
+      const name = !this.columns.includes(part) ? part : `${src} ${part}`;
+      if (steps.every((s) => s.name !== name)) steps.push({ op: "date_part", column: src, part, name });
+      found.push({ start, end, column: name });
+    }
+    let blanked = text;
+    for (const f of found) blanked = blanked.slice(0, f.start) + " ".repeat(f.end - f.start) + blanked.slice(f.end);
+    const sources = new Set(steps.map((s) => s.column));
+    found = found.concat(this.findColumns(blanked).filter((m) => !sources.has(m.column))); // skip "month of txn date"
+    return [steps, found.sort((a, b) => a.start - b.start)];
+  }
+
+  private distinctCount(name: string, steps: DatePartStep[]): number {
+    const s = steps.find((x) => x.name === name);
+    if (s) {
+      // Count the distinct parts without building the column twice.
+      return distinct(this.datePartCells(s));
+    }
+    return distinct(this.col(name).values);
+  }
+
+  private datePartCells(s: DatePartStep): Cell[] {
+    const t = applyPlan(new Map([["x", this.table]]), { clarification_question: null, summary: "", awaits_columns: false, steps: [s] });
+    return t.get("x")!.columns.find((c) => c.name === s.name)!.values;
+  }
+
+  private checkWidth(cols: string[], steps: DatePartStep[], what: string): void {
+    for (const c of cols) {
+      const n = this.distinctCount(c, steps);
+      if (n > MAX_SPLIT_SHEETS) {
+        const good = this.columns.filter((x) => { const k = distinct(this.col(x).values); return k >= 2 && k <= MAX_SPLIT_SHEETS; })
+          .map((x) => `${x} (${distinct(this.col(x).values)})`);
+        throw new ParseError(`'${c}' has ${n.toLocaleString("en-US")} different values, so it would create ${n.toLocaleString("en-US")} ${what}. `
+          + `Columns with fewer values (${what}): ` + (good.join(", ") || "none"));
+      }
+    }
+  }
+
+  private parseDedupe(cl: string): Step {
+    const tail = this.afterPattern(cl, String.raw`\b(?:by|on|based\s+on|using|in|of|per)\b`);
+    const cols = tail !== cl ? this.findColumns(tail).map((m) => m.column) : [];
+    const keep = /\b(?:keep(?:ing)?\s+(?:the\s+)?(?:last|latest|newest|most\s+recent))\b/i.test(cl) ? "last" : "first";
+    return { op: "dedupe", columns: cols.length ? cols : null, keep };
+  }
+
+  private parseSplit(cl: string): Step[] {
+    const tail = this.afterPattern(cl, String.raw`\b(?:by|on|per|for\s+each|for\s+every|based\s+on|according\s+to|using)\b`);
+    const [prefix, found] = this.dims(tail);
+    const cols = unique(found.map((m) => m.column));
+    if (!cols.length) throw new ParseError("Which column should I split by? Columns: " + this.columns.join(", "));
+    this.checkWidth(cols, prefix, "sheets");
+    return [...prefix, ...cols.map((c): Step => ({ op: "split_by", column: c }))];
+  }
+
+  private parseSort(cl: string): SortStep {
+    const desc = /\b(?:desc|descending|decreasing|highest|largest|biggest|most|newest|latest|recent|reverse|z\s*(?:-|to)\s*a|high(?:est)?\s+to\s+low(?:est)?|big(?:gest)?\s+to\s+small(?:est)?)\b/i.test(cl);
+    let tail = this.afterPattern(cl, String.raw`\bby\b`);
+    tail = tail.replace(/\b(?:asc|ascending|desc|descending|first|order|highest|lowest|newest|oldest|latest|high|low|to|z|a|reverse)\b/gi, " ");
+    let cols = this.findColumns(tail).map((m) => m.column);
+    if (!cols.length && /\b(?:newest|oldest|latest|earliest|recent|date)\b/i.test(cl)) cols = [this.defaultDateColumn(cl)];
+    if (!cols.length && /\b(?:highest|lowest|largest|smallest|biggest)\b/i.test(cl)) cols = [this.defaultNumberColumn()];
+    if (!cols.length) throw new ParseError("Which column should I sort by? Columns: " + this.columns.join(", "));
+    return { op: "sort", columns: unique(cols), ascending: !desc };
+  }
+
+  private parseColumns(cl: string): Step | null {
+    const low = cl.toLowerCase();
+    const lead = String.raw`^\s*(?:please\s+)?`;
+    const dropRe = String.raw`(?:drop|remove|delete|hide|exclude|get\s+rid\s+of)`;
+    const keepRe = String.raw`(?:keep|select|show|include|just|only|retain|pick|want|give\s+me)`;
+    const drop = new RegExp(`${lead}${dropRe}\\b`).test(low);
+    const keep = new RegExp(`${lead}${keepRe}\\b`).test(low);
+    if (!(drop || keep)) return null;
+    const hasWord = /\b(?:columns?|fields?|cols?)\b/.test(low);
+    let body = cl.replace(new RegExp(`${lead}(?:${dropRe}|${keepRe})\\b`, "i"), "");
+    body = body.replace(/\b(?:only|just|the|columns?|fields?|cols?)\b/gi, " ");
+    const items = body.split(/,|\band\b|&|\+|\//i).map((i) => i.trim()).filter(Boolean);
+    if (!items.length) return null;
+    const cols = items.map((i) => this.column(i));
+    if (cols.includes(null)) {
+      if (!hasWord) return null; // probably a row filter like "keep only debits"
+      throw new ParseError(`I couldn't find a column matching '${items[cols.indexOf(null)]}'. Columns: ` + this.columns.join(", "));
+    }
+    const names = unique(cols as string[]);
+    return drop ? { op: "drop_columns", columns: names } : { op: "select_columns", columns: names };
+  }
+
+  // ---------- row filters ----------
+
+  parseFilter(cl: string): FilterStep {
+    const everythingExcept = /\b(?:everything|all(?:\s+\w+)?)\s+(?:except|but|other\s+than|excluding)\b/i.exec(cl);
+    const neg = !!everythingExcept || /^\s*(?:please\s+)?(?:remove|exclude|delete|drop|hide|filter\s+out|get\s+rid\s+of|take\s+out|leave\s+out|without|except|excluding)\b/i.test(cl);
+    if (everythingExcept) cl = cl.slice(0, everythingExcept.index) + cl.slice(everythingExcept.index! + everythingExcept[0].length);
+    let body = cl;
+    for (const phrase of this.andOrPhrases()) { // e.g. the value "Food and Dining" is one value
+      body = body.replace(new RegExp(escapeRe(phrase), "gi"),
+        (m) => m.replace(/\s+(and|or)\s+/gi, (_, w: string) => ` __${w.toUpperCase()}__ `));
+    }
+    body = body.replace(/\b(between|from)\s+(\S+(?:\s+\S+){0,3}?)\s+and\s+/gi, "$1 $2 __AND__ ");
+    const parts = body.split(/\s*\b(and|or)\b\s*/i);
+    const frags = parts.filter((_, i) => i % 2 === 0);
+    const connectors = parts.filter((_, i) => i % 2 === 1).map((p) => p.toLowerCase());
+    if (connectors.includes("and") && connectors.includes("or")) {
+      throw new ParseError("Mixing 'and' with 'or' in one filter is ambiguous. Please split it into two commands.");
+    }
+    let match: "all" | "any" = connectors.includes("or") ? "any" : "all";
+    let conds: Condition[] = [];
+    for (let frag of frags) {
+      frag = frag.replace(/__AND__/g, "and").replace(/__OR__/g, "or");
+      const got = this.parseFragment(frag, conds.length ? conds[conds.length - 1] : null);
+      if (!got.length) {
+        throw new ParseError(`I couldn't understand '${frag.trim()}'.\n\nTry commands like:\n- ` + this.examples().join("\n- "));
+      }
+      conds.push(...got);
+    }
+    [conds, match] = mergeSameColumn(conds, match);
+    if (neg) {
+      conds = conds.map(negate);
+      if (conds.length > 1) match = match === "all" ? "any" : "all";
+    }
+    return { op: "filter", conditions: conds, match };
+  }
+
+  private parseFragment(frag: string, prev: Condition | null): Condition[] {
+    let prevCol = prev ? prev.column : null;
+    let conds: Condition[] = [];
+    let dconds: Condition[];
+    [frag, dconds] = this.datePhrases(frag);
+    conds.push(...dconds);
+
+    // "<column> <operator> <value>" for each column mentioned.
+    const mentions = this.findColumns(frag);
+    let residue = frag;
+    mentions.forEach((m, i) => {
+      const segEnd = i + 1 < mentions.length ? mentions[i + 1].start : frag.length;
+      let [got, used] = this.parseOp(m.column, frag.slice(m.end, segEnd));
+      if (!got.length && /\b(?:no|missing|empty|blank)\s+(?:an?\s+)?$/i.test(frag.slice(0, m.start))) {
+        got = [{ column: m.column, operator: "is_empty" }];
+        used = 0; // "rows with no branch"
+      }
+      if (got.length) {
+        conds.push(...got);
+        residue = residue.slice(0, m.start) + " ".repeat(m.end + used - m.start) + residue.slice(m.end + used);
+        prevCol = m.column;
+      }
+    });
+
+    // Bare values that exist in the data, e.g. "debits" -> txn_type = DEBIT.
+    let vconds: Condition[];
+    [residue, vconds] = this.bareValues(residue);
+    conds.push(...vconds);
+
+    // Operator without a column, e.g. "over 5000" or "and under 500".
+    const rest = residue.split(/\s+/).filter(Boolean).join(" ");
+    if (rest && /\d/.test(rest)) {
+      const looksLikeDate = /\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{1,2}-\d{1,2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b/i.test(rest);
+      const col = looksLikeDate
+        ? (prevCol !== null && this.dateCols.includes(prevCol) ? prevCol : this.defaultDateColumn(frag))
+        : (prevCol !== null && this.numericCols.includes(prevCol) ? prevCol : this.defaultNumberColumn());
+      // The operator may come after other words: "transactions after 01/03/2025".
+      for (const w of rest.matchAll(/\S+/g)) {
+        const [got] = this.parseOp(col, rest.slice(w.index!), true);
+        if (got.length) { conds.push(...got); break; }
+      }
+    }
+
+    // A lone value after "and"/"or" continues the previous condition: "description contains zomato or swiggy".
+    const value = cleanValue(frag);
+    if (!conds.length && prev && (prev.operator === "contains" || prev.operator === "not_contains")
+      && value.split(/\s+/).filter(Boolean).length > 0 && value.split(/\s+/).filter(Boolean).length <= 3) {
+      conds.push({ ...prev, value });
+    }
+    return conds;
+  }
+
+  private datePhrases(frag: string): [string, Condition[]] {
+    const conds: Condition[] = [];
+    const low = frag.toLowerCase();
+    const unit = String.raw`(day|week|month|year)s?`;
+    const patterns: [string, "older" | "recent"][] = [
+      [String.raw`\b(?:older\s+than|more\s+than|over|at\s+least)\s+(\d+)\s*${unit}(?:\s+(?:ago|old))?`, "older"],
+      [String.raw`\b(\d+)\s*${unit}\s+ago\s+or\s+(?:more|older|earlier)`, "older"],
+      [String.raw`\b(?:in|within|during|over|for|from)?\s*(?:the\s+)?(?:last|past|previous|recent)\s+(\d+)?\s*${unit}`, "recent"],
+      [String.raw`\b(?:in|within|for)\s+(\d+)\s*${unit}`, "recent"],
+    ];
+    for (const [pattern, kind] of patterns) {
+      const m = new RegExp(pattern).exec(low);
+      if (!m) continue;
+      const days = parseInt(m[1] ?? "1", 10) * DATE_UNITS[m[2]];
+      const before = low.slice(0, m.index);
+      const negated = /\b(?:not|no|never|without|inactive|hasnt|havent|didnt|isnt|wasnt|dont|doesnt)\b|n't\b/.test(before);
+      const col = this.defaultDateColumn(frag);
+      const op = (kind === "older") !== negated ? "older_than_days" : "within_last_days";
+      conds.push({ column: col, operator: op, value: String(days) });
+      frag = frag.slice(0, m.index) + " " + frag.slice(m.index! + m[0].length);
+      return [this.stripCol(frag, col), conds];
+    }
+
+    const now = new Date();
+    let m = /\b(?:this|current)\s+(month|year)\b|\btoday\b/.exec(low);
+    if (m) {
+      const start = m[0] === "today" ? new Date(now.getFullYear(), now.getMonth(), now.getDate())
+        : m[1] === "month" ? new Date(now.getFullYear(), now.getMonth(), 1) : new Date(now.getFullYear(), 0, 1);
+      const col = this.defaultDateColumn(frag);
+      conds.push({ column: col, operator: "gte", value: localIso(start) });
+      return [this.stripCol(frag.slice(0, m.index) + " " + frag.slice(m.index! + m[0].length), col), conds];
+    }
+
+    m = /\b(?:in|during|for|of)?\s*(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?,?\s+(\d{4})\b/.exec(low)
+      ?? /\b(?:in|during|for)\s+(?:the\s+year\s+)?()(\d{4})\b/.exec(low);
+    if (m && this.dateCols.length) {
+      const year = parseInt(m[2], 10);
+      let start: number, end: number;
+      if (m[1]) {
+        const month = MONTHS[m[1].slice(0, 3)];
+        start = utcDay(year, month, 1)!;
+        end = utcDay(year + (month === 12 ? 1 : 0), (month % 12) + 1, 1)!;
+      } else {
+        start = utcDay(year, 1, 1)!;
+        end = utcDay(year + 1, 1, 1)!;
+      }
+      const col = this.defaultDateColumn(frag);
+      conds.push({ column: col, operator: "gte", value: isoDay(start) }, { column: col, operator: "lt", value: isoDay(end) });
+      return [this.stripCol(frag.slice(0, m.index) + " " + frag.slice(m.index! + m[0].length), col), conds];
+    }
+    return [frag, conds];
+  }
+
+  /** Blank out mentions of `col` so it isn't parsed again as a separate condition. */
+  private stripCol(frag: string, col: string): string {
+    for (const m of [...this.findColumns(frag)].reverse()) {
+      if (m.column === col) frag = frag.slice(0, m.start) + " ".repeat(m.end - m.start) + frag.slice(m.end);
+    }
+    return frag;
+  }
+
+  private bareValues(text: string): [string, Condition[]] {
+    const index = this.valueIndex();
+    const toks = [...text.matchAll(/\S+/g)].map((m) => ({ start: m.index!, end: m.index! + m[0].length, text: m[0] }));
+    const conds: Condition[] = [];
+    const used = new Set<number>();
+    for (let n = Math.min(5, toks.length); n >= 1; n--) {
+      for (let i = 0; i + n <= toks.length; i++) {
+        let clash = false;
+        for (let t = i; t < i + n; t++) if (used.has(t)) clash = true;
+        if (clash) continue;
+        const words = toks.slice(i, i + n).map((t) => key(t.text));
+        if (n === 1 && (FILLER_WORDS.has(words[0]) || words[0].length < 2 || /^\d+$/.test(words[0]))) continue;
+        const hits = index.get(singular(words.join("")));
+        if (!hits) continue;
+        if (hits.size > 1) {
+          throw new ParseError(`'${toks.slice(i, i + n).map((t) => t.text).join(" ")}' appears in several columns (`
+            + [...hits.keys()].join(", ") + `). Please say which column, e.g. "<column> is <value>".`);
+        }
+        const [[col, value]] = [...hits];
+        const before = text.slice(0, toks[i].start).toLowerCase();
+        const negated = /\b(?:not|non|except|excluding|other\s+than|no)\s*-?\s*$/.test(before);
+        conds.push({ column: col, operator: negated ? "not_equals" : "equals", value });
+        for (let t = i; t < i + n; t++) used.add(t);
+      }
+    }
+    for (const i of [...used].sort((a, b) => b - a)) {
+      const t = toks[i];
+      text = text.slice(0, t.start) + " ".repeat(t.end - t.start) + text.slice(t.end);
+    }
+    return [text, conds];
+  }
+
+  // Each operator: (regex matched at the start of the text after the column, operator name).
+  private static readonly OPS: [RegExp, string][] = ([
+    [String.raw`(?:is\s+|are\s+)?(?:between|from)\s+(.+?)\s+(?:and|to|till|until|-)\s+(.+)`, "between"],
+    [String.raw`(?:is\s+|are\s+)?not\s+(?:empty|blank|missing|null)|(?:is\s+)?(?:filled|present)|has\s+(?:a\s+)?value`, "not_empty"],
+    [String.raw`(?:is\s+|are\s+)?(?:empty|blank|missing|null)`, "is_empty"],
+    [String.raw`(?:is\s+|are\s+)?(?:>=|=>|at\s+least|greater\s+than\s+or\s+equal\s+to|not\s+less\s+than|min(?:imum)?|since|on\s+or\s+after)\s*(.+)`, "gte"],
+    [String.raw`(?:is\s+|are\s+)?(?:<=|=<|at\s+most|less\s+than\s+or\s+equal\s+to|not\s+more\s+than|up\s+to|max(?:imum)?|until|till|on\s+or\s+before)\s*(.+)`, "lte"],
+    [String.raw`(?:is\s+|are\s+)?(?:>|greater\s+than|more\s+than|higher\s+than|larger\s+than|bigger\s+than|above|over|exceeds?|exceeding|after|later\s+than)\s*(.+)`, "gt"],
+    [String.raw`(?:is\s+|are\s+)?(?:<|less\s+than|lower\s+than|smaller\s+than|below|under|before|earlier\s+than)\s*(.+)`, "lt"],
+    [String.raw`(?:does\s*n[o']?t|doesnt|do\s*n[o']?t)\s+(?:contain|include|have|mention)\s+(.+)`, "not_contains"],
+    [String.raw`(?:contains?|includes?|has|having|mentions?|with|like)\s+(.+)`, "contains"],
+    [String.raw`(?:is\s+|are\s+)?not\s+(?:in|one\s+of|any\s+of)\s+(.+)`, "not_in"],
+    [String.raw`(?:is\s+|are\s+)?(?:in|one\s+of|any\s+of)\s+(.+)`, "in"],
+    [String.raw`(?:is\s+not|are\s+not|isn'?t|aren'?t|!=|<>|not\s+equals?(?:\s+to)?|not|except|other\s+than)\s+(.+)`, "not_equals"],
+    [String.raw`(?:(?:is\s+equal\s+to|equals?(?:\s+to)?|is|are|of|as)\b|==|=|:)\s*(.+)`, "equals"],
+    [String.raw`(.+)`, "equals_implicit"],
+  ] as [string, string][]).map(([p, op]) => [new RegExp(`^(?:${p})`, "i"), op]);
+
+  /** Parse '<operator> <value>' right after a column. Returns (conditions, chars consumed). */
+  private parseOp(col: string, seg: string, requireOp = false): [Condition[], number] {
+    let s = seg.replace(/^[ ,:]+/, "").replace(/^(?:(?:where|whose|value|column|field)\s+)+/i, "");
+    const lead = seg.length - s.length;
+    s = s.replace(/[ ,:]+$/, "");
+    if (!s) return [[], 0];
+    const numeric = this.numericCols.includes(col);
+    const isDate = this.dateCols.includes(col);
+    // Start of the last capture group (every pattern that needs it ends with its group).
+    const lastStart = (m: RegExpExecArray, g: number) => m[0].length - m[g].length;
+    for (const [re, op] of Parser.OPS) {
+      if (requireOp && (op === "equals" || op === "equals_implicit")) continue;
+      const m = re.exec(s);
+      if (!m) continue;
+      if (op === "is_empty" || op === "not_empty") return [[{ column: col, operator: op }], lead + m[0].length];
+      if (op === "between") {
+        const [lo] = this.scalar(col, m[1]);
+        const [hi, hiUsed] = this.scalar(col, m[2]);
+        if (lo === null || hi === null) continue;
+        return [[{ column: col, operator: "gte", value: lo }, { column: col, operator: "lte", value: hi }], lead + lastStart(m, 2) + hiUsed];
+      }
+      if (op === "gt" || op === "gte" || op === "lt" || op === "lte") {
+        if (!(numeric || isDate)) continue;
+        const [v, used] = this.scalar(col, m[1]);
+        if (v === null) continue;
+        return [[{ column: col, operator: op, value: v }], lead + lastStart(m, 1) + used];
+      }
+      if (isDate && (op === "equals" || op === "equals_implicit")) { // "date is 01/03/2024" means that whole day
+        const [v, used] = this.scalar(col, m[1]);
+        if (v === null) continue;
+        const next = isoDay(Date.parse(v) + DAY_MS);
+        return [[{ column: col, operator: "gte", value: v }, { column: col, operator: "lt", value: next }], lead + lastStart(m, 1) + used];
+      }
+      const raw = cleanValue(m[1]);
+      if (!raw || FILLER_WORDS.has(key(raw))) continue;
+      if (op === "contains" || op === "not_contains") return [[{ column: col, operator: op, value: raw }], seg.length];
+      if (op === "in" || op === "not_in") return [[{ column: col, operator: op, values: this.resolveValues(col, raw) }], seg.length];
+      let vals: string[];
+      if (op === "equals_implicit") { // No "is"/"=": accept only if it's clearly a value of this column.
+        try { vals = this.resolveValues(col, raw); } catch (e) { if (e instanceof ParseError) return [[], 0]; throw e; }
+      } else vals = this.resolveValues(col, raw);
+      const negated = op === "not_equals";
+      if (vals.length > 1) return [[{ column: col, operator: negated ? "not_in" : "in", values: vals }], seg.length];
+      return [[{ column: col, operator: negated ? "not_equals" : "equals", value: vals[0] }], seg.length];
+    }
+    return [[], 0];
+  }
+
+  /** Leading number or date in `text` (as the engine expects it) and chars consumed. */
+  private scalar(col: string, text: string): [string | null, number] {
+    if (this.dateCols.includes(col)) {
+      const m = /^\s*(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{1,2}\s+[a-z]{3,9}\.?,?\s+\d{4}|[a-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}|[a-z]{3,9}\s+\d{4})/i.exec(text);
+      const v = m ? parseDate(m[1]) : null;
+      return v ? [v, m![0].length] : [null, 0];
+    }
+    const m = /^\s*([₹$€£]?\s*(?:rs\.?\s*|inr\s*)?-?[\d,]*\.?\d+\s*(?:k|thousand|lakhs?|lacs?|l|crores?|cr|mn|m|million|bn|b|billion)?)(?![a-z])/i.exec(text);
+    const n = m ? parseNumber(m[1]) : null;
+    return n !== null ? [fmt(n), m![0].length] : [null, 0];
+  }
+}
+
+// ---------- whole commands ----------
+
+export function splitClauses(request: string): string[] {
+  let text = request.trim().replace(/[“”‘’]/g, (c) => SMART_QUOTES[c]);
+  text = text.replace(/\bw\s*\.\s*r\s*\.\s*t\b\.?/gi, "wrt"); // "w.r.t." must not end a sentence
+  // Quoted text ('"Rs. "', '", "') is set aside so the splitting below can't break it up.
+  const quoted: string[] = [];
+  text = text.replace(QUOTED, (m) => { quoted.push(m); return `__Q${quoted.length - 1}__`; });
+  text = text.replace(/,(?=[^\s\d])/g, ", "); // "date,amount" -> "date, amount"; not "5,000"
+  const clauses: string[] = [];
+  for (const part of text.split(CLAUSE_SPLIT)) {
+    for (const clause of splitAssignments(part ?? "")) {
+      if (!strip(clause, " ,.")) continue;
+      const cleaned = strip(clause, " ,.").replace(/^(?:(?:and|also|then|now|please|actually|next|finally|do)\b[\s,]*)+/i, "");
+      clauses.push(cleaned.replace(/__Q(\d+)__/g, (_, n: string) => quoted[+n]));
+    }
+  }
+  return clauses;
+}
+
+function splitAssignments(clause: string): string[] {
+  const first = /(?<![<>!=])=(?!=)/.exec(clause);
+  if (!first) return [clause];
+  const parts: string[] = [];
+  let start = 0;
+  const re = new RegExp(NEXT_ASSIGNMENT.source, "gi");
+  re.lastIndex = first.index + 1;
+  for (let m = re.exec(clause); m; m = re.exec(clause)) {
+    if (m[0] === "") { re.lastIndex++; continue; }
+    if (/\bor\s*$/i.test(clause.slice(0, m.index))) continue; // "type = DEBIT or type = CREDIT" is one filter
+    parts.push(clause.slice(start, m.index));
+    start = m.index + m[0].length;
+  }
+  return [...parts, clause.slice(start)];
+}
+
+export function replyColumns(sheets: Sheets | Table, text: string): [string[], string[]] | null {
+  const parser = new Parser(sheets);
+  const first = text.trim() ? (splitClauses(text)[0] ?? "") : "";
+  const items = first.split(/,|\band\b|&|\s{2,}/i).map((i) => i.trim()).filter(Boolean);
+  if (!items.length || items.length > 20 || items.some((i) => i.split(/\s+/).length > 3)) return null;
+  const lookAlike = (s: string) => s.replace(/o/g, "0").replace(/i/g, "1").replace(/l/g, "1");
+  const found: string[] = [], unknown: string[] = [];
+  for (const item of items) {
+    const col = parser.column(item);
+    const own = new Set(colWords(col ?? "").map(singular));
+    const extra = new Set((item.toLowerCase().replace(/_/g, " ").match(/[a-z0-9]+/g) ?? []).map(singular));
+    if (col && [...extra].every((w) => own.has(w))) { found.push(col); continue; } // nothing but the column's own words
+    if (/\s/.test(item) || col) return null; // a phrase like "rank by amount" is a command, not a mistyped column
+    let guess = parser.columns.find((c) => lookAlike(key(c)) === lookAlike(key(item))) ?? null;
+    if (guess === null) {
+      const close = closeMatch(key(item), parser.columns.map(key), 0.75);
+      guess = close !== null ? parser.columns.find((c) => key(c) === close) ?? null : null;
+    }
+    if (guess === null) return null; // not a column list after all
+    unknown.push(`'${item}' (did you mean ${guess}?)`);
+  }
+  return [unique(found), unknown];
+}
+
+export const examples = (sheets: Sheets | Table): string[] => new Parser(sheets).examples();
+
+export function makePlan(sheets: Sheets, request: string, answer: string[] = []): Plan {
+  const empty = (q: string, awaits = false): Plan => ({ clarification_question: q, summary: "", steps: [], awaits_columns: awaits });
+  try {
+    const clauses = splitClauses(request);
+    if (!clauses.length) throw new ParseError("Tell me what you'd like to do with the data.");
+    const justColumns = answer.length ? null : replyColumns(sheets, request);
+    if (justColumns) {
+      const [cols, unknown] = justColumns;
+      if (unknown.length) throw new ParseError("I couldn't find " + unknown.join(", ") + ".");
+      const c = cols[0];
+      throw new ParseError(`What should I do with ${cols.join(", ")}? For example:\n- total ${c} by <column>\n`
+        + `- sort by ${c} descending\n- keep columns ${cols.join(", ")}\n- top 10 by ${c}`);
+    }
+    const steps: Step[] = [];
+    let current = sheets;
+    clauses.forEach((clause, i) => {
+      const made = new Parser(current, answer).parseClause(clause);
+      steps.push(...made);
+      // Later parts see the result so far: "add column gst = ... and sort by gst".
+      if (i < clauses.length - 1) current = applyPlan(current, { clarification_question: null, summary: "", awaits_columns: false, steps: made });
+    });
+    return { clarification_question: null, summary: steps.map(describe).join("; ") + ".", steps, awaits_columns: false };
+  } catch (e) {
+    if (e instanceof ParseError) return empty(e.message, e.awaitsColumns);
+    if (e instanceof PlanError) return empty(`That can't run on this data: ${e.message}`);
+    throw e;
+  }
+}

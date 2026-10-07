@@ -1,0 +1,250 @@
+/** Runs a Plan on tables. Pure functions: the only code that touches the data. */
+import type { Condition, DatePart, DatePartStep, FilterStep, Plan, Step } from "./plan";
+import { Cell, Column, Sheets, Table, getColumn, makeColumn, pick, timesOf } from "./table";
+import { DAY_MS, cmpText, isoDay, parseDateText, todayMs } from "./util";
+
+export class PlanError extends Error {}
+
+const WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+function need(t: Table, cols: string[]): void {
+  const missing = cols.filter((c) => !getColumn(t, c));
+  if (missing.length) throw new PlanError(`Unknown column(s): ${missing.join(", ")}`);
+}
+
+function col(t: Table, name: string): Column {
+  need(t, [name]);
+  return getColumn(t, name)!;
+}
+
+// ---------- filtering ----------
+
+const textOf = (v: Cell): string => (v === null ? "" : String(v).trim().toLowerCase());
+
+/** A cell as a number: numbers as-is, numeric-looking text read like pandas to_numeric, else NaN. */
+function numberOf(v: Cell): number {
+  if (typeof v === "number") return v;
+  if (typeof v === "string" && v.trim() !== "") return Number(v.trim());
+  return NaN;
+}
+
+function compare(c: Column, op: "gt" | "gte" | "lt" | "lte", value: string): boolean[] {
+  const cmp = (a: number, b: number) =>
+    op === "gt" ? a > b : op === "gte" ? a >= b : op === "lt" ? a < b : a <= b; // NaN compares false, like a blank
+  if (c.kind !== "date" && value.trim() !== "" && !Number.isNaN(Number(value))) {
+    const v = Number(value);
+    return c.values.map((x) => cmp(numberOf(x), v));
+  }
+  const v = parseDateText(value);
+  if (v === null) throw new PlanError(`'${value}' is not a number or a date`);
+  return timesOf(c).map((t) => (t === null ? false : cmp(t, v)));
+}
+
+function mask(t: Table, c: Condition): boolean[] {
+  const column = col(t, c.column);
+  const val = (c.value ?? "").trim().toLowerCase();
+  const vals = (c.values ?? []).map((v) => v.trim().toLowerCase());
+  const numeric = column.kind === "number";
+  if ((c.operator === "equals" || c.operator === "not_equals") && numeric) {
+    const target = Number(c.value);
+    return column.values.map((x) => (numberOf(x) === target) === (c.operator === "equals"));
+  }
+  if ((c.operator === "in" || c.operator === "not_in") && numeric) {
+    const targets = new Set((c.values ?? []).map(Number));
+    return column.values.map((x) => targets.has(numberOf(x)) === (c.operator === "in"));
+  }
+  const text = column.values.map(textOf);
+  switch (c.operator) {
+    case "equals": return text.map((x) => x === val);
+    case "not_equals": return text.map((x) => x !== val);
+    case "contains": return text.map((x) => x.includes(val));
+    case "not_contains": return text.map((x) => !x.includes(val));
+    case "in": return text.map((x) => vals.includes(x));
+    case "not_in": return text.map((x) => !vals.includes(x));
+    case "is_empty": return text.map((x) => x === "");
+    case "not_empty": return text.map((x) => x !== "");
+    case "gt": case "gte": case "lt": case "lte": return compare(column, c.operator, c.value ?? "");
+    case "within_last_days": {
+      const cutoff = todayMs() - Number(c.value) * DAY_MS;
+      return timesOf(column).map((x) => x !== null && x >= cutoff);
+    }
+    case "older_than_days": {
+      const cutoff = todayMs() - Number(c.value) * DAY_MS;
+      return timesOf(column).map((x) => x !== null && x < cutoff);
+    }
+  }
+  throw new PlanError(`Unknown operator ${c.operator}`);
+}
+
+export function filterMask(t: Table, step: FilterStep): boolean[] {
+  const masks = step.conditions.map((c) => mask(t, c));
+  return Array.from({ length: t.nrows }, (_, i) =>
+    step.match === "all" ? masks.every((m) => m[i]) : masks.some((m) => m[i]));
+}
+
+const where = (flags: boolean[]): number[] => flags.flatMap((f, i) => (f ? [i] : []));
+
+// ---------- sorting ----------
+
+type SortKey = number | string | null;
+
+function sortKeys(c: Column): SortKey[] {
+  if (c.kind === "date") return timesOf(c);
+  if (c.kind === "number") return c.values.map((v) => (typeof v === "number" && !Number.isNaN(v) ? v : null));
+  const rank = c.order ? new Map(c.order.map((v, i) => [v, i])) : null;
+  return c.values.map((v) => (v === null ? null : rank ? (rank.get(String(v)) ?? c.order!.length) : String(v)));
+}
+
+function compareKeys(a: SortKey, b: SortKey): number {
+  return typeof a === "number" && typeof b === "number" ? a - b : cmpText(String(a), String(b));
+}
+
+function sortRows(t: Table, cols: string[], ascending: boolean): number[] {
+  const keys = cols.map((n) => sortKeys(col(t, n)));
+  const idx = Array.from({ length: t.nrows }, (_, i) => i);
+  return idx.sort((i, j) => {
+    for (const k of keys) {
+      const a = k[i], b = k[j];
+      if (a === null || b === null) {
+        if (a === b) continue;
+        return a === null ? 1 : -1; // blanks always last
+      }
+      const d = compareKeys(a, b);
+      if (d !== 0) return ascending ? d : -d;
+    }
+    return 0;
+  });
+}
+
+// ---------- dates ----------
+
+function isoWeek(ms: number): { year: number; week: number } {
+  const d = new Date(ms);
+  d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7) + 3); // the Thursday of this week decides the year
+  const year = d.getUTCFullYear();
+  const thursday = d.getTime();
+  const jan1 = new Date(Date.UTC(year, 0, 1));
+  const firstThursday = Date.UTC(year, 0, 1 + ((4 - jan1.getUTCDay() + 7) % 7));
+  return { year, week: 1 + Math.round((thursday - firstThursday) / (7 * DAY_MS)) };
+}
+
+export function datePartValues(c: Column, part: DatePart): Cell[] {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return timesOf(c).map((ms) => {
+    if (ms === null) return null;
+    const d = new Date(ms);
+    const y = d.getUTCFullYear(), m = d.getUTCMonth() + 1;
+    switch (part) {
+      case "year": return y;
+      case "quarter": return `${y}-Q${Math.ceil(m / 3)}`;
+      case "month": return `${y}-${pad(m)}`;
+      case "week": { const w = isoWeek(ms); return `${w.year}-W${pad(w.week)}`; }
+      case "weekday": return WEEKDAYS[(d.getUTCDay() + 6) % 7];
+      case "day": return isoDay(ms);
+    }
+  });
+}
+
+export function addDatePart(t: Table, step: DatePartStep): Table {
+  const source = col(t, step.column);
+  const made = makeColumn(step.name, datePartValues(source, step.part));
+  if (step.part === "weekday") made.order = WEEKDAYS;
+  const columns = t.columns.filter((c) => c.name !== step.name).concat(made);
+  return { columns, nrows: t.nrows };
+}
+
+// ---------- the steps ----------
+
+function dedupe(t: Table, cols: string[] | null, keep: "first" | "last"): Table {
+  const use = cols?.length ? cols.map((n) => col(t, n)) : t.columns;
+  const keyOf = (i: number) => JSON.stringify(use.map((c) => c.values[i]));
+  const seen = new Map<string, number>();
+  for (let i = 0; i < t.nrows; i++) {
+    const k = keyOf(i);
+    if (keep === "last" || !seen.has(k)) seen.set(k, i);
+  }
+  return pick(t, [...seen.values()].sort((a, b) => a - b));
+}
+
+const keyLabel = (c: Column, v: Cell, i: number): string => {
+  if (v === null || (typeof v === "string" && v.trim() === "")) return "(blank)";
+  if (c.kind === "date" && c.time?.[i] != null) return isoDay(c.time[i]!);
+  return typeof v === "number" ? String(v) : String(v);
+};
+
+function sheetName(parent: string, key: string, totalParents: number): string {
+  let name = totalParents === 1 ? key : `${parent}-${key}`;
+  name = name.replace(/[[\]:*?/\\]/g, "_").replace(/^'+|'+$/g, "");
+  return name.slice(0, 31) || "blank";
+}
+
+function splitBy(t: Table, name: string): [string, Table][] {
+  const c = col(t, name);
+  const keys = sortKeys(c);
+  const groups = new Map<string, number[]>();
+  const sortOf = new Map<string, SortKey>();
+  for (let i = 0; i < t.nrows; i++) {
+    const label = keyLabel(c, c.values[i], i);
+    if (!groups.has(label)) { groups.set(label, []); sortOf.set(label, keys[i]); }
+    groups.get(label)!.push(i);
+  }
+  const labels = [...groups.keys()].sort((a, b) => {
+    const ka = sortOf.get(a)!, kb = sortOf.get(b)!;
+    if (ka === null || kb === null) return ka === kb ? 0 : ka === null ? 1 : -1;
+    return compareKeys(ka, kb);
+  });
+  return labels.map((l) => [l, pick(t, groups.get(l)!)]);
+}
+
+function unsupported(step: Step): never {
+  throw new PlanError(`The '${step.op}' step isn't available in this version of the add-in yet.`);
+}
+
+function applyStep(t: Table, step: Step): Table | [string, Table][] {
+  switch (step.op) {
+    case "filter": return pick(t, where(filterMask(t, step)));
+    case "select_columns":
+      need(t, step.columns);
+      return { nrows: t.nrows, columns: step.columns.map((n) => getColumn(t, n)!) };
+    case "drop_columns":
+      need(t, step.columns);
+      return { nrows: t.nrows, columns: t.columns.filter((c) => !step.columns.includes(c.name)) };
+    case "sort": need(t, step.columns); return pick(t, sortRows(t, step.columns, step.ascending));
+    case "dedupe": need(t, step.columns ?? []); return dedupe(t, step.columns, step.keep);
+    case "split_by": return splitBy(t, step.column);
+    case "date_part": return addDatePart(t, step);
+    default: return unsupported(step);
+  }
+}
+
+/** Run every step on every sheet. Splitting creates several sheets, later steps apply to each. */
+export function applyPlan(sheets: Sheets, plan: Plan): Sheets {
+  let current = sheets;
+  for (const step of plan.steps) {
+    const next: Sheets = new Map();
+    const used = new Set<string>();
+    for (const [name, table] of current) {
+      const out = applyStep(table, step);
+      if (Array.isArray(out)) {
+        for (const [key, part] of out) {
+          let n = sheetName(name, key, current.size), base = n, i = 2;
+          while (used.has(n.toLowerCase())) {
+            const suffix = ` (${i++})`;
+            n = base.slice(0, 31 - suffix.length) + suffix;
+          }
+          used.add(n.toLowerCase());
+          next.set(n, part);
+        }
+      } else {
+        used.add(name.toLowerCase());
+        next.set(name, out);
+      }
+    }
+    current = next;
+  }
+  return current;
+}
+
+export function rowCounts(sheets: Sheets): Record<string, number> {
+  return Object.fromEntries([...sheets].map(([n, t]) => [n, t.nrows]));
+}
