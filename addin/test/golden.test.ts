@@ -70,7 +70,7 @@ for (const [suiteName, suite] of Object.entries(golden.suites)) describe(`matche
         }
         if (expected.cells) {
           // Summaries are compared cell by cell (numbers to 6 decimals; Python NaN is a blank here).
-          const norm = (v: unknown) => (typeof v === "number" ? Math.round(v * 1e6) / 1e6 : v ?? null);
+          const norm = (v: unknown) => (typeof v === "number" ? Math.round(v * 1e6) / 1e6 : v === "" ? null : v ?? null);
           // Real Excel dates (serial numbers) compare as ISO days; text dates stay as written.
           const shown = (x: (typeof t.columns)[number], i: number) =>
             x.kind === "date" && typeof x.values[i] === "number" && x.time?.[i] != null ? isoDay(x.time[i]!) : x.values[i];

@@ -1,6 +1,7 @@
 /** Runs a Plan on tables. Pure functions: the only code that touches the data. */
 import type { ComputeStep, Condition, DatePart, DatePartStep, FilterStep, LabelStep, Plan, Step } from "./plan";
 import { calculate, groupBy, pivot, topN } from "./aggregate";
+import { cleanText, convertColumns, dropBlankRows, fillBlanks, mergeColumns, renameColumns, replaceText, splitColumn } from "./clean";
 import { evaluate } from "./evaluate";
 import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
 import { Cell, Column, Sheets, Table, getColumn, makeColumn, pick, timesOf } from "./table";
@@ -199,6 +200,14 @@ function applyStep(t: Table, step: Step): Table | [string, Table][] {
     case "pivot": return pivot(t, step);
     case "top_n": return topN(t, step);
     case "calculate": return calculate(t, step);
+    case "clean_text": return cleanText(t, step);
+    case "fill_blanks": return fillBlanks(t, step);
+    case "drop_blank_rows": return dropBlankRows(t, step);
+    case "replace": return replaceText(t, step);
+    case "split_column": return splitColumn(t, step);
+    case "merge_columns": return mergeColumns(t, step);
+    case "rename": return renameColumns(t, step);
+    case "convert": return convertColumns(t, step);
     case "compute": return compute(t, step);
     case "label": return label(t, step);
     default: return unsupported(step);

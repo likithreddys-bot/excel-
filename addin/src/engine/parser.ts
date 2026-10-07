@@ -52,8 +52,8 @@ const TRIM = new RegExp(
   String.raw`(?:(?:extra|leading|trailing|double|unnecessary|additional)\s+(?:and\s+)?)*(?:white\s*)?spaces?\b`, "i");
 const CONVERT = new RegExp(
   String.raw`^\s*(?:please\s+)?(?:convert|change|make|set|treat|format|turn|cast)\s+(?:the\s+)?(?:columns?\s+)?` +
-  String.raw`(.+?)\s+(?:(?:to|as|into)\s+)?(?:an?\s+)?(?:proper\s+|real\s+)?` +
-  String.raw`(numbers?|numeric|integers?|decimals?|dates?|text|strings?)(?:\s+(?:format|type|values?))?\s*$`, "i");
+  String.raw`(?<cols>.+?)\s+(?:(?:to|as|into)\s+)?(?:an?\s+)?(?:proper\s+|real\s+)?` +
+  String.raw`(?<to>numbers?|numeric|integers?|decimals?|dates?|text|strings?)(?:\s+(?:format|type|values?))?\s*$`, "i");
 const NUMBER_FORMAT = new RegExp(
   String.raw`^\s*(?:please\s+)?(?:format|show|display|make|set|put)\s+(?:the\s+)?(.+?)\s+(?:as|in|with|to|using)\s+(?:an?\s+)?` +
   String.raw`(rupees?|inr|₹|indian\s+(?:rupees?|format|currency)|currency|money|commas?|comma\s+separators?` +
@@ -69,6 +69,12 @@ const DATEDIFF = new RegExp(
   String.raw`(?:(?:since|from|after)\s+(?<a>.+?)(?:\s+(?:to|until|till)\s+(?<b>.+?))?` +
   String.raw`|between\s+(?<a2>.+?)\s+and\s+(?<b2>.+?)|(?:until|till|to|before)\s+(?<b3>.+?))\s*$` +
   String.raw`|^age\s+(?:from|of|using|based\s+on)\s+(?<dob>.+?)\s*$`, "i");
+
+const DELIMITERS: Record<string, string> = {
+  comma: ",", commas: ",", space: " ", spaces: " ", dash: "-", hyphen: "-", slash: "/", "forward slash": "/",
+  backslash: "\\", pipe: "|", underscore: "_", colon: ":", semicolon: ";", dot: ".", period: ".", "full stop": ".",
+  tab: "\t", nothing: "", "no space": "",
+};
 
 const WHAT_IT_CAN_DO = "Right now the add-in can filter rows, sort, split into sheets, remove duplicates and choose columns.";
 
@@ -339,7 +345,8 @@ export class Parser {
     if (/\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b/.test(low)) return [this.parseDedupe(cl)];
     const formula = this.formulaCommand(cl);
     if (formula !== null) return formula;
-    this.cleaningCommand(cl);
+    const cleaning = this.cleaningCommand(cl);
+    if (cleaning !== null) return cleaning;
     if (/\b(?:split|segregate|separate|seperate|segment|divide|partition)\b|\bbreak\b.*\b(?:up|down|into)\b|\b(?:sheets?|tabs?|files?)\s+(?:per|for\s+each|by)\b/.test(low)) {
       return this.parseSplit(cl);
     }
@@ -509,24 +516,151 @@ export class Parser {
     return `[${c}]`;
   }
 
-  /** Cleaning commands aren't available yet; recognise them so they aren't mistaken for filters. */
-  private cleaningCommand(cl: string): void {
+  /** Cleaning commands, or null if `cl` isn't one. */
+  private cleaningCommand(cl: string): Step[] | null {
     const low = cl.toLowerCase();
-    if (/^\s*(?:please\s+)?rename\b/.test(low)) soon("Renaming columns");
+    if (/^\s*(?:please\s+)?rename\b/.test(low)) return [this.parseRename(cl)];
     if (/^\s*(?:please\s+)?(?:replace|substitute)\b/.test(low)
-      || /^\s*(?:please\s+)?(?:remove|delete|strip|erase|get\s+rid\s+of|take\s+out)\s+(?:the\s+)?(?:text\s+)?["']/.test(cl)) soon("Find and replace");
-    const split = /^\s*(?:please\s+)?(?:split|separate|break)\s+(?:up\s+)?(?:the\s+)?(?:column\s+)?(.+?)\s+((?:into|by|on|at|using|with)\b.*)$/i.exec(cl);
-    if (split && !/^(?:by|per|on|for|according|based|into|each)\b/i.test(split[1])
-      && !/\b(?:sheets?|tabs?|files?|workbooks?)\b/i.test(split[2]) && this.column(split[1]) !== null) soon("Splitting text into columns");
-    if (/^\s*(?:please\s+)?(?:merge|combine|concatenate|concat|join)\b/.test(low)) soon("Merging columns");
+      || /^\s*(?:please\s+)?(?:remove|delete|strip|erase|get\s+rid\s+of|take\s+out)\s+(?:the\s+)?(?:text\s+)?["']/.test(cl)) return [this.parseReplace(cl)];
+    const split = this.parseTextSplit(cl);
+    if (split) return [split];
+    if (/^\s*(?:please\s+)?(?:merge|combine|concatenate|concat|join)\b/.test(low)) return [this.parseMerge(cl)];
     if (/^\s*(?:please\s+)?(?:remove|delete|drop|exclude)\b/.test(low)) {
-      if (/\b(?:blank|empty)\s+(?:rows|lines)\b/.test(low)
-        || /\brows?\s+(?:with|having|that\s+have|containing)\s+(?:any\s+)?(?:blank|empty|missing)(?:\s+(?:values?|cells?|fields?|data))?\s*$/.test(low)) soon("Removing blank rows");
+      if (/\b(?:blank|empty)\s+(?:rows|lines)\b/.test(low)) return [{ op: "drop_blank_rows", how: "all" }];
+      if (/\brows?\s+(?:with|having|that\s+have|containing)\s+(?:any\s+)?(?:blank|empty|missing)(?:\s+(?:values?|cells?|fields?|data))?\s*$/.test(low)) {
+        return [{ op: "drop_blank_rows", how: "any" }];
+      }
     }
-    if (CASE.test(low)) soon("Changing text case");
-    if (TRIM.test(low)) soon("Trimming spaces");
-    if (/^\s*(?:please\s+)?fill\b/.test(low)) soon("Filling blanks");
-    if (CONVERT.test(cl)) soon("Converting column types");
+    const kase = CASE.exec(low);
+    if (kase) {
+      const word = kase[0];
+      const action = /upper|caps/.test(word) ? "upper" : word.includes("lower") ? "lower" : "title";
+      return [{ op: "clean_text", columns: this.textTargets(cl.replace(new RegExp(CASE.source, "gi"), " ")), action }];
+    }
+    if (TRIM.test(low)) return [{ op: "clean_text", columns: this.textTargets(cl.replace(new RegExp(TRIM.source, "gi"), " ")), action: "trim" }];
+    if (/^\s*(?:please\s+)?fill\b/.test(low)) return [this.parseFill(cl)];
+    const cv = CONVERT.exec(cl);
+    if (cv) {
+      const target = cv.groups!.to.toLowerCase();
+      const to = target.startsWith("date") ? "date" : target.startsWith("text") || target.startsWith("string") ? "text" : "number";
+      return [{ op: "convert", columns: this.columnList(cv.groups!.cols, "convert"), to }];
+    }
+    return null;
+  }
+
+  /** Columns named in a trim/case command; null means every text column. */
+  private textTargets(text: string): string[] | null {
+    const cols = unique(this.findColumns(text).map((m) => m.column));
+    const numeric = cols.filter((c) => this.numericCols.includes(c));
+    if (numeric.length) throw new ParseError(`${numeric.join(", ")} holds numbers, not text.`);
+    return cols.length ? cols : null;
+  }
+
+  private parseRename(cl: string): Step {
+    const body = cl.replace(/^\s*(?:please\s+)?rename\s+(?:the\s+)?(?:columns?\s+)?/i, "");
+    const item = String.raw`(?:"[^"]*"|'[^']*'|.+?)`;
+    const re = new RegExp(String.raw`(?:^|\s*(?:,|\band\b)\s*)(?<old>${item})\s+(?:to|as|into|->)\s+(?<new>${item})(?=\s*(?:,|\band\b)\s*${item}\s+(?:to|as|into|->)\s+|\s*$)`, "gi");
+    const mapping: Record<string, string> = {};
+    for (const p of body.matchAll(re)) {
+      const old = this.column(unquote(p.groups!.old));
+      if (old === null) throw new ParseError(`I couldn't find a column called '${unquote(p.groups!.old)}'. Columns: ` + this.columns.join(", "));
+      mapping[old] = unquote(p.groups!.new);
+    }
+    if (!Object.keys(mapping).length) throw new ParseError("Try: rename amt to amount");
+    return { op: "rename", mapping };
+  }
+
+  private parseReplace(cl: string): Step {
+    const q = String.raw`"[^"]*"|'[^']*'`;
+    const colsPart = String.raw`(?:the\s+)?(?:columns?\s+)?(?<cols>.+?)`;
+    const m = new RegExp(String.raw`^\s*(?:please\s+)?(?:replace|substitute)\s+(?:all\s+)?(?<find>${q}|.+?)\s+(?:in|within)\s+${colsPart}\s+(?:with|by|->)\s+(?<rep>${q}|.+?)\s*$`, "i").exec(cl)
+      ?? new RegExp(String.raw`^\s*(?:please\s+)?(?:replace|substitute)\s+(?:all\s+)?(?<find>${q}|.+?)\s+(?:with|by|->|to)\s+(?<rep>${q}|.+?)(?:\s+(?:in|on|for|within)\s+${colsPart})?\s*$`, "i").exec(cl)
+      ?? new RegExp(String.raw`^\s*(?:please\s+)?(?:remove|delete|strip|erase|get\s+rid\s+of|take\s+out)\s+(?:the\s+)?(?:text\s+)?(?<find>${q})(?:\s+(?:from|in)\s+${colsPart})?\s*$`, "i").exec(cl);
+    if (!m) throw new ParseError('Try: replace "UPI/" with "" in description');
+    const find = unquote(m.groups!.find);
+    let rep = unquote(m.groups!.rep ?? "");
+    if (BLANK_WORDS.has(rep.toLowerCase())) rep = "";
+    const colsText = m.groups!.cols;
+    const cols = !colsText || /^\s*(?:all(?:\s+columns)?|everywhere|every\s*where|all\s+text)\s*$/i.test(colsText) ? null : this.columnList(colsText, "replace in");
+    if (BLANK_WORDS.has(find.toLowerCase())) { // "replace blanks with Unknown" means fill the empty cells
+      return { op: "fill_blanks", columns: cols, method: "value", value: rep };
+    }
+    if (!find) throw new ParseError("What text should I replace?");
+    return { op: "replace", columns: cols, find, replace: rep };
+  }
+
+  private parseFill(cl: string): Step {
+    const low = cl.toLowerCase();
+    const method = /\bdown(?:wards?)?\b|\bforward\b|\babove\b|\bprevious\b/.test(low) ? "down"
+      : /\bup(?:wards?)?\b|\bbackwards?\b|\bbelow\b|\bnext\b/.test(low) ? "up" : "value";
+    let value: string | null = null;
+    const vm = /\b(?:with|as|using|to)\s+(?<v>"[^"]*"|'[^']*'|.+?)(?=\s+(?:in|for|on)\s+|\s*$)/i.exec(cl);
+    if (method === "value") {
+      if (!vm) throw new ParseError("Fill the blanks with what? e.g. fill blank branch with Unknown, or fill down branch");
+      value = unquote(vm.groups!.v);
+      cl = cl.slice(0, vm.index) + " " + cl.slice(vm.index + vm[0].length);
+    }
+    const cols = unique(this.findColumns(cl).map((m) => m.column));
+    return { op: "fill_blanks", columns: cols.length ? cols : null, method, value };
+  }
+
+  private parseTextSplit(cl: string): Step | null {
+    const m = /^\s*(?:please\s+)?(?:split|separate|break)\s+(?:up\s+)?(?:the\s+)?(?:column\s+)?(?<col>.+?)\s+(?<rest>(?:into|by|on|at|using|with)\b.*)$/i.exec(cl);
+    if (!m || /^(?:by|per|on|for|according|based|into|each)\b/i.test(m.groups!.col)
+      || /\b(?:sheets?|tabs?|files?|workbooks?)\b/i.test(m.groups!.rest)) return null; // "split by category": one sheet per value
+    const c = this.column(m.groups!.col);
+    if (c === null) return null;
+    let rest = m.groups!.rest;
+    const dm = /\b(?:by|on|at|using|with)\s+(?:an?\s+|the\s+)?(?<d>"[^"]*"|'[^']*'|forward\s+slash|full\s+stop|\S+)/i.exec(rest);
+    let delimiter = " ";
+    if (dm) {
+      const d = unquote(dm.groups!.d);
+      delimiter = DELIMITERS[d.toLowerCase()] ?? d;
+      rest = rest.slice(0, dm.index) + " " + rest.slice(dm.index + dm[0].length);
+    }
+    let names: string[] = [];
+    const nm = /\binto\s+(?<n>.+?)\s*$/i.exec(rest);
+    let count: number | null = null;
+    if (nm) {
+      const cm = /^(\d+|two|three|four|five|six)\s+(?:new\s+)?(?:columns?|parts?|pieces?|fields?)$/i.exec(nm.groups!.n.trim());
+      if (cm) count = NUMBER_WORDS[cm[1].toLowerCase()] ?? parseInt(cm[1], 10);
+      else {
+        names = nm.groups!.n.split(/,|\band\b|&/i).filter((n) => n.trim()).map(unquote);
+        if (names.length < 2) throw new ParseError("Split into which new columns? e.g. split name into first and last");
+      }
+    }
+    if (!names.length) {
+      if (count === null) {
+        let most = 0;
+        for (const v of this.col(c).values) {
+          if (v === null) continue;
+          most = Math.max(most, delimiter ? String(v).split(delimiter).length - 1 : 0);
+        }
+        count = Math.max(2, Math.min(most + 1, 10));
+      }
+      names = Array.from({ length: count }, (_, i) => `${c} ${i + 1}`);
+    }
+    return { op: "split_column", column: c, delimiter, names };
+  }
+
+  private parseMerge(cl: string): Step {
+    let body = cl.replace(/^\s*(?:please\s+)?(?:merge|combine|concatenate|concat|join)\s+(?:the\s+)?(?:columns?\s+)?/i, "");
+    let separator = " ";
+    const sm = /\s+(?:with|using|separated\s+by|by)\s+(?:an?\s+|the\s+)?(?<s>"[^"]*"|'[^']*'|no\s+space|forward\s+slash|\S+)(?:\s+(?:separator|in\s+between|between))?/i.exec(body);
+    if (sm && (`"'`.includes(sm.groups!.s[0]) || sm.groups!.s.toLowerCase() in DELIMITERS)) {
+      const sep = unquote(sm.groups!.s);
+      separator = DELIMITERS[sep.toLowerCase()] ?? sep;
+      body = body.slice(0, sm.index) + " " + body.slice(sm.index + sm[0].length);
+    }
+    let name: string | null = null;
+    const nm = /\s+(?:into|as|to)\s+(?:an?\s+)?(?:new\s+)?(?:column\s+)?(?:called\s+|named\s+)?(?<n>.+?)\s*$/i.exec(body);
+    if (nm) {
+      name = unquote(nm.groups!.n);
+      body = body.slice(0, nm.index);
+    }
+    const cols = this.columnList(body, "merge");
+    if (cols.length < 2) throw new ParseError("Merge which columns? e.g. merge first and last into full name");
+    return { op: "merge_columns", columns: cols, separator, name: name || cols.join(" ") };
   }
 
   // ---------- totals, pivots, top N, running totals ----------

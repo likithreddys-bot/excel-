@@ -42,7 +42,8 @@ def make_bank_df(n=2000, seed=0) -> pd.DataFrame:
     return df
 
 SUPPORTED = {"filter", "select_columns", "drop_columns", "sort", "dedupe", "split_by", "date_part",
-             "group_by", "pivot", "top_n", "calculate", "compute", "label"}
+             "group_by", "pivot", "top_n", "calculate", "compute", "label",
+             "clean_text", "fill_blanks", "drop_blank_rows", "replace", "split_column", "merge_columns", "rename", "convert"}
 
 COMMANDS = [
     # filters
@@ -149,6 +150,43 @@ def make_ledger_df() -> pd.DataFrame:
     })
 
 
+def make_messy_df() -> pd.DataFrame:
+    """Same file as tests/test_cleaning.py: stray spaces, odd case, blanks, rupee text, mixed date formats."""
+    return pd.DataFrame({
+        "name": ["  Asha  Rao ", "vikram SINGH", None, "  ", "Meera iyer", "Ravi Kumar Das"],
+        "city": ["pune", "MUMBAI ", "Pune", None, None, "delhi"],
+        "state": ["MH", "MH", "MH", None, "KA", "DL"],
+        "email": ["asha@x.com", "vik@y.in", None, None, "meera@z.org", "ravi@x.com"],
+        "description": ["UPI/SWIGGY", "UPI/ZOMATO", "N/A", None, "ATM WDL", "NEFT RENT"],
+        "amt": ["₹1,200", "Rs. 90", "3,400.50", None, "", "INR 5,00,000"],
+        "txn date": ["01/03/2025", "2025-04-02", "15/01/2024", None, "28/02/2025", "31/12/2025"],
+        "score": [10.0, 0.0, 5.0, None, 0.0, 7.0],
+    })
+
+
+CLEAN_COMMANDS = [
+    "trim spaces", "trim name", "remove extra spaces from name", "trim the name column",
+    "make city title case", "capitalize city", "convert city to uppercase", "lowercase city", "city in proper case",
+    "make score uppercase",
+    "fill blank city with Unknown", "fill empty values in city with 'Not Known'", "fill down city",
+    "fill blanks with 0", "replace blanks in state with NA", "fill up city", "fill blank score with 0",
+    "remove blank rows", "remove rows with any blank values", "remove rows where city is empty",
+    'replace "UPI/" with "" in description', 'remove "UPI/" from description', "replace 'UPI/' with nothing in description",
+    "replace pune with Pune in city", "replace N/A with blank", "replace 0 with blank in score",
+    "replace mh in state with Maharashtra", 'replace "Rs. " with "INR, " in amt', "replace score with 9",
+    "get rid of 'UPI/' in description",
+    "split name into first and last", "split email on @ into user and domain", "split description by slash",
+    "split name into 3 columns", "split by state",
+    'combine city and state with ", " into location', "merge city and state into place", "merge city and state",
+    "rename amt to amount", "rename city to City Name and amt to Amount", "rename nothing to x",
+    "convert amt to number", "change txn date to date", "make score text", "convert city to number",
+    "convert description to date", "make state text",
+    "trim spaces, make city title case and fill blank city with Unknown",
+    "trim name, split name into first and last",
+    "remove duplicates by email", "remove rows where description contains ATM", "drop the score column", "sort by city",
+]
+
+
 def clean(o):
     """Drop None values so Python's plan and the TypeScript plan compare equal."""
     if isinstance(o, dict):
@@ -159,6 +197,8 @@ def clean(o):
 
 
 def cell(v):
+    if v is pd.NaT:
+        return None
     if isinstance(v, pd.Timestamp):
         return None if pd.isna(v) else v.date().isoformat()
     if v is None or (isinstance(v, float) and math.isnan(v)) or v is pd.NA:
@@ -212,7 +252,8 @@ def build(df, commands):
 
 
 def main():
-    suites = {"bank": build(make_bank_df(), COMMANDS), "ledger": build(make_ledger_df(), LEDGER_COMMANDS)}
+    suites = {"bank": build(make_bank_df(), COMMANDS), "ledger": build(make_ledger_df(), LEDGER_COMMANDS),
+              "messy": build(make_messy_df(), CLEAN_COMMANDS)}
     os.makedirs(os.path.join(HERE, "..", "test", "golden"), exist_ok=True)
     with open(os.path.join(HERE, "..", "test", "golden", "cases.json"), "w") as f:
         json.dump({"suites": suites}, f)
