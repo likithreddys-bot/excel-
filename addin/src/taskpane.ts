@@ -10,6 +10,7 @@ import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
 import { ExcelHost } from "./excel/io";
 import { Host, HostError, SourceRef } from "./host";
+import { Field, TEMPLATES, Template, Values, build, columnChoices, visibleFields } from "./builder";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const num = (n: number) => n.toLocaleString("en-IN");
@@ -27,6 +28,8 @@ const state = {
   label: "",
   /** The "which column?" question waiting for an answer. */
   asked: null as string | null,
+  /** The table last read, for the menu builder's column lists. */
+  table: null as Table | null,
   pending: null as Pending | null,
   busy: false,
 };
@@ -142,6 +145,7 @@ async function readSource(ref?: SourceRef): Promise<Table> {
   const src = await state.host!.readSource(ref);
   state.ref = src.ref;
   state.label = src.label;
+  state.table = src.table;
   showSource(src.label, src.table);
   return src.table;
 }
@@ -191,7 +195,15 @@ async function preview(text: string): Promise<void> {
   if (plan.clarification_question) {
     state.pending = null;
     state.asked = plan.awaits_columns ? (reply ? state.asked : text) : null;
-    post("bot", problems.length ? problems.join("\n") : plan.clarification_question);
+    const card = post("bot", problems.length ? problems.join("\n") : plan.clarification_question);
+    if (!plan.awaits_columns) {
+      const actions = el("div", "actions");
+      const b = el("button", "", "Build it with menus instead");
+      b.type = "button";
+      b.addEventListener("click", () => void guarded(() => openBuilder()));
+      actions.append(b);
+      card.append(actions);
+    }
     return;
   }
   state.asked = null;
@@ -326,6 +338,72 @@ async function guarded(fn: () => Promise<void>): Promise<void> {
   }
 }
 
+
+// ---------- the menu builder ----------
+
+async function openBuilder(): Promise<void> {
+  const table = state.table ?? (await readSource(state.ref));
+  const sheets = (await state.host!.listSheets()).filter((n) => n !== state.ref?.sheet);
+  const card = post("bot", "Build it with menus. Choose what you want to do:");
+  const picker = el("select");
+  picker.setAttribute("aria-label", "What do you want to do?");
+  for (const t of TEMPLATES) picker.append(new Option(t.title, t.id));
+  const hint = el("div", "muted");
+  const form = el("div", "builder");
+  const values: Values = {};
+  const actions = el("div", "actions");
+  const go = el("button", "primary", "Preview");
+  const cancel = el("button", "", "Close");
+  go.type = cancel.type = "button";
+  actions.append(go, cancel);
+  card.append(picker, hint, form, actions);
+
+  const current = (): Template => TEMPLATES.find((t) => t.id === picker.value)!;
+
+  const control = (f: Field): HTMLElement => {
+    const id = `b-${f.id}`;
+    const wrap = el("div", "field");
+    const label = el("label", "", f.label);
+    label.htmlFor = id;
+    let input: HTMLElement;
+    const set = (v: string | string[]) => { values[f.id] = v; };
+    if (f.type === "text") {
+      const i = el("input"); i.type = "text"; i.placeholder = f.placeholder ?? ""; i.value = String(values[f.id] ?? "");
+      i.addEventListener("input", () => { set(i.value); });
+      i.addEventListener("change", render);
+      input = i;
+    } else {
+      const sel = el("select");
+      if (f.type === "columns") { sel.multiple = true; sel.size = Math.min(5, Math.max(3, table.columns.length)); }
+      const options = f.type === "choice" ? f.choices ?? [] : f.type === "sheet" ? sheets : columnChoices(table, f).length ? columnChoices(table, f) : table.columns.map((c) => c.name);
+      if (f.type !== "columns" && (f.optional || f.type !== "choice")) sel.append(new Option(f.optional ? "(none)" : "Choose…", ""));
+      for (const o of options) sel.append(new Option(o, o));
+      const have = values[f.id];
+      for (const o of Array.from(sel.options)) o.selected = Array.isArray(have) ? have.includes(o.value) : o.value === have;
+      if (f.type === "choice" && !f.optional && !have && options.length) { sel.value = options[0]; set(options[0]); }
+      sel.addEventListener("change", () => { set(f.type === "columns" ? Array.from(sel.selectedOptions).map((o) => o.value) : sel.value); render(); });
+      input = sel;
+    }
+    input.id = id;
+    wrap.append(label, input);
+    return wrap;
+  };
+
+  function render(): void {
+    const t = current();
+    hint.textContent = t.hint;
+    form.replaceChildren(...visibleFields(t, values).map(control));
+  }
+  picker.addEventListener("change", () => { for (const k of Object.keys(values)) delete values[k]; render(); });
+  cancel.addEventListener("click", () => card.remove());
+  go.addEventListener("click", () => {
+    const made = build(current(), values);
+    if ("missing" in made) { post("err", `Please fill in: ${made.missing}`); return; }
+    void guarded(() => preview(made.sentence));
+  });
+  render();
+}
+
 // ---------- start up ----------
 
 function wire(): void {
@@ -344,6 +422,7 @@ function wire(): void {
     const k = ev as KeyboardEvent;
     if (k.key === "Enter" && !k.shiftKey) { k.preventDefault(); $<HTMLFormElement>("ask").requestSubmit(); }
   });
+  $("open-builder").addEventListener("click", () => { if (!state.busy && state.host) void guarded(() => openBuilder()); });
   $("use-selection").addEventListener("click", () => void guarded(async () => {
     state.ref = undefined;
     state.asked = null;
