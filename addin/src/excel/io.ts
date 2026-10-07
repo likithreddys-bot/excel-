@@ -17,19 +17,22 @@ function headerNames(raw: unknown[]): string[] {
   });
 }
 
-async function locate(ctx: Excel.RequestContext, ref?: SourceRef): Promise<Excel.Range> {
-  if (ref) return ctx.workbook.worksheets.getItem(ref.sheet).getRange(ref.address);
+async function locate(ctx: Excel.RequestContext, ref?: SourceRef): Promise<{ range: Excel.Range; region: boolean }> {
+  if (ref) {
+    const range = ctx.workbook.worksheets.getItem(ref.sheet).getRange(ref.address);
+    return { range: ref.region ? range.getCell(0, 0).getSurroundingRegion() : range, region: !!ref.region };
+  }
   const sel = ctx.workbook.getSelectedRange();
   sel.load("rowCount,columnCount");
   await ctx.sync();
   if (sel.rowCount === 1 && sel.columnCount === 1) {
-    return sel.getSurroundingRegion(); // one cell inside a table: take the whole table around it
+    return { range: sel.getSurroundingRegion(), region: true }; // one cell inside a table: take the whole table around it
   }
   const used = sel.getUsedRangeOrNullObject(true); // a bigger selection (even a whole column): just the part with data
   used.load("isNullObject");
   await ctx.sync();
   if (used.isNullObject) throw new HostError("I can't see any data there. Click a cell inside your table first.");
-  return used;
+  return { range: used, region: false };
 }
 
 export class ExcelHost implements Host {
@@ -37,7 +40,7 @@ export class ExcelHost implements Host {
 
   async readSource(ref?: SourceRef): Promise<Source> {
     return Excel.run(async (ctx) => {
-      const range = await locate(ctx, ref);
+      const { range, region } = await locate(ctx, ref);
       range.load("address,rowCount,columnCount");
       range.worksheet.load("name");
       await ctx.sync();
@@ -63,7 +66,7 @@ export class ExcelHost implements Host {
       }
       const sheet = range.worksheet.name;
       const address = range.address.split("!").pop()!;
-      return { ref: { sheet, address }, label: `${sheet}!${address}`, table: makeTable(names, rows, formats) };
+      return { ref: { sheet, address, region }, label: `${sheet}!${address}`, table: makeTable(names, rows, formats) };
     }).catch(rethrow);
   }
 

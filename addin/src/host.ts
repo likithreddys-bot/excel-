@@ -4,6 +4,8 @@ import type { Sheets, Table } from "./engine/table";
 export interface SourceRef {
   sheet: string;
   address: string;
+  /** Found by clicking inside a table: re-read it from its top-left cell so rows added later are included. */
+  region?: boolean;
 }
 
 export interface Source {

@@ -11,11 +11,13 @@ import { Host, HostError, SourceRef } from "./host";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const num = (n: number) => n.toLocaleString("en-IN");
 
-interface Pending { text: string; plan: Plan; result: Sheets; before: number }
+interface Pending { text: string; plan: Plan; result: Sheets; before: number; using: string }
 
 const state = {
   host: null as Host | null,
   ref: undefined as SourceRef | undefined,
+  /** What the last read looked like, e.g. "Sheet1!A1:D7", so each preview can say what it worked on. */
+  label: "",
   /** The "which column?" question waiting for an answer. */
   asked: null as string | null,
   pending: null as Pending | null,
@@ -101,6 +103,7 @@ function showExamples(t: Table): void {
 async function readSource(ref?: SourceRef): Promise<Table> {
   const src = await state.host!.readSource(ref);
   state.ref = src.ref;
+  state.label = src.label;
   showSource(src.label, src.table);
   return src.table;
 }
@@ -135,12 +138,13 @@ async function preview(text: string): Promise<void> {
     if (e instanceof PlanError) { post("err", `This can't run on your data: ${e.message}`); return; }
     throw e;
   }
-  state.pending = { text, plan, result, before: table.nrows };
+  state.pending = { text, plan, result, before: table.nrows, using: state.label };
   renderPreview(state.pending);
 }
 
 function renderPreview(p: Pending): void {
   const card = post("bot", "Here's what I'll do:");
+  card.append(el("div", "muted", `On: ${p.using}`));
   const list = el("ul", "steps");
   for (const s of p.plan.steps) list.append(el("li", "", describeStep(s)));
   card.append(list);
@@ -184,20 +188,28 @@ async function execute(p: Pending): Promise<void> {
   card.textContent = made.length === 1
     ? `Done. I made the sheet “${made[0].name}” with ${num(made[0].rows)} rows.`
     : `Done. I made ${made.length} sheets: ${made.slice(0, 6).map((m) => `${m.name} (${num(m.rows)})`).join(", ")}${made.length > 6 ? "…" : ""}.`;
-  if (made.length === 1) {
-    state.ref = await state.host!.refOf(made[0].name);
-    card.append(el("div", "muted", "Your next command will carry on from this new sheet. Press “Use my table” to start from a different table."));
-  }
+  card.append(el("div", "muted", `Your table (${p.using}) is unchanged. The next command also works on that table.`));
   const actions = el("div", "actions");
   const undo = el("button", "", "Undo (remove the new sheets)");
   undo.type = "button";
   undo.addEventListener("click", () => guarded(async () => {
     undo.disabled = true;
     await state.host!.removeSheets(made.map((m) => m.name));
-    if (made.length === 1 && state.ref?.sheet === made[0].name) state.ref = undefined;
+    if (state.ref && made.some((m) => m.name === state.ref!.sheet)) state.ref = undefined;
     post("bot", "Undone. The new sheets are removed.");
   }));
   actions.append(undo);
+  if (made.length === 1) {
+    const carry = el("button", "", "Continue from this result");
+    carry.type = "button";
+    carry.addEventListener("click", () => guarded(async () => {
+      carry.disabled = true;
+      state.ref = await state.host!.refOf(made[0].name);
+      await readSource(state.ref);
+      post("bot", `OK. The next commands work on “${made[0].name}”. Press “Use my table” to go back to your own table.`);
+    }));
+    actions.append(carry);
+  }
   card.append(actions);
 }
 
