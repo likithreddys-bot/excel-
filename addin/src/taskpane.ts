@@ -2,6 +2,7 @@ import { describe as describeStep } from "./engine/describe";
 import { applyPlan, PlanError, rowCounts } from "./engine/engine";
 import { FormatStep, chartTable, highlightMask, isFormatStep, liveFormats } from "./engine/format";
 import { Parser, makePlan, replyColumns } from "./engine/parser";
+import { LiveColumn, PivotSpec, liveColumns, livePivot } from "./engine/live";
 import { profile } from "./engine/profile";
 import type { Plan } from "./engine/plan";
 import { Cell, Sheets, Table, combine } from "./engine/table";
@@ -13,7 +14,11 @@ import { Host, HostError, SourceRef } from "./host";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const num = (n: number) => n.toLocaleString("en-IN");
 
-interface Pending { text: string; plan: Plan; result: Sheets; before: number; using: string; notes: string[]; formats: FormatStep[] }
+interface Pending {
+  text: string; plan: Plan; result: Sheets; before: number; using: string; notes: string[]; formats: FormatStep[];
+  /** Set when "keep results live" is on and the plan can be written that way. */
+  pivot: PivotSpec | null; liveCols: LiveColumn[] | null; source: SourceRef;
+}
 
 const state = {
   host: null as Host | null,
@@ -160,6 +165,15 @@ async function sheetsMentioned(text: string, problems: string[]): Promise<Record
   return out;
 }
 
+/** What "keep results live" can do for this plan (nothing at all in the browser demo). */
+function liveOptions(plan: Plan, source: Table, result: Sheets): { pivot: PivotSpec | null; liveCols: LiveColumn[] | null } {
+  if (!isLive() || state.host?.kind !== "excel") return { pivot: null, liveCols: null };
+  const first = result.values().next().value as Table | undefined;
+  return { pivot: livePivot(plan, source), liveCols: result.size === 1 && first ? liveColumns(plan, first) : null };
+}
+
+const isLive = (): boolean => $<HTMLInputElement>("live").checked;
+
 async function preview(text: string): Promise<void> {
   post("user", text);
   const table = await readSource(state.ref);
@@ -191,7 +205,8 @@ async function preview(text: string): Promise<void> {
     if (e instanceof PlanError) { post("err", `This can't run on your data: ${e.message}`); return; }
     throw e;
   }
-  state.pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(notes)], formats: plan.steps.filter(isFormatStep) };
+  state.pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(notes)], formats: plan.steps.filter(isFormatStep),
+    ...liveOptions(plan, table, result), source: state.ref! };
   renderPreview(state.pending);
 }
 
@@ -216,6 +231,8 @@ function renderPreview(p: Pending): void {
   }
   card.append(out);
   for (const note of p.notes) card.append(el("div", "note", note));
+  if (p.pivot) card.append(el("div", "note", "Live: this will be a PivotTable on your data. Right-click it and choose Refresh after your data changes."));
+  else if (p.liveCols) card.append(el("div", "note", `Live: ${p.liveCols.map((c) => `“${c.name}”`).join(", ")} will be formulas that update by themselves.`));
   const first = p.result.get(names[0])!;
   const paint = highlightPainter(first, liveFormats(p.formats, p.result));
   if (first.nrows) card.append(miniTable(first, 5, paint), el("div", "muted", names.length > 1 ? `First rows of “${names[0]}”` : "First rows of the result"));
@@ -252,32 +269,46 @@ function highlightPainter(t: Table, formats: FormatStep[]): ((row: number, col: 
 
 async function execute(p: Pending): Promise<void> {
   if (state.pending !== p) return;
-  const made = await state.host!.writeResult(p.result, p.formats);
+  const extra: string[] = [];
+  let made: { name: string; rows: number }[] | null = null;
+  if (p.pivot) {
+    try {
+      made = [await state.host!.writePivot(p.source, p.pivot)];
+    } catch (e) {
+      extra.push(`I couldn't build a PivotTable here (${e instanceof HostError ? e.message : (e as Error).message}), so I wrote the result as plain values instead.`);
+    }
+  }
+  if (!made) {
+    const outcome = await state.host!.writeResult(p.result, p.formats, p.liveCols);
+    made = outcome.created;
+    extra.push(...outcome.notes);
+  }
   state.pending = null;
   const card = post("bot");
   card.classList.add("ok");
   card.textContent = made.length === 1
-    ? `Done. I made the sheet “${made[0].name}” with ${num(made[0].rows)} rows.`
+    ? made[0].rows < 0 ? `Done. I made the PivotTable on the sheet “${made[0].name}”.` : `Done. I made the sheet “${made[0].name}” with ${num(made[0].rows)} rows.`
     : `Done. I made ${made.length} sheets: ${made.slice(0, 6).map((m) => `${m.name} (${num(m.rows)})`).join(", ")}${made.length > 6 ? "…" : ""}.`;
+  for (const note of extra) card.append(el("div", "muted", note));
   card.append(el("div", "muted", `Your table (${p.using}) is unchanged. The next command also works on that table.`));
   const actions = el("div", "actions");
   const undo = el("button", "", "Undo (remove the new sheets)");
   undo.type = "button";
   undo.addEventListener("click", () => guarded(async () => {
     undo.disabled = true;
-    await state.host!.removeSheets(made.map((m) => m.name));
-    if (state.ref && made.some((m) => m.name === state.ref!.sheet)) state.ref = undefined;
+    await state.host!.removeSheets(made!.map((m) => m.name));
+    if (state.ref && made!.some((m) => m.name === state.ref!.sheet)) state.ref = undefined;
     post("bot", "Undone. The new sheets are removed.");
   }));
   actions.append(undo);
-  if (made.length === 1) {
+  if (made.length === 1 && made[0].rows >= 0) {
     const carry = el("button", "", "Continue from this result");
     carry.type = "button";
     carry.addEventListener("click", () => guarded(async () => {
       carry.disabled = true;
-      state.ref = await state.host!.refOf(made[0].name);
+      state.ref = await state.host!.refOf(made![0].name);
       await readSource(state.ref);
-      post("bot", `OK. The next commands work on “${made[0].name}”. Press “Use my table” to go back to your own table.`);
+      post("bot", `OK. The next commands work on “${made![0].name}”. Press “Use my table” to go back to your own table.`);
     }));
     actions.append(carry);
   }
@@ -298,6 +329,9 @@ async function guarded(fn: () => Promise<void>): Promise<void> {
 // ---------- start up ----------
 
 function wire(): void {
+  const live = $<HTMLInputElement>("live");
+  try { live.checked = localStorage.getItem("sheet-assistant-live") === "1"; } catch { /* storage can be blocked: the default is fine */ }
+  live.addEventListener("change", () => { try { localStorage.setItem("sheet-assistant-live", live.checked ? "1" : "0"); } catch { /* ignore */ } });
   $("ask").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const box = $<HTMLTextAreaElement>("input");

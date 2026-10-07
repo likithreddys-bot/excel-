@@ -720,3 +720,42 @@ export function columnResolver(names: string[]): (name: string) => string {
     throw new FormulaSyntaxError(`I couldn't find a column called '${name}'.` + (near ? ` Did you mean ${byKey.get(near)}?` : ` Columns: ${names.join(", ")}`));
   };
 }
+
+// ---------- to a real Excel formula ----------
+
+/** Is argument `i` of `fn` a whole column (SUM(amount), COUNTIF(type, ...)) rather than this row's value? */
+function isWholeColumnArg(fn: string, i: number): boolean {
+  if (AGGREGATES.has(fn)) return true;
+  switch (fn) {
+    case "COUNTIF": return i === 0;
+    case "COUNTIFS": return i % 2 === 0;
+    case "SUMIF": case "AVERAGEIF": return i === 0 || i === 2;
+    case "SUMIFS": return i === 0 || i % 2 === 1;
+    default: return false;
+  }
+}
+
+const xlQuote = (s: string) => `"${s.replace(/"/g, '""')}"`;
+const xlName = (name: string) => name.replace(/([[\]#'])/g, "'$1");
+
+/**
+ * The same formula as Excel would hold it in a Table: [@[amount]] for "this row's amount" and Table[[amount]] for a
+ * whole column (inside SUM, COUNTIF and friends). Errors become blank, like they do in the add-in's own result.
+ */
+export function toExcelFormula(source: string, tableName: string, resolve: (name: string) => string): string {
+  const root = new Parser(tokenize(source.trim().replace(/^=/, "")), resolve).parse();
+  const wholeColumn = (name: string) => `${tableName}[[${xlName(name)}]]`;
+  const walk = (n: Node, whole = false): string => {
+    switch (n.t) {
+      case "num": return String(n.v);
+      case "str": return xlQuote(n.v);
+      case "bool": return n.v ? "TRUE" : "FALSE";
+      case "col": return whole ? wholeColumn(n.name) : `[@[${xlName(n.name)}]]`;
+      case "neg": return `-(${walk(n.a)})`;
+      case "pct": return `(${walk(n.a)})%`;
+      case "bin": return `(${walk(n.a)}${n.op}${walk(n.b)})`;
+      case "call": return `${n.fn}(${n.args.map((arg, i) => walk(arg, arg.t === "col" && isWholeColumnArg(n.fn, i))).join(",")})`;
+    }
+  };
+  return `=IFERROR(${walk(root)},"")`;
+}

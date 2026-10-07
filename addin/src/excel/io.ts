@@ -2,7 +2,8 @@
 import { FormatStep, liveFormats } from "../engine/format";
 import { Cell, Sheets, Table, makeTable } from "../engine/table";
 import { addCharts, formatSheet } from "./format";
-import { Created, Host, HostError, Source, SourceRef } from "../host";
+import type { LiveColumn, PivotSpec } from "../engine/live";
+import { Created, Host, HostError, Source, SourceRef, WriteOutcome } from "../host";
 
 const READ_CELLS_PER_CHUNK = 100_000;
 const WRITE_CELLS_PER_CHUNK = 50_000;
@@ -102,7 +103,7 @@ export class ExcelHost implements Host {
     }).catch(rethrow);
   }
 
-  async writeResult(sheets: Sheets, formats: FormatStep[] = []): Promise<Created[]> {
+  async writeResult(sheets: Sheets, formats: FormatStep[] = [], liveCols: LiveColumn[] | null = null): Promise<WriteOutcome> {
     return Excel.run(async (ctx) => {
       const existing = ctx.workbook.worksheets;
       existing.load("items/name");
@@ -111,6 +112,7 @@ export class ExcelHost implements Host {
       const taken = new Set(existing.items.map((w) => w.name.toLowerCase()));
       const tableNames = new Set(ctx.workbook.tables.items.map((t) => t.name.toLowerCase()));
       const created: Created[] = [];
+      const notes: string[] = [];
       let first: Excel.Worksheet | null = null;
 
       const live = liveFormats(formats, sheets);
@@ -118,7 +120,8 @@ export class ExcelHost implements Host {
         const name = freeName(wanted, taken);
         const ws = ctx.workbook.worksheets.add(name);
         first ??= ws;
-        await writeTable(ctx, ws, table, tableNames);
+        const tableName = await writeTable(ctx, ws, table, tableNames);
+        if (liveCols?.length && tableName) notes.push(...(await applyLiveColumns(ctx, ws, table, tableName, liveCols)));
         ws.load("name");
         formatSheet(ws, table, live);
         await ctx.sync();
@@ -128,7 +131,31 @@ export class ExcelHost implements Host {
       await ctx.sync();
       first?.activate();
       await ctx.sync();
-      return created;
+      return { created, notes };
+    }).catch(rethrow);
+  }
+
+  async writePivot(source: SourceRef, spec: PivotSpec): Promise<Created> {
+    return Excel.run(async (ctx) => {
+      const { range } = await locate(ctx, source);
+      const sheets = ctx.workbook.worksheets;
+      sheets.load("items/name");
+      ctx.workbook.pivotTables.load("items/name");
+      await ctx.sync();
+      const taken = new Set(sheets.items.map((w) => w.name.toLowerCase()));
+      const name = freeName("Pivot", taken);
+      const ws = sheets.add(name);
+      const pt = ws.pivotTables.add(freeName("Pivot_" + name.replace(/\W+/g, "_"), new Set(ctx.workbook.pivotTables.items.map((p) => p.name.toLowerCase()))), range, ws.getRange("A3"));
+      for (const r of spec.rows) pt.rowHierarchies.add(pt.hierarchies.getItem(r));
+      for (const c of spec.columns) pt.columnHierarchies.add(pt.hierarchies.getItem(c));
+      for (const d of spec.data) {
+        const dh = pt.dataHierarchies.add(pt.hierarchies.getItem(d.column));
+        dh.summarizeBy = d.func as Excel.AggregationFunction;
+        dh.name = d.name;
+      }
+      ws.activate();
+      await ctx.sync();
+      return { name, rows: -1 };
     }).catch(rethrow);
   }
 
@@ -160,9 +187,9 @@ function freeName(wanted: string, taken: Set<string>): string {
   return name;
 }
 
-async function writeTable(ctx: Excel.RequestContext, ws: Excel.Worksheet, t: Table, tableNames: Set<string>): Promise<void> {
+async function writeTable(ctx: Excel.RequestContext, ws: Excel.Worksheet, t: Table, tableNames: Set<string>): Promise<string | null> {
   const cols = t.columns.length;
-  if (!cols) return;
+  if (!cols) return null;
   ws.getRangeByIndexes(0, 0, 1, cols).values = [t.columns.map((c) => c.name)];
   const step = Math.max(1, Math.floor(WRITE_CELLS_PER_CHUNK / cols));
   for (let r = 0; r < t.nrows; r += step) {
@@ -175,10 +202,12 @@ async function writeTable(ctx: Excel.RequestContext, ws: Excel.Worksheet, t: Tab
     if (c.format && t.nrows) (ws.getRangeByIndexes(1, j, t.nrows, 1) as { numberFormat: unknown }).numberFormat = c.format;
   });
   const used = ws.getRangeByIndexes(0, 0, t.nrows + 1, cols);
+  let tableName: string | null = null;
   try {
     // A real Excel Table: filter buttons, banded rows, and pivots/formulas can refer to it by name.
     const table = ws.tables.add(used, true);
-    table.name = freeName("Table_" + ws.name.replace(/\W+/g, "_"), tableNames);
+    tableName = freeName("Table_" + ws.name.replace(/\W+/g, "_"), tableNames);
+    table.name = tableName;
     table.style = "TableStyleMedium2";
     await ctx.sync();
   } catch {
@@ -188,6 +217,56 @@ async function writeTable(ctx: Excel.RequestContext, ws: Excel.Worksheet, t: Tab
   ws.freezePanes.freezeRows(1);
   used.format.autofitColumns();
   await ctx.sync();
+  return tableName;
+}
+
+/** Cells as Excel gives them back vs what the add-in worked out: the same, within rounding? */
+function sameCell(expected: Cell, actual: unknown): boolean {
+  if (expected === null) return actual === "" || actual === null;
+  if (typeof expected === "number") return typeof actual === "number" && Math.abs(actual - expected) <= 1e-9 * Math.max(1, Math.abs(expected));
+  return actual === expected;
+}
+
+/**
+ * Turn finished value columns into real formulas, then check Excel agrees with the numbers in the preview.
+ * A column where it doesn't goes back to plain values, and the user is told.
+ */
+async function applyLiveColumns(ctx: Excel.RequestContext, ws: Excel.Worksheet, t: Table, tableName: string, live: LiveColumn[]): Promise<string[]> {
+  const notes: string[] = [];
+  const made: string[] = [];
+  for (const lc of live) {
+    const j = t.columns.findIndex((c) => c.name === lc.name);
+    if (j < 0 || !t.nrows) continue;
+    const col = t.columns[j];
+    const range = ws.getRangeByIndexes(1, j, t.nrows, 1);
+    let ok = false;
+    try {
+      (range as { formulas: unknown }).formulas = lc.build(tableName);
+      await ctx.sync();
+      const step = Math.max(1, Math.floor(READ_CELLS_PER_CHUNK));
+      let bad = 0;
+      for (let r = 0; r < t.nrows && bad === 0; r += step) {
+        const part = ws.getRangeByIndexes(1 + r, j, Math.min(step, t.nrows - r), 1);
+        part.load("values");
+        await ctx.sync();
+        part.values.forEach((row, i) => { if (!sameCell(col.values[r + i], row[0])) bad++; });
+      }
+      ok = bad === 0;
+    } catch {
+      ok = false;
+    }
+    if (ok) made.push(lc.name);
+    else {
+      notes.push(`“${lc.name}” is plain values: Excel's own calculation didn't match the preview exactly, so I kept the preview's numbers.`);
+      for (let r = 0; r < t.nrows; r += WRITE_CELLS_PER_CHUNK) {
+        const h = Math.min(WRITE_CELLS_PER_CHUNK, t.nrows - r);
+        ws.getRangeByIndexes(1 + r, j, h, 1).values = col.values.slice(r, r + h).map((v) => [v ?? ""]);
+      }
+      await ctx.sync();
+    }
+  }
+  if (made.length) notes.unshift(`Live formulas: ${made.map((n) => `“${n}”`).join(", ")} update by themselves when you change the data in this table.`);
+  return notes;
 }
 
 function rethrow(e: unknown): never {

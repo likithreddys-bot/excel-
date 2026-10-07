@@ -19,7 +19,7 @@ Describe what you want done with your table in plain English, inside Excel. The 
 - **Highlights, number formats and charts:** `highlight rows where amount > 1 lakh in red`, `highlight duplicates in pan`, `show amount in rupees`, `show date as dd-mmm-yyyy`, `bar chart of total amount by category`, `line chart of amount by month`. Applied to the new sheet; the preview shows which rows will be coloured and what a chart will plot.
 - **Several at once:** `only debits over 5000, split by category and sort by amount descending`.
 
-Results are written as values (so they match the preview exactly), not yet as live PivotTables or formulas.
+Results are written as values by default, so they match the preview exactly. Tick **Keep results live** in the pane and, where Excel can do it exactly, a new column becomes a real formula in the result table (`=IF([@[amount]]>10000,"High","Low")`), and a plain total or pivot on your own table becomes a native PivotTable. After writing formulas the add-in reads Excel's answers back; a column where Excel disagrees with the preview is kept as values and you are told.
 
 ## Run it
 
@@ -65,7 +65,6 @@ When porting a new feature, add its commands to `tools/gen_golden.py` first. Gen
 
 ## Not done yet
 
-- Native PivotTables and live formulas as an option.
 - A guided builder (pick from menus) for sentences it can't read.
 - Packaging for company-wide deployment (Microsoft 365 admin center).
 - The Office.js read/write layer (`src/excel/io.ts`) has not yet been run inside a real Excel; the engine and task pane have been tested in a browser only.

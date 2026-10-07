@@ -65,3 +65,6 @@ textarea { font: inherit; padding: 8px; border: 1px solid var(--line); border-ra
 #findings li { display: flex; gap: 8px; align-items: flex-start; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
 #findings li span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 #findings button { padding: 3px 10px; font-size: 12px; white-space: nowrap; }
+
+#live-row { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); margin-top: 8px; cursor: pointer; }
+#live-row input { margin: 0; }

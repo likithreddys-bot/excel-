@@ -3,7 +3,7 @@
  * https://localhost:3000/taskpane.html. It holds a small made-up bank file in memory.
  */
 import { Cell, Sheets, Table, makeTable } from "../engine/table";
-import { Created, Host, Source, SourceRef } from "../host";
+import { Created, Host, Source, SourceRef, WriteOutcome } from "../host";
 
 function demoRows(n = 400): Cell[][] {
   let seed = 7;
@@ -50,7 +50,7 @@ export class DemoHost implements Host {
     return { ref: { sheet, address: "A1" }, label: `${sheet}!A1:H${table.nrows + 1}`, table };
   }
 
-  async writeResult(sheets: Sheets, _formats?: unknown): Promise<Created[]> {
+  async writeResult(sheets: Sheets, _formats?: unknown, _live?: unknown): Promise<WriteOutcome> {
     const out: Created[] = [];
     for (const [wanted, table] of sheets) {
       let name = wanted, n = 2;
@@ -58,7 +58,11 @@ export class DemoHost implements Host {
       this.sheets.set(name, table);
       out.push({ name, rows: table.nrows });
     }
-    return out;
+    return { created: out, notes: [] };
+  }
+
+  async writePivot(): Promise<Created> {
+    throw new Error("PivotTables need Excel.");
   }
 
   async removeSheets(names: string[]): Promise<void> {
