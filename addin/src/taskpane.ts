@@ -111,7 +111,7 @@ async function readSource(ref?: SourceRef): Promise<Table> {
 // ---------- commands ----------
 
 /** Other sheets the command talks about ("bring email from Customers on PAN"): read only those. */
-async function sheetsMentioned(text: string): Promise<Record<string, Table>> {
+async function sheetsMentioned(text: string, problems: string[]): Promise<Record<string, Table>> {
   const here = state.ref?.sheet;
   const others = (await state.host!.listSheets()).filter((n) => n !== here);
   const k = key(text);
@@ -120,7 +120,9 @@ async function sheetsMentioned(text: string): Promise<Record<string, Table>> {
   if (!named.length && others.length === 1 && /\b(?:other|second|lookup|new|that|another)\s+(?:file|sheet|list|table|data)\b|\bboth\s+(?:files|sheets)\b/i.test(text)) named = others;
   const out: Record<string, Table> = {};
   for (const n of named) {
-    try { out[n] = await state.host!.readSheet(n); } catch { /* an empty or unreadable sheet simply isn't offered */ }
+    try { out[n] = await state.host!.readSheet(n); } catch (e) {
+      problems.push(e instanceof HostError ? e.message : `I couldn't read the sheet “${n}”.`); // said out loud if the command then fails
+    }
   }
   return out;
 }
@@ -136,12 +138,13 @@ async function preview(text: string): Promise<void> {
     post("bot", "I couldn't find " + reply[1].join(", ") + ". Reply again with the column names.");
     return;
   }
-  const files = await sheetsMentioned(reply ? state.asked! : text);
+  const problems: string[] = [];
+  const files = await sheetsMentioned(reply ? state.asked! : text, problems);
   const plan = reply ? makePlan(sheets, state.asked!, reply[0], {}, files) : makePlan(sheets, text, [], {}, files);
   if (plan.clarification_question) {
     state.pending = null;
     state.asked = plan.awaits_columns ? (reply ? state.asked : text) : null;
-    post("bot", plan.clarification_question);
+    post("bot", problems.length ? problems.join("\n") : plan.clarification_question);
     return;
   }
   state.asked = null;

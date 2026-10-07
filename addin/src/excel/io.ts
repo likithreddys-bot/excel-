@@ -92,7 +92,10 @@ export class ExcelHost implements Host {
       const used = ctx.workbook.worksheets.getItem(name).getUsedRangeOrNullObject(true);
       used.load("isNullObject");
       await ctx.sync();
-      if (used.isNullObject) throw new HostError(`The sheet “${name}” is empty.`);
+      if (used.isNullObject) throw new HostError(`The sheet “${name}” is empty. Put a header row and your data on it first.`);
+      used.load("rowCount");
+      await ctx.sync();
+      if (used.rowCount < 2) throw new HostError(`The sheet “${name}” has a header row but no data rows yet. Add the rows you want to look up, then try again.`);
       return readTable(ctx, used);
     }).catch(rethrow);
   }
