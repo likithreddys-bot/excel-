@@ -64,7 +64,7 @@ See [`DEPLOY.md`](DEPLOY.md): hosting, `npm run manifest -- <https address>`, in
 npm test
 ```
 
-`npm test` first asks the Python reference (`../planner.py`, `../engine.py`) to answer about 250 commands on made-up files (bank transactions, a ledger, a messy contact list, and a few files for lookups). It then checks that the TypeScript parser produces the **same plans, summaries and results**. This needs Python with pandas, numpy and pydantic.
+`npm test` first asks the Python reference (`../planner.py`, `../engine.py`) to answer about 250 commands on made-up files (bank transactions, a ledger, a messy contact list, and a few files for lookups). It then checks that the TypeScript parser produces the **same plans, summaries and results**. This needs Python with the app's requirements (`pip install -r ../requirements.txt`).
 
 When porting a new feature, add its commands to `tools/gen_golden.py` first. Generated data stays out of git.
 

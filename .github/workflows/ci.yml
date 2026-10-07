@@ -31,11 +31,11 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: addin/package-lock.json
-      # The add-in's tests compare it with the Python app, so they need pandas to generate the expected answers.
+      # The add-in's tests compare it with the Python app, so they need the app's requirements to generate the expected answers.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pandas numpy pydantic
+      - run: pip install -r requirements.txt
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
