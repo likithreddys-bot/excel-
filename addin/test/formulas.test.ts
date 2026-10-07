@@ -162,6 +162,16 @@ describe("mistakes are explained, not guessed", () => {
   };
   it("unknown function", () => asks("add column x = IFF(amount>1, 1, 0)", "Did you mean IF"));
   it("unknown column", () => asks("add column x = IF(amnt>1, 1, 0)", "Did you mean amount"));
+  it("a column that is nearly named that way", () => {
+    const sheets: Sheets = new Map([["Result", makeTable(["name", "city", "amt"], [["a", "b", 5]])]]);
+    const p = makePlan(sheets, 'add column grade = IF(amount>5000,"High","Low")');
+    expect(p.clarification_question).toContain("Did you mean amt?");
+  });
+  it("numbers saved as text are pointed out before anything else", () => {
+    const sheets: Sheets = new Map([["Result", makeTable(["name", "amt"], [["a", "₹1,200"], ["b", "Rs. 90"]])]]);
+    const p = makePlan(sheets, "top 5 by amount");
+    expect(p.clarification_question).toContain("convert amt to number");
+  });
   it("wrong number of arguments", () => asks("add column x = LEFT()", "needs"));
   it("unclosed quote or bracket", () => asks('add column x = IF(amount>1, "yes, 0)', "quote"));
   it("a formula with no column name", () => asks('=IF(amount>1,"a","b")', "name"));

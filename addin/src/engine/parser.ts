@@ -7,7 +7,7 @@ import { COLORS, describe } from "./describe";
 import { applyPlan, PlanError } from "./engine";
 import { FORMULA_FUNCTIONS, FormulaSyntaxError, columnResolver, compileFormula } from "./formula";
 import type { Aggregation, Condition, DatePartStep, FilterStep, GroupByStep, PivotStep, Plan, SortStep, Step, TopNStep } from "./plan";
-import { Cell, Sheets, Table, combine, isBlankCell } from "./table";
+import { Cell, Column, Sheets, Table, combine, isBlankCell } from "./table";
 import {
   MONTHS, DAY_MS, closeMatch, colWords, fmt, isoDay, key, parseDate, parseNumber, similarity, singular, utcDay,
 } from "./util";
@@ -104,6 +104,12 @@ const strip = (s: string, chars: string): string => {
   return s.slice(a, b);
 };
 const unique = <T>(xs: T[]): T[] => [...new Set(xs)];
+
+/** Most values read as amounts once ₹, Rs. and commas are ignored ("₹1,200", "Rs. 90"). */
+function looksLikeAmounts(c: Column): boolean {
+  const strings = c.values.filter((v): v is string => typeof v === "string" && v.trim() !== "").slice(0, 200);
+  return strings.length > 0 && strings.filter((s) => parseNumber(s.replace(/\s+/g, " ")) !== null).length / strings.length >= 0.8;
+}
 const sortedText = (xs: string[]) => [...xs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
 const unquote = (v: string): string => {
@@ -330,6 +336,14 @@ export class Parser {
     const amountish = cands.filter((c) => colWords(c).some((w) => AMOUNT_WORDS.has(w)));
     if (cands.length === 1) return cands[0];
     if (amountish.length === 1) return amountish[0];
+    if (!this.numericCols.length) {
+      // No real numbers at all: say so, and point at columns that look like amounts saved as text.
+      const textual = this.table.columns.filter((c) => c.kind === "text" && looksLikeAmounts(c)).map((c) => c.name);
+      if (textual.length) {
+        throw new ParseError(`No column holds numbers yet. ${textual.map((c) => `'${c}'`).join(" and ")} looks like amounts saved as text, so it can't be added up. `
+          + `Try: convert ${textual[0]} to number`);
+      }
+    }
     throw new ParseError("Which column should the number apply to? Reply with the column name(s). Numeric columns: "
       + (cands.length ? cands : this.numericCols.length ? this.numericCols : ["(none)"]).join(", "), true);
   }
@@ -842,7 +856,7 @@ export class Parser {
     if (!values.length && /\b(?:it|that|this|them|those|the\s+result|the\s+totals?)\b/i.test(head)) values = [this.defaultNumberColumn()];
     const [prefix, found] = this.dims(tail);
     const xs = unique(found.map((x) => x.column));
-    if (xs.length !== 1) throw new ParseError("Chart by which one column? e.g. '... by category' or '... by month'");
+    if (xs.length !== 1) throw new ParseError("Chart by which one column? e.g. '... by category' or '... by month'\nColumns here: " + this.columns.join(", "));
     let func = (funcs[0] ?? (values.length ? "sum" : "count")) as string;
     if (func === "nunique") func = "count";
     let y: string | null = func === "count" && !values.length ? null : (values[0] ?? this.defaultNumberColumn());

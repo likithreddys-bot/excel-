@@ -716,7 +716,7 @@ export function columnResolver(names: string[]): (name: string) => string {
   return (name) => {
     const hit = byKey.get(key(name));
     if (hit !== undefined) return hit;
-    const near = closeMatch(key(name), [...byKey.keys()], 0.75);
+    const near = closeMatch(key(name), [...byKey.keys()], 0.6);
     throw new FormulaSyntaxError(`I couldn't find a column called '${name}'.` + (near ? ` Did you mean ${byKey.get(near)}?` : ` Columns: ${names.join(", ")}`));
   };
 }
