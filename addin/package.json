@@ -12,7 +12,8 @@
     "pretest": "npm run golden",
     "test": "vitest run",
     "validate": "office-addin-manifest validate manifest.xml",
-    "certs": "office-addin-dev-certs install"
+    "certs": "office-addin-dev-certs install",
+    "manifest": "node tools/make-manifest.mjs"
   },
   "devDependencies": {
     "@types/office-js": "^1.0.611",

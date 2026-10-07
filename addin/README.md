@@ -54,6 +54,10 @@ sentence ──► parser.ts ──► Plan (typed steps) ──► engine.ts �
 | `src/excel/demo.ts` | Stand-in workbook for browsers |
 | `src/taskpane.ts` | The task pane UI |
 
+## Putting it in front of a team
+
+See [`DEPLOY.md`](DEPLOY.md): hosting, `npm run manifest -- <https address>`, installing for everyone from the Microsoft 365 admin center, and a short note on what leaves the computer (nothing) for security review.
+
 ## Tests
 
 ```bash
@@ -66,5 +70,4 @@ When porting a new feature, add its commands to `tools/gen_golden.py` first. Gen
 
 ## Not done yet
 
-- Packaging for company-wide deployment (Microsoft 365 admin center).
 - The Office.js read/write layer (`src/excel/io.ts`) has not yet been run inside a real Excel; the engine and task pane have been tested in a browser only.

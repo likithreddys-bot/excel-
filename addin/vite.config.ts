@@ -12,6 +12,8 @@ const trusted = existsSync(join(certDir, "localhost.key")) && existsSync(join(ce
   : undefined;
 
 export default defineConfig({
+  // Relative links, so the built files work from any folder or sub-path of a web server.
+  base: "./",
   plugins: trusted ? [] : [basicSsl()],
   server: { port: 3000, host: "localhost", https: trusted },
   build: { target: "es2022", outDir: "dist", rollupOptions: { input: "taskpane.html" } },
