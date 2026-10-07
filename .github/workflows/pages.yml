@@ -1,0 +1,48 @@
+# Publishes the built Excel add-in to GitHub Pages. Manual only: nothing is published until someone presses
+# "Run workflow" (Actions tab), and Pages must first be switched on in the repository settings
+# (Settings > Pages > Source: GitHub Actions). See addin/DEPLOY.md.
+name: Publish add-in
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: addin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: addin/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r ../requirements.txt
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      # The manifest to give IT, pointing at where Pages serves the files.
+      - run: npm run manifest -- "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: addin/dist
+      - id: deployment
+        uses: actions/deploy-pages@v4
