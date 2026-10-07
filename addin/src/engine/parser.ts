@@ -61,6 +61,15 @@ const NUMBER_FORMAT = new RegExp(
   String.raw`|whole\s+numbers?|integers?|(?:(?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)[/\-. ](?:dd|d|mm|mmm|yyyy|yy)))` +
   String.raw`(?:\s+format)?\s*$`, "i");
 
+const NUMBER_WORDS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
+const BLANK_WORDS = new Set(["", "blank", "blanks", "empty", "empties", "empty cells", "empty values", "blank cells",
+  "blank values", "nothing", "null", "nulls", "missing", "missing values"]);
+const DATEDIFF = new RegExp(
+  String.raw`^(?:the\s+)?(?:number\s+of\s+|no\.?\s+of\s+)?(?<unit>day|week|month|year)s?\s+` +
+  String.raw`(?:(?:since|from|after)\s+(?<a>.+?)(?:\s+(?:to|until|till)\s+(?<b>.+?))?` +
+  String.raw`|between\s+(?<a2>.+?)\s+and\s+(?<b2>.+?)|(?:until|till|to|before)\s+(?<b3>.+?))\s*$` +
+  String.raw`|^age\s+(?:from|of|using|based\s+on)\s+(?<dob>.+?)\s*$`, "i");
+
 const WHAT_IT_CAN_DO = "Right now the add-in can filter rows, sort, split into sheets, remove duplicates and choose columns.";
 
 export class ParseError extends Error {
@@ -149,7 +158,7 @@ export class Parser {
   private values: Map<string, Map<string, string>> | null = null;
 
   /** `answer`: columns the user gave in reply to a "which column?" question. */
-  constructor(sheets: Sheets | Table, private answer: string[] = []) {
+  constructor(sheets: Sheets | Table, private answer: string[] = [], private computed: Record<string, string> = {}) {
     this.table = sheets instanceof Map ? combine(sheets) : sheets;
     this.columns = this.table.columns.map((c) => String(c.name));
     this.colKeys = new Map(this.columns.map((c) => [c, key(c)]));
@@ -351,37 +360,153 @@ export class Parser {
       && GROUP_MARKER.test(low);
   }
 
-  /** Commands that make a new column. Returns steps we can run (date parts), null if `cl` isn't one, or says "coming soon". */
+  /** Commands that make a new column. Returns null if `cl` isn't one. */
   private formulaCommand(cl: string): Step[] | null {
     const text = cl.trim().replace(/\.+$/, "");
-    let m = /^\s*(?:please\s+)?round(?:\s+off)?\s+(?:the\s+)?(?:column\s+)?(.+?)(?:\s+to\s+(?:\d+|one|two|three|four)\s+(?:decimals?|decimal\s+places?|places?|digits?))?\s*$/i.exec(text);
+    let m = /^\s*(?:please\s+)?round(?:\s+off)?\s+(?:the\s+)?(?:column\s+)?(?<x>.+?)(?:\s+to\s+(?<n>\d+|one|two|three|four)\s+(?:decimals?|decimal\s+places?|places?|digits?))?\s*$/i.exec(text);
     if (m) {
-      if (this.column(m[1]) === null) throw new ParseError("Which column should I round? Columns: " + this.numericCols.join(", "));
-      return soon("Rounding");
+      const c = this.column(m.groups!.x);
+      if (c === null) throw new ParseError("Which column should I round? Columns: " + this.numericCols.join(", "));
+      const n = NUMBER_WORDS[(m.groups!.n ?? "0").toLowerCase()] ?? parseInt(m.groups!.n ?? "0", 10);
+      return [{ op: "compute", name: c, expr: `round([${c}], ${n})`, replace: true }];
     }
-    if (/^\s*(?:please\s+)?(?:label|tag|flag|mark)\s+(?:the\s+)?(?:rows?\s+|transactions?\s+|records?\s+)?(?:where\s+|with\s+|that\s+have\s+|if\s+)?(.+?)(?:\s+as\s+("[^"]*"|'[^']*'|[^,]+?))?(?:\s*,?\s*\b(?:else|otherwise)\b[\s,:]*(.+))?\s*$/i.test(text)) {
-      return soon("Labelling rows");
+    m = /^\s*(?:please\s+)?(?<verb>label|tag|flag|mark)\s+(?:the\s+)?(?:rows?\s+|transactions?\s+|records?\s+)?(?:where\s+|with\s+|that\s+have\s+|if\s+)?(?<c>.+?)(?:\s+as\s+(?<v>"[^"]*"|'[^']*'|[^,]+?))?(?:\s*,?\s*\b(?:else|otherwise)\b[\s,:]*(?<d>.+))?\s*$/i.exec(text);
+    if (m) {
+      const name = ["flag", "mark"].includes(m.groups!.verb.toLowerCase()) ? "flag" : "label";
+      return [this.label(name, [[m.groups!.v ?? "Yes", m.groups!.c]], m.groups!.d ?? null, false)];
     }
-    if (/^\s*(?:please\s+)?(?:add|calculate|compute|show|create)\s+(?:a\s+column\s+(?:for|with)\s+)?(?:the\s+)?((?:number\s+of\s+)?(?:days?|weeks?|months?|years?)\s+(?:since|from|after|between|until|till|before)\b.+|age\s+(?:from|of|using|based\s+on)\s+.+)$/i.test(text)) {
-      return soon("Date calculations");
+    m = /^\s*(?:please\s+)?(?:add|calculate|compute|show|create)\s+(?:a\s+column\s+(?:for|with)\s+)?(?:the\s+)?(?<rhs>(?:number\s+of\s+)?(?:days?|weeks?|months?|years?)\s+(?:since|from|after|between|until|till|before)\b.+|age\s+(?:from|of|using|based\s+on)\s+.+)$/i.exec(text);
+    if (m) {
+      const rhs = m.groups!.rhs;
+      const name = rhs.toLowerCase().startsWith("age") ? "age" : rhs.replace(/^number\s+of\s+/i, "");
+      return [this.compute(name, rhs, true, null)];
     }
     const verb = String.raw`(?:add|create|make|insert|calculate|compute|new|set|update)`;
-    if (new RegExp(String.raw`^\s*(?:please\s+)?(${verb})\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?|col)\s+(?:called\s+|named\s+)?("[^"]*"|'[^']*'|.+?)\s*(?:=|:|\bas\b|\bequal\s+to\b|\bequals\b|\bwhich\s+is\b|\bthat\s+is\b|\bwith\b)\s*(.+)$`, "i").test(text)
-      || /^\s*(?:please\s+)?(?:add|calculate|compute|create)\s+(.+?)\s+as\s+(.+)$/i.test(text)) {
-      return soon("Calculated columns");
+    m = new RegExp(String.raw`^\s*(?:please\s+)?(?<verb>${verb})\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?|col)\s+(?:called\s+|named\s+)?(?<name>"[^"]*"|'[^']*'|.+?)\s*(?:=|:|\bas\b|\bequal\s+to\b|\bequals\b|\bwhich\s+is\b|\bthat\s+is\b|\bwith\b)\s*(?<rhs>.+)$`, "i").exec(text)
+      ?? /^\s*(?:please\s+)?(?<verb>add|calculate|compute|create)\s+(?<name>.+?)\s+as\s+(?<rhs>.+)$/i.exec(text);
+    if (m) return [this.compute(m.groups!.name, m.groups!.rhs, true, m.groups!.verb.toLowerCase())];
+    m = new RegExp(String.raw`^\s*(?:please\s+)?(?:(?<verb>${verb})\s+)?(?<name>[^=:<>!]+?)\s*[=:]\s*(?<rhs>[^=].*)$`, "i").exec(text);
+    if (m && m.groups!.name.split(/\s+/).filter(Boolean).length <= 4) {
+      const verbWord = (m.groups!.verb ?? "").toLowerCase();
+      if (this.column(m.groups!.name) && verbWord !== "set" && verbWord !== "update") return null; // "txn_type = DEBIT" is a filter
+      return [this.compute(m.groups!.name, m.groups!.rhs, false, verbWord)];
     }
-    m = new RegExp(String.raw`^\s*(?:please\s+)?(?:(${verb})\s+)?([^=:<>!]+?)\s*[=:]\s*([^=].*)$`, "i").exec(text);
-    if (m && m[2].split(/\s+/).filter(Boolean).length <= 4) {
-      const verbWord = (m[1] ?? "").toLowerCase();
-      if (this.column(m[2]) && verbWord !== "set" && verbWord !== "update") return null; // "txn_type = DEBIT" is a filter
-      return soon("Calculated columns");
-    }
-    m = /^\s*(?:please\s+)?(?:add|create|insert|make)\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?)?\s*(?:for\s+|called\s+|named\s+)?([^=:]+?)\s*$/i.exec(text);
+    m = /^\s*(?:please\s+)?(?:add|create|insert|make)\s+(?:an?\s+)?(?:new\s+)?(?:columns?|fields?)?\s*(?:for\s+|called\s+|named\s+)?(?<x>[^=:]+?)\s*$/i.exec(text);
     if (m) {
-      const [prefix, found] = this.dims(m[1]);
+      const [prefix, found] = this.dims(m.groups!.x); // "add column due_month" -> month of due_date
       if (prefix.length && found.length === 1) return prefix;
     }
     return null;
+  }
+
+  private compute(name: string, rhs: string, explicit: boolean, verb: string | null): Step {
+    name = unquote(name).trim().replace(/^the\s+|\s+column$/gi, "").trim();
+    const existing = this.columns.find((c) => key(c) === key(name)) ?? (explicit ? null : this.column(name));
+    const replace = !!existing && (verb === "set" || verb === "update");
+    if (existing && !replace) {
+      throw new ParseError(`There is already a column called ${existing}. Say 'set ${existing} = ...' to overwrite it, or pick a new name.`);
+    }
+    if (replace) name = existing!;
+    if (/\bif\b|\b(?:else|otherwise)\b/i.test(rhs)) return this.labelRhs(name, rhs, replace);
+    try {
+      return { op: "compute", name, expr: this.parseExpression(rhs), replace };
+    } catch (e) {
+      // "flag = amount > 100000": a condition on its own becomes a Yes/No column.
+      if (e instanceof ParseError && /[<>]|\b(?:is|are|over|under|above|below|more|less|greater|contains?|between|empty)\b/i.test(rhs)) {
+        return this.label(name, [["Yes", rhs]], "No", replace);
+      }
+      throw e;
+    }
+  }
+
+  private labelRhs(name: string, rhs: string, replace: boolean): Step {
+    rhs = rhs.trim();
+    const m = /^if\s+(?<c>.+?)\s+then\s+(?<v>.+?)\s*,?\s+(?:else|otherwise)\s+(?<d>.+)$/i.exec(rhs);
+    if (m) return this.label(name, [[m.groups!.v, m.groups!.c]], m.groups!.d, replace);
+    const dm = /\s*,?\s*\b(?:else|otherwise|or\s+else)\b[\s,:]*(?<d>.+)$/i.exec(rhs);
+    const body = dm ? rhs.slice(0, dm.index) : rhs;
+    const cases: [string, string][] = [];
+    for (const part of body.split(/,\s*(?=(?:"[^"]*"|'[^']*'|[^,]+?)\s+if\b)/i)) {
+      const pm = /^\s*(?<v>"[^"]*"|'[^']*'|.+?)\s+(?:if|when|where)\s+(?<c>.+?)\s*$/i.exec(part);
+      if (!pm) throw new ParseError("Try: add column size = high if amount > 50000 else low");
+      cases.push([pm.groups!.v, pm.groups!.c]);
+    }
+    return this.label(name, cases, dm ? dm.groups!.d : null, replace);
+  }
+
+  private label(name: string, cases: [string, string][], dflt: string | null, replace: boolean): Step {
+    if (this.columns.includes(name) && !replace) {
+      throw new ParseError(`There is already a column called ${name}. Say 'set ${name} = ...' to overwrite it.`);
+    }
+    let d = dflt ? unquote(dflt) : null;
+    if (d !== null && BLANK_WORDS.has(d.toLowerCase())) d = null;
+    return { op: "label", name, default: d, replace, cases: cases.map(([v, c]) => ({ when: this.parseFilter(c), value: unquote(v) })) };
+  }
+
+  /** Plain-English arithmetic -> the engine's restricted formula, e.g. '18% of amount' -> '0.18 * [amount]'. */
+  private parseExpression(text: string): string {
+    const t0 = text.trim().replace(/\.+$/, "");
+    const dd = DATEDIFF.exec(t0);
+    if (dd) {
+      const g = dd.groups!;
+      let unit: string, a: string, b: string;
+      if (g.dob) { unit = "year"; a = g.dob; b = "today"; }
+      else {
+        unit = g.unit.toLowerCase();
+        a = g.a ?? g.a2 ?? "today";
+        b = g.b ?? g.b2 ?? g.b3 ?? "today";
+      }
+      return `${unit}s(${this.dateOperand(a)}, ${this.dateOperand(b)})`;
+    }
+    const rm = /^round(?:ed)?\s*(?:off\s+)?\(?\s*(?<x>.+?)\s*(?:,\s*|\s+to\s+)(?<n>\d+)\s*(?:decimals?|(?:decimal\s+)?places?)?\s*\)?$/i.exec(t0);
+    if (rm) return `round(${this.parseExpression(rm.groups!.x)}, ${rm.groups!.n})`;
+    // "amount + 18%" means "amount increased by 18%", as people mean it, not amount + 0.18.
+    const pm = /^(?<base>.+?)\s*(?<op>[+-]|\bplus\b|\bminus\b)\s*(?<p>\d+(?:\.\d+)?)\s*%$/i.exec(t0);
+    if (pm) {
+      const sign = ["+", "plus"].includes(pm.groups!.op.toLowerCase()) ? 1 : -1;
+      return `(${this.parseExpression(pm.groups!.base)}) * ${fmt(1 + (sign * parseFloat(pm.groups!.p)) / 100)}`;
+    }
+    // [bracketed] and "quoted" column names are set aside so "Amount (INR)" isn't split at its brackets.
+    const held: string[] = [];
+    let t = t0.replace(/\[[^\]]+\]|"[^"]*"|'[^']*'/g, (m) => { held.push(m.slice(1, -1)); return `__H${held.length - 1}__`; });
+    t = t.replace(/\bmultiplied\s+by\b|\btimes\b|×|(?<=\s)x(?=\s)/gi, " * ")
+      .replace(/\bdivided\s+by\b|÷/gi, " / ")
+      .replace(/\bplus\b/gi, " + ")
+      .replace(/\bminus\b/gi, " - ")
+      .replace(/%\s+of\b/gi, "% * ");
+    const out: string[] = [];
+    for (const tok of t.split(/(\*|\/|\+|\(|\)|,|(?:(?<=\s)|^)-(?=[\s\d(]))/)) {
+      const chunk = (tok ?? "").trim();
+      if (!chunk) continue;
+      if (["*", "/", "+", "-", "(", ")", ","].includes(chunk)) { out.push(chunk); continue; }
+      out.push(this.operand(chunk.replace(/__H(\d+)__/g, (_, n: string) => held[+n])));
+    }
+    if (!out.length) throw new ParseError("What should the new column be? e.g. add column gst = amount * 0.18");
+    return out.join(" ");
+  }
+
+  private operand(chunk: string): string {
+    if (chunk.endsWith("%") && parseNumber(chunk.slice(0, -1)) !== null) return fmt(parseNumber(chunk.slice(0, -1))! / 100);
+    const n = parseNumber(chunk);
+    if (n !== null) return fmt(n);
+    if (["abs", "round"].includes(chunk.toLowerCase())) return chunk.toLowerCase();
+    if (["today", "now", "today's date"].includes(chunk.toLowerCase())) return "today()";
+    const c = this.column(chunk);
+    if (c) return `[${c}]`;
+    if (chunk.includes("-")) { // "credit-debit" without spaces
+      const parts = chunk.split("-");
+      if (parts.every((p) => this.column(p) || parseNumber(p) !== null)) return parts.map((p) => this.operand(p)).join(" - ");
+    }
+    throw new ParseError(`I couldn't find a column called '${chunk}' for the formula. Columns: ` + this.columns.join(", "));
+  }
+
+  private dateOperand(text: string): string {
+    const t = unquote(text.trim());
+    if (["today", "now", "today's date", "current date", "the current date"].includes(t.toLowerCase())) return "today()";
+    const c = this.column(t);
+    if (c === null) throw new ParseError(`I couldn't find a date column called '${t}'. Date columns: ` + (this.dateCols.join(", ") || "(none)"));
+    if (!this.dateCols.includes(c)) throw new ParseError(`'${c}' doesn't look like a date column. Date columns: ` + (this.dateCols.join(", ") || "(none)"));
+    return `[${c}]`;
   }
 
   /** Cleaning commands aren't available yet; recognise them so they aren't mistaken for filters. */
@@ -444,11 +569,18 @@ export class Parser {
     throw new ParseError(`Which column should ${what}? Reply with the column name(s). Columns: ` + this.columns.join(", "), true);
   }
 
-  /** Several columns totalled side by side become a "calculated" pivot of plain totals. */
+  /** Values worked out from each group's totals, like an Excel pivot calculated field: columns made by a formula
+   * ("B0% = b0_amt*100/alloc_amt" -> total b0_amt*100/total alloc_amt), and several columns totalled side by side.
+   * {} means the ordinary one-column summary. */
   private calculated(values: string[], funcs: string[]): Record<string, string> {
     if (funcs.length && funcs[0] !== "sum") return {}; // "average B0% by month" really means the average of the row values
-    if (values.length < 2) return {};
-    return Object.fromEntries(values.map((v) => [v, `[${v}]`]));
+    const formula = (c: string, depth = 0): string => {
+      const expr = this.computed[c];
+      if (expr === undefined || /[a-z_]+\s*\(/i.test(expr) || depth > 5) return `[${c}]`; // no functions: round(), days()...
+      return expr.replace(/\[([^\]]+)\]/g, (m, n: string) => (n in this.computed ? `(${formula(n, depth + 1)})` : m));
+    };
+    if (values.length < 2 && !values.some((v) => formula(v) !== `[${v}]`)) return {};
+    return Object.fromEntries(values.map((v) => [v, formula(v)]));
   }
 
   private checkPivotWidth(cols: string[], steps: DatePartStep[], what: string): void {
@@ -475,14 +607,18 @@ export class Parser {
     if (!valueCols.length && !(funcs.length === 1 && funcs[0] === "count")) {
       valueCols = this.answer.filter((c) => this.numericCols.includes(c) && !groupCols.includes(c));
     }
+    // Formula columns (B0% = ...) are totalled the calculated-field way, not by adding row percentages.
+    const formulas = valueCols.filter((c) => c in this.computed);
+    const calculated = formulas.length ? this.calculated(formulas, explicit) : {};
     const aggs: Aggregation[] = [];
     for (const f of funcs) {
       if (f === "count" && !valueCols.length) { aggs.push({ column: groupCols[0], func: "count" }); continue; }
-      for (const c of valueCols.length ? unique(valueCols) : [this.defaultNumberColumn()]) aggs.push({ column: c, func: f });
+      const cols = unique(valueCols).filter((c) => !(c in calculated));
+      for (const c of cols.length ? cols : Object.keys(calculated).length ? [] : [this.defaultNumberColumn()]) aggs.push({ column: c, func: f });
     }
-    const steps: Step[] = [...filters, ...prefix, { op: "group_by", columns: groupCols, aggregations: aggs, calculated: {} } as GroupByStep];
+    const steps: Step[] = [...filters, ...prefix, { op: "group_by", columns: groupCols, aggregations: aggs, calculated } as GroupByStep];
     if (pct) {
-      const out = `${aggs[0].func}_${aggs[0].column}`;
+      const out = aggs.length ? `${aggs[0].func}_${aggs[0].column}` : Object.keys(calculated)[0];
       steps.push({ op: "calculate", kind: "percent_of_total", column: out, per: null, descending: true, name: `% of total ${out}` });
     }
     return steps;
@@ -1072,7 +1208,8 @@ export function replyColumns(sheets: Sheets | Table, text: string): [string[], s
 
 export const examples = (sheets: Sheets | Table): string[] => new Parser(sheets).examples();
 
-export function makePlan(sheets: Sheets, request: string, answer: string[] = []): Plan {
+export function makePlan(sheets: Sheets, request: string, answer: string[] = [], computed: Record<string, string> = {}): Plan {
+  computed = { ...computed };
   const empty = (q: string, awaits = false): Plan => ({ clarification_question: q, summary: "", steps: [], awaits_columns: awaits });
   try {
     const clauses = splitClauses(request);
@@ -1088,8 +1225,9 @@ export function makePlan(sheets: Sheets, request: string, answer: string[] = [])
     const steps: Step[] = [];
     let current = sheets;
     clauses.forEach((clause, i) => {
-      const made = new Parser(current, answer).parseClause(clause);
+      const made = new Parser(current, answer, computed).parseClause(clause);
       steps.push(...made);
+      for (const st of made) if (st.op === "compute") computed[st.name] = st.expr;
       // Later parts see the result so far: "add column gst = ... and sort by gst".
       if (i < clauses.length - 1) current = applyPlan(current, { clarification_question: null, summary: "", awaits_columns: false, steps: made });
     });

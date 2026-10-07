@@ -1,6 +1,7 @@
 /** Summaries: group totals, pivots, top N, percent of total / running total / rank. */
 import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
 import type { Aggregation, CalculateStep, GroupByStep, PivotStep, TopNStep } from "./plan";
+import { evaluate } from "./evaluate";
 import { Cell, Column, Table, isBlankCell, makeColumn, pick } from "./table";
 
 type Func = Aggregation["func"];
@@ -58,20 +59,20 @@ function summarise(c: Column, idx: number[], func: Func): Cell {
   }
 }
 
-/** Group totals worked out from sums, so a formula like [a]*100/[b] uses total a and total b. */
+/** Group totals worked out from sums, so a formula like [a]*100/[b] uses total a and total b (an Excel calculated field). */
 export function calculatedTotals(t: Table, groups: number[][], calculated: Record<string, string>): Cell[][] {
-  const out: Cell[][] = [];
-  for (const [name, expr] of Object.entries(calculated)) {
-    const m = /^\[([^\]]+)\]$/.exec(expr);
-    if (!m) throw new PlanError(`The formula for '${name}' needs calculated columns, which come to the add-in in the next update.`);
-    const c = col(t, m[1]);
-    out.push(groups.map((g) => {
+  const refs = [...new Set(Object.values(calculated).flatMap((e) => [...e.matchAll(/\[([^\]]+)\]/g)].map((m) => m[1])))].sort();
+  need(t, refs);
+  const sums = refs.map((r) => {
+    const c = col(t, r);
+    return makeColumn(r, groups.map((g) => {
       let s = 0, any = false;
       for (const i of g) { const n = numberOf(c.values[i]); if (!Number.isNaN(n)) { s += n; any = true; } }
       return any ? s : null;
     }));
-  }
-  return out;
+  });
+  const table: Table = { columns: sums, nrows: groups.length };
+  return Object.values(calculated).map((expr) => evaluate(table, expr));
 }
 
 const withBlankLabel = (c: Column): Column => {

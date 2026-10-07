@@ -42,7 +42,7 @@ def make_bank_df(n=2000, seed=0) -> pd.DataFrame:
     return df
 
 SUPPORTED = {"filter", "select_columns", "drop_columns", "sort", "dedupe", "split_by", "date_part",
-             "group_by", "pivot", "top_n", "calculate"}
+             "group_by", "pivot", "top_n", "calculate", "compute", "label"}
 
 COMMANDS = [
     # filters
@@ -98,10 +98,55 @@ COMMANDS = [
     "add % of total amount", "add running total of amount", "running total of amount per category",
     "rank by amount", "rank by amount within category lowest first", "rank branches by total amount",
     "cumulative sum of amount sorted by date", "percent of total amount per category",
+    # calculated columns on the bank file
+    "add column gst = amount * 0.18", "add column net = balance - amount", "round amount to 2 decimals",
+    "add column size = high if amount > 50000 else low",
     # not yet in the add-in (must be recognised, not guessed)
-    "highlight debits in red", "trim spaces", "add column gst = amount * 0.18",
-    "bar chart of total amount by category", "rename amount to amt", "round amount to 2 decimals",
+    "highlight debits in red", "trim spaces", "bar chart of total amount by category", "rename amount to amt",
 ]
+
+LEDGER_COMMANDS = [
+    "add column gst = amount * 0.18", "add a new column called gst = amount * 18%", "add gst as 18% of amount",
+    "gst = amount times 0.18", "create column gst as amount multiplied by 0.18",
+    "add column net = credit - debit", "add column net2 = credit-debit", "add column x = (amount + credit) / 2",
+    "add column y = amount + credit / 2", "add column with tax = amount + 18%", "add column discounted = amount - 10%",
+    "add column in lakhs = amount / 1 lakh", "add column per unit = amount / qty",
+    "add column double = [Amount (INR)] * 2", "add column gst = amount * 0.18 and sort by gst descending",
+    "add column third = amount / 3 and round third to 2 decimals", "add column k = round(amount / 3, 1)",
+    "add column double = amt text * 2", "add column x = colour * 2", "add column amount = amount * 2",
+    "set amount = amount * 2", "round amount to 1 decimal", "round amount",
+    "add column size = high if amount > 50000 else low", "add column size: if amount > 50000 then high else low",
+    "add band: high if amount > 1 lakh, medium if amount > 10000, else low",
+    "add column status = 'Record Found' if result code is 101 otherwise 'Not Found'",
+    "add column big = yes if amount > 50000", "add column big debit = yes if txn type is debit and amount > 50000 else no",
+    "add column is credit = 1 if txn type is credit else 0", "label amount over 1 lakh as large, otherwise small",
+    "flag rows where amount > 50000", "add column duration = days between start date and end date",
+    "add column m = months between start date and end date", "add column w = weeks between start date and end date",
+    "add days since end date", "add column age = years since dob", "add age from dob",
+    "add column d = days since amount", "set amount = 0 if txn type is credit", "add column big = amount > 100000",
+    "txn_type = DEBIT", "amount = 1000",
+    "add column pct = credit * 100 / amount and total pct by txn type",
+    "add column pct = credit * 100 / amount and pivot by txn type with pct",
+    "add column pct = credit * 100 / amount and average pct by txn type",
+    "add column pct = credit * 100 / amount and total credit and amount by txn type",
+]
+
+
+def make_ledger_df() -> pd.DataFrame:
+    """Same small file as tests/test_formulas.py: numbers, text dates and blanks."""
+    return pd.DataFrame({
+        "txn_type": ["DEBIT", "CREDIT", "DEBIT", "CREDIT"],
+        "amount": [1000.0, 60000.0, 250000.0, 0.0],
+        "credit": [0.0, 60000.0, 0.0, 10.0],
+        "debit": [1000.0, 0.0, 250000.0, 0.0],
+        "qty": [2, 0, 5, 1],
+        "result_code": [101, 109, 101, 109],
+        "Amount (INR)": [1.0, 2.0, 3.0, 4.0],
+        "amt text": ["₹1,200", "5", None, "abc"],
+        "start date": ["01/01/2024", "15/06/2024", None, "29/02/2024"],
+        "end date": ["31/03/2025", "14/06/2025", "01/01/2025", "28/02/2025"],
+        "dob": ["15/08/1990", "01/01/2000", "31/12/1985", None],
+    })
 
 
 def clean(o):
@@ -114,6 +159,8 @@ def clean(o):
 
 
 def cell(v):
+    if isinstance(v, pd.Timestamp):
+        return None if pd.isna(v) else v.date().isoformat()
     if v is None or (isinstance(v, float) and math.isnan(v)) or v is pd.NA:
         return None
     if hasattr(v, "item"):
@@ -145,24 +192,31 @@ def result_of(sheets, plan):
     return out
 
 
-def main():
-    df = make_bank_df()
+def build(df, commands):
     sheets = {"Sheet1": df}
     data = {str(c): [cell(v) for v in df[c]] for c in df.columns}
     cases = []
-    for cmd in COMMANDS:
+    for cmd in commands:
         plan = make_plan(sheets, cmd)
         case = {"command": cmd, "question": plan.clarification_question,
                 "plan": clean(plan.model_dump())["steps"] if plan.steps else [],
                 "summary": plan.summary, "runnable": False}
         if plan.steps and all(s.op in SUPPORTED for s in plan.steps):
             case["runnable"] = True
-            case["result"] = result_of(engine.apply_plan(sheets, plan), plan)
+            try:
+                case["result"] = result_of(engine.apply_plan(sheets, plan), plan)
+            except engine.PlanError as e:  # parses fine but can't run on this data: the add-in must refuse too
+                case["run_error"] = str(e)
         cases.append(case)
+    return {"data": data, "cases": cases}
+
+
+def main():
+    suites = {"bank": build(make_bank_df(), COMMANDS), "ledger": build(make_ledger_df(), LEDGER_COMMANDS)}
     os.makedirs(os.path.join(HERE, "..", "test", "golden"), exist_ok=True)
     with open(os.path.join(HERE, "..", "test", "golden", "cases.json"), "w") as f:
-        json.dump({"data": data, "cases": cases}, f)
-    print(f"wrote {len(cases)} cases")
+        json.dump({"suites": suites}, f)
+    print("wrote", {k: len(v["cases"]) for k, v in suites.items()})
 
 
 if __name__ == "__main__":

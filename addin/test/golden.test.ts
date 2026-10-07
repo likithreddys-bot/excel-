@@ -4,20 +4,24 @@ import { describe, expect, it } from "vitest";
 import { applyPlan } from "../src/engine/engine";
 import { makePlan } from "../src/engine/parser";
 import { Sheets, makeTable } from "../src/engine/table";
+import { isoDay } from "../src/engine/util";
 
-interface Golden {
+interface Suite {
   data: Record<string, (string | number | null)[]>;
   cases: {
-    command: string; question: string | null; plan: unknown[]; summary: string; runnable: boolean;
+    command: string; question: string | null; plan: unknown[]; summary: string; runnable: boolean; run_error?: string;
     result?: Record<string, { rows: number; ids: number[] | null; columns: string[]; order?: unknown[][]; cells?: unknown[][] | null }>;
   }[];
 }
 
-const golden: Golden = JSON.parse(readFileSync(new URL("./golden/cases.json", import.meta.url), "utf8"));
-const names = Object.keys(golden.data);
-const n = golden.data[names[0]].length;
-const rows = Array.from({ length: n }, (_, i) => names.map((c) => golden.data[c][i]));
-const sheets: Sheets = new Map([["Sheet1", makeTable(names, rows)]]);
+const golden: { suites: Record<string, Suite> } = JSON.parse(readFileSync(new URL("./golden/cases.json", import.meta.url), "utf8"));
+
+function sheetsOf(suite: Suite): Sheets {
+  const names = Object.keys(suite.data);
+  const n = suite.data[names[0]].length;
+  const rows = Array.from({ length: n }, (_, i) => names.map((c) => suite.data[c][i]));
+  return new Map([["Sheet1", makeTable(names, rows)]]);
+}
 
 /** Drop null/undefined keys so {value: null} and a missing value compare equal. */
 const clean = (o: unknown): unknown =>
@@ -28,8 +32,9 @@ const clean = (o: unknown): unknown =>
 
 const sameSet = (a: string[], b: string[]) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 
-describe("matches the Python reference parser", () => {
-  for (const c of golden.cases) {
+for (const [suiteName, suite] of Object.entries(golden.suites)) describe(`matches the Python reference: ${suiteName}`, () => {
+  const sheets = sheetsOf(suite);
+  for (const c of suite.cases) {
     it(JSON.stringify(c.command), () => {
       const plan = makePlan(sheets, c.command);
       if (c.question !== null) {
@@ -49,6 +54,10 @@ describe("matches the Python reference parser", () => {
       expect(clean(plan.steps)).toEqual(c.plan);
       expect(plan.summary).toBe(c.summary);
 
+      if (c.run_error) {
+        expect(() => applyPlan(sheets, plan)).toThrow(c.run_error.slice(0, 50));
+        return;
+      }
       const out = applyPlan(sheets, plan);
       expect(sameSet([...out.keys()], Object.keys(c.result!))).toBe(true);
       for (const [name, expected] of Object.entries(c.result!)) {
@@ -62,7 +71,10 @@ describe("matches the Python reference parser", () => {
         if (expected.cells) {
           // Summaries are compared cell by cell (numbers to 6 decimals; Python NaN is a blank here).
           const norm = (v: unknown) => (typeof v === "number" ? Math.round(v * 1e6) / 1e6 : v ?? null);
-          const got = Array.from({ length: t.nrows }, (_, i) => t.columns.map((x) => norm(x.values[i])));
+          // Real Excel dates (serial numbers) compare as ISO days; text dates stay as written.
+          const shown = (x: (typeof t.columns)[number], i: number) =>
+            x.kind === "date" && typeof x.values[i] === "number" && x.time?.[i] != null ? isoDay(x.time[i]!) : x.values[i];
+          const got = Array.from({ length: t.nrows }, (_, i) => t.columns.map((x) => norm(shown(x, i))));
           expect(got).toEqual(expected.cells.map((r) => r.map(norm)));
         }
         if (expected.order) {

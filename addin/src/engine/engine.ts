@@ -1,6 +1,7 @@
 /** Runs a Plan on tables. Pure functions: the only code that touches the data. */
-import type { Condition, DatePart, DatePartStep, FilterStep, Plan, Step } from "./plan";
+import type { ComputeStep, Condition, DatePart, DatePartStep, FilterStep, LabelStep, Plan, Step } from "./plan";
 import { calculate, groupBy, pivot, topN } from "./aggregate";
+import { evaluate } from "./evaluate";
 import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
 import { Cell, Column, Sheets, Table, getColumn, makeColumn, pick, timesOf } from "./table";
 import { DAY_MS, isoDay, parseDateText, todayMs } from "./util";
@@ -143,6 +144,40 @@ function splitBy(t: Table, name: string): [string, Table][] {
   return labels.map((l) => [l, pick(t, groups.get(l)!)]);
 }
 
+function checkNew(t: Table, name: string, replace: boolean): void {
+  if (getColumn(t, name) && !replace) throw new PlanError(`There is already a column called ${name}. Use 'set ${name} = ...' to overwrite it.`);
+}
+
+/** Add `made` as a new last column, or replace the column of the same name where it stands. */
+function putColumn(t: Table, made: Column): Table {
+  const at = t.columns.findIndex((c) => c.name === made.name);
+  const columns = at < 0 ? [...t.columns, made] : t.columns.map((c, i) => (i === at ? made : c));
+  return { columns, nrows: t.nrows };
+}
+
+function compute(t: Table, step: ComputeStep): Table {
+  checkNew(t, step.name, step.replace);
+  const old = getColumn(t, step.name);
+  return putColumn(t, makeColumn(step.name, evaluate(t, step.expr), old?.format));
+}
+
+function label(t: Table, step: LabelStep): Table {
+  checkNew(t, step.name, step.replace);
+  const masks = step.cases.map((c) => filterMask(t, c.when));
+  const values = step.cases.map((c) => c.value).concat(step.default !== null ? [step.default] : []);
+  const old = getColumn(t, step.name);
+  // Overwriting a column with no "else": rows that match no rule keep their current value.
+  const keep = step.replace && step.default === null;
+  const numeric = values.every((v) => /^-?\d+(\.\d+)?$/.test(v)) && (!keep || old?.kind === "number");
+  const put = (v: string): Cell => (numeric ? parseFloat(v) : v);
+  const out: Cell[] = keep ? [...old!.values] : new Array(t.nrows).fill(null);
+  if (step.default !== null) out.fill(put(step.default));
+  for (let k = step.cases.length - 1; k >= 0; k--) { // first matching case wins
+    for (let i = 0; i < t.nrows; i++) if (masks[k][i]) out[i] = put(step.cases[k].value);
+  }
+  return putColumn(t, makeColumn(step.name, out, old?.format));
+}
+
 function unsupported(step: Step): never {
   throw new PlanError(`The '${step.op}' step isn't available in this version of the add-in yet.`);
 }
@@ -164,6 +199,8 @@ function applyStep(t: Table, step: Step): Table | [string, Table][] {
     case "pivot": return pivot(t, step);
     case "top_n": return topN(t, step);
     case "calculate": return calculate(t, step);
+    case "compute": return compute(t, step);
+    case "label": return label(t, step);
     default: return unsupported(step);
   }
 }
