@@ -70,4 +70,5 @@ When porting a new feature, add its commands to `tools/gen_golden.py` first. Gen
 
 ## Not done yet
 
-- The Office.js read/write layer (`src/excel/io.ts`) has not yet been run inside a real Excel; the engine and task pane have been tested in a browser only.
+- Tried so far in real Excel (on the web): reading a table, previews, writing result sheets, charts, highlights, formulas, lookups and the menus. Still to prove at scale: files with lakhs of rows, and Excel for Windows and Mac.
+- Hosting at a real web address for a team (see `DEPLOY.md`).
