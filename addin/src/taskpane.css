@@ -75,3 +75,5 @@ textarea { font: inherit; padding: 8px; border: 1px solid var(--line); border-ra
 .field { display: flex; flex-direction: column; gap: 3px; }
 .field label { font-size: 12px; color: var(--muted); }
 .msg select, .msg input[type="text"] { font: inherit; padding: 5px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); width: 100%; }
+
+#status { font-size: 12px; margin-top: 6px; }

@@ -7,6 +7,17 @@ import { Created, Host, HostError, Source, SourceRef, WriteOutcome } from "../ho
 
 const READ_CELLS_PER_CHUNK = 100_000;
 const WRITE_CELLS_PER_CHUNK = 50_000;
+/** Excel's own request limit is about 5 MB; stay well under it when a chunk holds long text. */
+const WRITE_BYTES_PER_CHUNK = 1_500_000;
+/** More cells than this and the browser tab holding them gets unreliable. */
+const MAX_CELLS = 8_000_000;
+
+/** The pane sets this to show progress ("Reading 300,000 of 1,000,000 rows…") during long reads and writes. */
+export const progress: { report: (message: string) => void } = { report: () => {} };
+const num = (n: number) => n.toLocaleString("en-IN");
+
+/** Excel refused a request because it was too big: worth retrying in smaller pieces. */
+const isTooBig = (e: unknown) => /payload|too large|size limit|RequestPayload|ResponsePayload|exceeds/i.test(`${(e as { code?: string })?.code ?? ""} ${(e as Error)?.message ?? ""}`);
 
 /** Header text for each column: blanks become "Column N", repeats get " (2)". */
 function headerNames(raw: unknown[]): string[] {
@@ -44,6 +55,10 @@ async function readTable(ctx: Excel.RequestContext, range: Excel.Range): Promise
   await ctx.sync();
   const { rowCount, columnCount } = range;
   if (rowCount < 2) throw new HostError("I need a header row and at least one row of data. Click a cell inside your table first.");
+  if (rowCount * columnCount > MAX_CELLS) {
+    throw new HostError(`This table has ${num(rowCount - 1)} rows and ${columnCount} columns (${num(rowCount * columnCount)} cells), which is more than I can safely work on at once (about ${num(MAX_CELLS)} cells). `
+      + "Select just the columns you need, or filter the data in Excel first, then try again.");
+  }
 
   // The first data row's number formats tell dates from plain numbers.
   const firstData = range.getRow(1);
@@ -55,12 +70,20 @@ async function readTable(ctx: Excel.RequestContext, range: Excel.Range): Promise
   const formats = firstData.numberFormat[0].map((f) => String(f));
 
   const rows: Cell[][] = [];
-  const step = Math.max(1, Math.floor(READ_CELLS_PER_CHUNK / columnCount));
-  for (let r = 1; r < rowCount; r += step) {
-    const part = range.getCell(r, 0).getResizedRange(Math.min(step, rowCount - r) - 1, columnCount - 1);
-    part.load("values");
-    await ctx.sync();
-    for (const row of part.values) rows.push(row as Cell[]);
+  let step = Math.max(1, Math.floor(READ_CELLS_PER_CHUNK / columnCount));
+  for (let r = 1; r < rowCount;) {
+    const h = Math.min(step, rowCount - r);
+    try {
+      const part = range.getCell(r, 0).getResizedRange(h - 1, columnCount - 1);
+      part.load("values");
+      await ctx.sync();
+      for (const row of part.values) rows.push(row as Cell[]);
+      r += h;
+      if (rowCount > 20_000) progress.report(`Reading your table: ${num(Math.min(r - 1, rowCount - 1))} of ${num(rowCount - 1)} rows…`);
+    } catch (e) {
+      if (!isTooBig(e) || step <= 50) throw e;
+      step = Math.max(50, Math.floor(step / 2)); // Excel said that was too much at once: try half
+    }
   }
   return makeTable(names, rows, formats);
 }
@@ -68,16 +91,31 @@ async function readTable(ctx: Excel.RequestContext, range: Excel.Range): Promise
 export class ExcelHost implements Host {
   kind = "excel" as const;
 
-  async readSource(ref?: SourceRef): Promise<Source> {
+  /** A big table is read once and kept until Excel says something on that sheet changed (reading 1,000,000 rows takes a while). */
+  private cache: { key: string; source: Source; dirty: boolean } | null = null;
+  private watching = new Set<string>();
+
+  async readSource(ref?: SourceRef, fresh = false): Promise<Source> {
     return Excel.run(async (ctx) => {
       const { range, region } = await locate(ctx, ref);
       range.load("address");
       range.worksheet.load("name");
       await ctx.sync();
-      const table = await readTable(ctx, range);
       const sheet = range.worksheet.name;
       const address = range.address.split("!").pop()!;
-      return { ref: { sheet, address, region }, label: `${sheet}!${address}`, table };
+      const key = `${sheet}!${address}`;
+      if (!fresh && this.cache && this.cache.key === key && !this.cache.dirty) return { ...this.cache.source, ref: { sheet, address, region } };
+      const table = await readTable(ctx, range);
+      const source: Source = { ref: { sheet, address, region }, label: key, table };
+      if (table.nrows > 20_000) {
+        this.cache = { key, source, dirty: false };
+        if (!this.watching.has(sheet)) {
+          this.watching.add(sheet);
+          ctx.workbook.worksheets.getItem(sheet).onChanged.add(async () => { if (this.cache) this.cache.dirty = true; });
+          await ctx.sync();
+        }
+      } else if (this.cache?.key === key) this.cache = null;
+      return source;
     }).catch(rethrow);
   }
 
@@ -191,12 +229,28 @@ async function writeTable(ctx: Excel.RequestContext, ws: Excel.Worksheet, t: Tab
   const cols = t.columns.length;
   if (!cols) return null;
   ws.getRangeByIndexes(0, 0, 1, cols).values = [t.columns.map((c) => c.name)];
-  const step = Math.max(1, Math.floor(WRITE_CELLS_PER_CHUNK / cols));
-  for (let r = 0; r < t.nrows; r += step) {
-    const h = Math.min(step, t.nrows - r);
+  // Chunks hold at most WRITE_CELLS_PER_CHUNK cells and about WRITE_BYTES_PER_CHUNK of text, whichever comes first.
+  for (let r = 0; r < t.nrows;) {
+    let h = 0, cells = 0, bytes = 0;
+    while (r + h < t.nrows && cells < WRITE_CELLS_PER_CHUNK && bytes < WRITE_BYTES_PER_CHUNK) {
+      for (const c of t.columns) { const v = c.values[r + h]; bytes += typeof v === "string" ? v.length + 2 : 8; }
+      cells += cols;
+      h++;
+    }
     const values = Array.from({ length: h }, (_, i) => t.columns.map((c) => c.values[r + i] ?? ""));
-    ws.getRangeByIndexes(1 + r, 0, h, cols).values = values;
-    await ctx.sync();
+    let size = h;
+    for (;;) {
+      try {
+        ws.getRangeByIndexes(1 + r, 0, size, cols).values = values.slice(0, size);
+        await ctx.sync();
+        break;
+      } catch (e) {
+        if (!isTooBig(e) || size <= 20) throw e;
+        size = Math.max(20, Math.floor(size / 2)); // too big for Excel: send it in halves
+      }
+    }
+    r += size;
+    if (t.nrows > 20_000) progress.report(`Writing the result: ${num(Math.min(r, t.nrows))} of ${num(t.nrows)} rows…`);
   }
   t.columns.forEach((c, j) => {
     if (c.format && t.nrows) (ws.getRangeByIndexes(1, j, t.nrows, 1) as { numberFormat: unknown }).numberFormat = c.format;
@@ -215,7 +269,8 @@ async function writeTable(ctx: Excel.RequestContext, ws: Excel.Worksheet, t: Tab
     await ctx.sync();
   }
   ws.freezePanes.freezeRows(1);
-  used.format.autofitColumns();
+  // Fit the column widths to the first rows only: measuring a million rows would take minutes.
+  ws.getRangeByIndexes(0, 0, Math.min(t.nrows + 1, 500), cols).format.autofitColumns();
   await ctx.sync();
   return tableName;
 }

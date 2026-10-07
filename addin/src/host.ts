@@ -31,7 +31,7 @@ export interface WriteOutcome {
 export interface Host {
   kind: "excel" | "demo";
   /** Read the user's table: from `ref` if given, else from their current selection. */
-  readSource(ref?: SourceRef): Promise<Source>;
+  readSource(ref?: SourceRef, fresh?: boolean): Promise<Source>;
   /** Names of the workbook's visible sheets (other sheets can be looked up, appended or compared). */
   listSheets(): Promise<string[]>;
   /** The whole used range of a sheet, first row as headers. */

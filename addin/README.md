@@ -54,6 +54,12 @@ sentence ──► parser.ts ──► Plan (typed steps) ──► engine.ts �
 | `src/excel/demo.ts` | Stand-in workbook for browsers |
 | `src/taskpane.ts` | The task pane UI |
 
+## Big tables
+
+Tables of up to about 8 million cells (for example 800,000 rows by 10 columns) are read; bigger ones are refused with a message telling you to select fewer columns or filter first. Reading and writing in Excel go in chunks that shrink automatically if Excel says a request is too big, with progress shown in the pane. A big table is read once and reused until something on its sheet changes (press **Use my table** to force a fresh read).
+
+On the add-in's side (not counting Excel's own reading and writing time), 1,000,000 rows by 10 columns take a few seconds per command (`npm run bench -- 1000000` prints the timings). `python3 tools/make_big_file.py 200000 big.xlsx` makes a fake bank file of any size to try it on.
+
 ## Putting it in front of a team
 
 See [`DEPLOY.md`](DEPLOY.md): hosting, `npm run manifest -- <https address>`, installing for everyone from the Microsoft 365 admin center, and a short note on what leaves the computer (nothing) for security review.
@@ -70,5 +76,5 @@ When porting a new feature, add its commands to `tools/gen_golden.py` first. Gen
 
 ## Not done yet
 
-- Tried so far in real Excel (on the web): reading a table, previews, writing result sheets, charts, highlights, formulas, lookups and the menus. Still to prove at scale: files with lakhs of rows, and Excel for Windows and Mac.
+- Tried so far in real Excel (on the web): reading a table, previews, writing result sheets, charts, highlights, formulas, lookups and the menus. Still to prove: reading and writing lakhs of rows inside Excel itself (the add-in's own work is measured, see "Big tables"), and Excel for Windows and Mac.
 - Hosting at a real web address for a team (see `DEPLOY.md`).
