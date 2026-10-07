@@ -101,6 +101,8 @@ export function describe(step: Step): string {
     case "rename": return "Rename " + Object.entries(step.mapping).map(([a, b]) => `${a} → ${b}`).join(", ");
     case "convert": return `Convert ${step.columns.join(", ")} to ${step.to}`;
     case "compute": return `${step.replace ? "Replace" : "Add"} column '${step.name}' = ${step.expr.replace(/\[([^\]]+)\]/g, "$1")}`;
+    case "formula": return `${step.replace ? "Replace" : "Add"} column '${step.name}' = ${step.formula}`;
+    case "filter_formula": return `${step.keep ? "Keep" : "Remove"} rows where ${step.formula} is true`;
     case "label": {
       const rules = step.cases.map((c) => `'${c.value}' if ${noPrefix(describeFilter(c.when))}`).join("; ");
       const other = step.default !== null ? `; otherwise '${step.default}'`

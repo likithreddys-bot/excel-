@@ -40,6 +40,10 @@ export interface MergeColumnsStep { op: "merge_columns"; columns: string[]; sepa
 export interface RenameStep { op: "rename"; mapping: Record<string, string> }
 export interface ConvertStep { op: "convert"; columns: string[]; to: "number" | "date" | "text" }
 export interface ComputeStep { op: "compute"; name: string; expr: string; replace: boolean }
+/** A column made with an Excel-style formula, e.g. IF([amount]>50000,"High","Low"). */
+export interface FormulaStep { op: "formula"; name: string; formula: string; replace: boolean }
+/** Keep (or remove) the rows where an Excel-style formula is true. */
+export interface FormulaFilterStep { op: "filter_formula"; formula: string; keep: boolean }
 export interface LabelCase { when: FilterStep; value: string }
 export interface LabelStep { op: "label"; name: string; cases: LabelCase[]; default: string | null; replace: boolean }
 export interface LookupStep { op: "lookup"; file: string; left_on: string; right_on: string; columns: string[] }
@@ -61,7 +65,7 @@ export type Step =
   | FilterStep | SelectColumnsStep | DropColumnsStep | SortStep | DedupeStep | GroupByStep
   | SplitByStep | PivotStep | TopNStep | DatePartStep | CalculateStep
   | CleanTextStep | FillBlanksStep | DropBlankRowsStep | ReplaceStep | SplitColumnStep
-  | MergeColumnsStep | RenameStep | ConvertStep | ComputeStep | LabelStep
+  | MergeColumnsStep | RenameStep | ConvertStep | ComputeStep | LabelStep | FormulaStep | FormulaFilterStep
   | LookupStep | AppendStep | CompareStep | HighlightStep | NumberFormatStep | ChartStep;
 
 export interface Plan {

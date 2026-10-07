@@ -1,8 +1,9 @@
 /** Runs a Plan on tables. Pure functions: the only code that touches the data. */
-import type { ComputeStep, Condition, DatePart, DatePartStep, FilterStep, LabelStep, Plan, Step } from "./plan";
+import type { ComputeStep, FormulaFilterStep, FormulaStep, Condition, DatePart, DatePartStep, FilterStep, LabelStep, Plan, Step } from "./plan";
 import { calculate, groupBy, pivot, topN } from "./aggregate";
 import { cleanText, convertColumns, dropBlankRows, fillBlanks, mergeColumns, renameColumns, replaceText, splitColumn } from "./clean";
 import { evaluate } from "./evaluate";
+import { FormulaSyntaxError, columnResolver, compileFormula } from "./formula";
 import { append, compare as compareSheets, lookup } from "./files";
 import { checkFormat } from "./format";
 import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
@@ -172,6 +173,33 @@ function compute(t: Table, step: ComputeStep): Table {
   return putColumn(t, makeColumn(step.name, evaluate(t, step.expr), old?.format));
 }
 
+function compileFor(t: Table, formula: string) {
+  try {
+    const compiled = compileFormula(formula, columnResolver(t.columns.map((c) => c.name)));
+    need(t, compiled.columns);
+    return compiled;
+  } catch (e) {
+    if (e instanceof FormulaSyntaxError) throw new PlanError(e.message);
+    throw e;
+  }
+}
+
+function formulaColumn(t: Table, step: FormulaStep, notes: string[]): Table {
+  checkNew(t, step.name, step.replace);
+  const compiled = compileFor(t, step.formula);
+  const { values, errors } = compiled.run(t);
+  if (errors) notes.push(`${errors.toLocaleString("en-US")} row(s) gave an error in the formula (left blank).`);
+  const old = getColumn(t, step.name);
+  return putColumn(t, makeColumn(step.name, values, compiled.kind === "date" ? "dd/mm/yyyy" : old?.format));
+}
+
+function formulaFilter(t: Table, step: FormulaFilterStep, notes: string[]): Table {
+  const { values, errors } = compileFor(t, step.formula).run(t);
+  if (errors) notes.push(`${errors.toLocaleString("en-US")} row(s) gave an error in the formula and were treated as not matching.`);
+  const hit = values.map((v) => v === true || (typeof v === "number" && v !== 0));
+  return pick(t, hit.flatMap((h, i) => (h === step.keep ? [i] : [])));
+}
+
 function label(t: Table, step: LabelStep): Table {
   checkNew(t, step.name, step.replace);
   const masks = step.cases.map((c) => filterMask(t, c.when));
@@ -222,6 +250,8 @@ function applyStep(t: Table, step: Step, files: Files, notes: string[]): Table |
     case "lookup": return lookup(t, step, otherSheet(files, step.file), notes);
     case "append": return append(t, step, otherSheet(files, step.file), notes);
     case "compare": return compareSheets(t, step, otherSheet(files, step.file), notes);
+    case "formula": return formulaColumn(t, step, notes);
+    case "filter_formula": return formulaFilter(t, step, notes);
     case "compute": return compute(t, step);
     case "label": return label(t, step);
     default: return unsupported(step);

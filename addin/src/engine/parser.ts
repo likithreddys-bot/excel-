@@ -5,6 +5,7 @@
  */
 import { COLORS, describe } from "./describe";
 import { applyPlan, PlanError } from "./engine";
+import { FORMULA_FUNCTIONS, FormulaSyntaxError, columnResolver, compileFormula } from "./formula";
 import type { Aggregation, Condition, DatePartStep, FilterStep, GroupByStep, PivotStep, Plan, SortStep, Step, TopNStep } from "./plan";
 import { Cell, Sheets, Table, combine, isBlankCell } from "./table";
 import {
@@ -263,6 +264,7 @@ export class Parser {
       out.push(`only rows where ${cat} is ${typeof best.v === "number" ? fmt(best.v) : String(best.v)}`, `split by ${cat}`);
     }
     if (nums.length >= 2) out.push(`add column ratio = ${nums[1]} * 100 / ${nums[0]}`);
+    if (num) out.push(`add column size = IF(${num} > 1000, "High", "Low")`);
     out.push("keep columns " + this.columns.slice(0, 3).join(", "));
     return out.slice(0, 8);
   }
@@ -348,6 +350,8 @@ export class Parser {
       if (fm) return this.parseFileCommand(cl, fm);
     }
     // Formatting first: "highlight duplicates in pan" must colour rows, never remove them.
+    const ff = /^\s*(?:please\s+)?(keep|show|only|select|filter|remove|delete|drop|exclude|hide)(?:\s+(?:only\s+)?(?:the\s+)?rows?)?\s+(?:where|if|when|with|for)\s*=\s*(.+)$/i.exec(cl);
+    if (ff) return [this.formulaFilter(ff[2], !/^(?:remove|delete|drop|exclude|hide)$/i.test(ff[1]))];
     const formatting = this.formatCommand(cl);
     if (formatting !== null) return formatting;
     if (/\bduplicat|\bde-?dup|\b(?:unique|distinct)\s+rows\b/.test(low)) return [this.parseDedupe(cl)];
@@ -378,6 +382,7 @@ export class Parser {
   /** Commands that make a new column. Returns null if `cl` isn't one. */
   private formulaCommand(cl: string): Step[] | null {
     const text = cl.trim().replace(/\.+$/, "");
+    if (/^=/.test(text)) throw new ParseError("Give the new column a name, e.g. add column grade = IF([amount] > 50000, \"High\", \"Low\")");
     let m = /^\s*(?:please\s+)?round(?:\s+off)?\s+(?:the\s+)?(?:column\s+)?(?<x>.+?)(?:\s+to\s+(?<n>\d+|one|two|three|four)\s+(?:decimals?|decimal\s+places?|places?|digits?))?\s*$/i.exec(text);
     if (m) {
       const c = this.column(m.groups!.x);
@@ -422,9 +427,15 @@ export class Parser {
       throw new ParseError(`There is already a column called ${existing}. Say 'set ${existing} = ...' to overwrite it, or pick a new name.`);
     }
     if (replace) name = existing!;
+    const typed = this.formulaText(rhs);
+    if (typed !== null) return this.formulaStep(name, typed, replace);
     if (/\bif\b|\b(?:else|otherwise)\b/i.test(rhs)) return this.labelRhs(name, rhs, replace);
     try {
-      return { op: "compute", name, expr: this.parseExpression(rhs), replace };
+      const expr = this.parseExpression(rhs);
+      // Arithmetic on a date column ("date + 30") is formula territory: dates are day numbers there, as in Excel.
+      const usesDate = [...expr.matchAll(/\[([^\]]+)\]/g)].some((m) => this.dateCols.includes(m[1]));
+      if (usesDate && !/\b(?:days|weeks|months|years|today)\(/.test(expr)) return this.formulaStep(name, expr, replace);
+      return { op: "compute", name, expr, replace };
     } catch (e) {
       // "flag = amount > 100000": a condition on its own becomes a Yes/No column.
       if (e instanceof ParseError && /[<>]|\b(?:is|are|over|under|above|below|more|less|greater|contains?|between|empty)\b/i.test(rhs)) {
@@ -669,6 +680,81 @@ export class Parser {
     const cols = this.columnList(body, "merge");
     if (cols.length < 2) throw new ParseError("Merge which columns? e.g. merge first and last into full name");
     return { op: "merge_columns", columns: cols, separator, name: name || cols.join(" ") };
+  }
+
+  // ---------- Excel-style formulas ----------
+
+  /** The formula behind `rhs`: typed in Excel syntax (IF(...), =LEFT(...)) or said in plain words. Null if it's neither. */
+  private formulaText(rhs: string): string | null {
+    const t = rhs.trim().replace(/\.+$/, "");
+    // These stay on the older plain-English path (round(...), abs(...), days(a, b) ...); any other NAME( is a formula,
+    // even a misspelt one, so the user gets "did you mean IF?" rather than a vague "couldn't understand".
+    const older = new Set(["round", "abs", "days", "weeks", "months", "years", "today", "now"]);
+    const call = [...t.replace(/"[^"]*"|\[[^\]]*\]/g, "").matchAll(/\b([A-Za-z_][A-Za-z0-9_.]*)\s*\(/g)].some((m) => !older.has(m[1].toLowerCase()));
+    if (t.startsWith("=") || call || /&/.test(t.replace(/"[^"]*"/g, ""))) return t.replace(/^=/, "");
+    return this.plainFormula(t);
+  }
+
+  private formulaStep(name: string, formula: string, replace: boolean): Step {
+    try {
+      compileFormula(formula, columnResolver(this.columns));
+    } catch (e) {
+      if (e instanceof FormulaSyntaxError) throw new ParseError(e.message);
+      throw e;
+    }
+    return { op: "formula", name, formula, replace };
+  }
+
+  private formulaFilter(formula: string, keep: boolean): Step {
+    try {
+      compileFormula(formula, columnResolver(this.columns));
+    } catch (e) {
+      if (e instanceof FormulaSyntaxError) throw new ParseError(e.message);
+      throw e;
+    }
+    return { op: "filter_formula", formula: formula.trim(), keep };
+  }
+
+  /** Everyday phrasing for common text and date jobs, turned into the formula Excel people would write. */
+  private plainFormula(t: string): string | null {
+    const col = (x: string): string | null => { const c = this.column(x.trim()); return c === null ? null : `[${c}]`; };
+    const lit = (x: string) => `"${unquote(x).replace(/"/g, '""')}"`;
+    let m: RegExpExecArray | null;
+    if ((m = /^(?:the\s+)?first\s+(\d+)\s+(?:characters?|chars?|letters?|digits?)\s+(?:of|from)\s+(.+)$/i.exec(t))) { const c = col(m[2]); return c && `LEFT(${c}, ${m[1]})`; }
+    if ((m = /^(?:the\s+)?last\s+(\d+)\s+(?:characters?|chars?|letters?|digits?)\s+(?:of|from)\s+(.+)$/i.exec(t))) { const c = col(m[2]); return c && `RIGHT(${c}, ${m[1]})`; }
+    if ((m = /^(?:the\s+)?(?:characters?|chars?|letters?)\s+(\d+)\s+(?:to|through|-)\s+(\d+)\s+(?:of|from)\s+(.+)$/i.exec(t))) { const c = col(m[3]); return c && `MID(${c}, ${m[1]}, ${+m[2] - +m[1] + 1})`; }
+    if ((m = /^(?:the\s+)?(?:length|number\s+of\s+characters|character\s+count)\s+of\s+(.+)$/i.exec(t))) { const c = col(m[1]); return c && `LEN(${c})`; }
+    if ((m = /^(?:the\s+)?text\s+(before|after)\s+(?:the\s+)?("[^"]*"|'[^']*'|\S+)\s+(?:in|of|from)\s+(.+)$/i.exec(t))) {
+      const c = col(m[3]); if (!c) return null;
+      const d = lit(m[2]);
+      return m[1].toLowerCase() === "before" ? `IFERROR(LEFT(${c}, FIND(${d}, ${c}) - 1), "")` : `IFERROR(MID(${c}, FIND(${d}, ${c}) + LEN(${d}), LEN(${c})), "")`;
+    }
+    if ((m = /^(?:the\s+)?(?:name\s+of\s+the\s+month|month\s+name)\s+(?:of|from)\s+(.+)$/i.exec(t))) { const c = col(m[1]); return c && `TEXT(${c}, "mmmm")`; }
+    if ((m = /^(?:the\s+)?(?:day\s+name|weekday\s+name|name\s+of\s+the\s+(?:day|weekday)|day\s+of\s+the\s+week)\s+(?:of|from)\s+(.+)$/i.exec(t))) { const c = col(m[1]); return c && `TEXT(${c}, "dddd")`; }
+    if ((m = /^(?:the\s+)?(year|month|day)\s+(?:of|from)\s+(.+)$/i.exec(t))) { const c = col(m[2]); return c && `${m[1].toUpperCase()}(${c})`; }
+    if ((m = /^(?:the\s+)?(?:end|last\s+day)\s+of\s+(?:the\s+)?month\s+(?:of|for)\s+(.+)$/i.exec(t))) { const c = col(m[1]); return c && `EOMONTH(${c}, 0)`; }
+    if ((m = /^(.+?)\s+(?:plus|\+|add)\s+(\d+)\s+(months?|years?|days?)$/i.exec(t))) {
+      const c = this.column(m[1].trim());
+      if (!c || !this.dateCols.includes(c)) return null;
+      const n = +m[2], unit = m[3].toLowerCase();
+      return unit.startsWith("month") ? `EDATE([${c}], ${n})` : unit.startsWith("year") ? `EDATE([${c}], ${12 * n})` : `[${c}] + ${n}`;
+    }
+    if ((m = /^(?:the\s+)?(upper|lower|proper|title)\s*case\s+(?:of\s+)?(.+)$/i.exec(t)) || (m = /^(.+?)\s+in\s+(upper|lower|proper|title)\s*case$/i.exec(t))) {
+      const kind = (/^(?:upper|lower|proper|title)$/i.test(m[1]) ? m[1] : m[2]).toLowerCase();
+      const c = col(/^(?:upper|lower|proper|title)$/i.test(m[1]) ? m[2] : m[1]);
+      return c && `${kind === "title" ? "PROPER" : kind.toUpperCase()}(${c})`;
+    }
+    if ((m = /^(.+?)\s+as\s+(?:a\s+)?number$/i.exec(t))) { const c = col(m[1]); return c && `VALUE(${c})`; }
+    // "amount / qty, or 0 if error": wrap the sum in IFERROR (only for plain arithmetic).
+    if ((m = /^(.+?)\s*,?\s*(?:or|otherwise)\s+(.+?)\s+(?:if|when|in\s+case\s+of)\s+(?:error|invalid|missing|blank|zero\s+division|dividing\s+by\s+zero)$/i.exec(t))) {
+      try {
+        const expr = this.parseExpression(m[1]);
+        if (/\b(?:days|weeks|months|years|round)\(/.test(expr)) return null;
+        const alt = parseNumber(m[2]);
+        return `IFERROR(${expr}, ${alt !== null ? fmt(alt) : lit(m[2])})`;
+      } catch { return null; }
+    }
+    return null;
   }
 
   // ---------- formatting: highlight, number formats, charts ----------
@@ -1492,16 +1578,40 @@ export function splitClauses(request: string): string[] {
   // Quoted text ('"Rs. "', '", "') is set aside so the splitting below can't break it up.
   const quoted: string[] = [];
   text = text.replace(QUOTED, (m) => { quoted.push(m); return `__Q${quoted.length - 1}__`; });
+  // [Column names] and (bracketed parts, function arguments) are set aside too: a comma or "and" inside a formula
+  // such as IF(a>1,"x",TRIM(b)) must not start a new command.
+  text = text.replace(/\[[^\]]*\]/g, (m) => { quoted.push(m); return `__Q${quoted.length - 1}__`; });
+  text = protectParentheses(text, quoted);
   text = text.replace(/,(?=[^\s\d])/g, ", "); // "date,amount" -> "date, amount"; not "5,000"
   const clauses: string[] = [];
   for (const part of text.split(CLAUSE_SPLIT)) {
     for (const clause of splitAssignments(part ?? "")) {
       if (!strip(clause, " ,.")) continue;
       const cleaned = strip(clause, " ,.").replace(/^(?:(?:and|also|then|now|please|actually|next|finally|do)\b[\s,]*)+/i, "");
-      clauses.push(cleaned.replace(/__Q(\d+)__/g, (_, n: string) => quoted[+n]));
+      let restored = cleaned;
+      for (let pass = 0; pass < 5 && /__Q\d+__/.test(restored); pass++) restored = restored.replace(/__Q(\d+)__/g, (_, n: string) => quoted[+n]);
+      clauses.push(restored);
     }
   }
   return clauses;
+}
+
+/** Replace each outermost (...) group with a placeholder (unbalanced text is left alone). */
+function protectParentheses(text: string, store: string[]): string {
+  let depth = 0, start = -1, out = "", last = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === "(") { if (depth === 0) start = i; depth++; }
+    else if (text[i] === ")" && depth > 0) {
+      depth--;
+      if (depth === 0) {
+        out += text.slice(last, start);
+        store.push(text.slice(start, i + 1));
+        out += `__Q${store.length - 1}__`;
+        last = i + 1;
+      }
+    }
+  }
+  return depth === 0 ? out + text.slice(last) : text;
 }
 
 function splitAssignments(clause: string): string[] {

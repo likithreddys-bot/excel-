@@ -11,12 +11,15 @@ Describe what you want done with your table in plain English, inside Excel. The 
 - **Rows and columns:** filter rows, sort, split into one sheet per value (including by month / year / weekday), remove duplicates, keep or drop columns.
 - **Summaries:** `total amount by category`, `how many debits per branch`, `monthly totals by category`, `pivot amount by category and txn type` (with totals), `top 10 by amount`, `lowest 3 amounts per category`, `add % of total amount`, `running total of amount per category`, `rank by amount`.
 - **Calculated columns:** `add column gst = amount * 0.18`, `add column net = credit - debit`, `add column size = high if amount > 50000 else low`, `add days since txn date`, `round amount to 2 decimals`, `set amount = amount * 100`, `flag rows where amount > 50000`. A column made by a formula is totalled the Excel "calculated field" way in later totals and pivots.
+- **Excel-style formulas:** type them the way you would in Excel, with column names in `[brackets]`: `add column grade = IF(amount>50000,"High",IF(amount>10000,"Medium","Low"))`, `add column each = IFERROR(amount/qty, 0)`, `add column user = LEFT(email, FIND("@", email) - 1)`, `add column due = EOMONTH(date, 1)`, `add column dup = COUNTIF(pan, pan) > 1`, `keep rows where =AND(type="DEBIT", amount>1000)`. About 70 functions: IF, IFS, IFERROR, AND, OR, NOT, SWITCH, ROUND, MOD, SUM / AVERAGE / MIN / MAX over a whole column, COUNTIF(S), SUMIF(S), AVERAGEIF, LEFT, RIGHT, MID, LEN, UPPER, LOWER, PROPER, TRIM, SUBSTITUTE, FIND, SEARCH, TEXT, VALUE, CONCAT, TEXTJOIN, TODAY, YEAR, MONTH, DAY, WEEKDAY, EDATE, EOMONTH, DATE, DATEDIF, NETWORKDAYS and more. A wrong name gets "did you mean…?"; a row that errors is left blank and counted in the preview.
+- **Plain-English text and dates:** `first 3 characters of name`, `last 4 characters of pan`, `text before @ in email`, `year of date`, `name of the month of date`, `end of month of date`, `date plus 2 months`, `amount / qty, or 0 if error`.
 - **Cleaning:** `trim spaces`, `make city title case`, `fill blank city with Unknown`, `fill down city`, `remove blank rows`, `replace "UPI/" with "" in description`, `split name into first and last`, `combine city and state into location`, `rename amt to amount`, `convert amt to number` (understands ₹, Rs., INR, commas), `change txn date to date`.
 - **Other sheets in the workbook:** `bring email from Customers on pan` (VLOOKUP), `rows not in March on pan`, `rows also in Customers`, `append March`. The sheet is named in the sentence; only the sheets you mention are read.
 - **Beginner mode:** when you press **Use my table**, the add-in looks the table over and lists what it noticed (repeated rows, empty rows, stray spaces, amounts saved as text, the same value spelled differently, blanks, dates stored two ways). Each item has a **Fix…** button that opens the usual preview, so nothing changes without a look.
+- **Highlights, number formats and charts:** `highlight rows where amount > 1 lakh in red`, `highlight duplicates in pan`, `show amount in rupees`, `show date as dd-mmm-yyyy`, `bar chart of total amount by category`, `line chart of amount by month`. Applied to the new sheet; the preview shows which rows will be coloured and what a chart will plot.
 - **Several at once:** `only debits over 5000, split by category and sort by amount descending`.
 
-Results are written as values (so they match the preview exactly), not yet as live PivotTables or formulas. Highlights, number formats and charts follow. The Python app in the repo root already has them, and the add-in is being brought up to the same level step by step. Until a command is ported, the add-in says so instead of guessing.
+Results are written as values (so they match the preview exactly), not yet as live PivotTables or formulas.
 
 ## Run it
 
@@ -62,7 +65,7 @@ When porting a new feature, add its commands to `tools/gen_golden.py` first. Gen
 
 ## Not done yet
 
-- Ports of the remaining operations: highlight, number formats, charts. Native PivotTables and live formulas as an option.
+- Native PivotTables and live formulas as an option.
 - A guided builder (pick from menus) for sentences it can't read.
 - Packaging for company-wide deployment (Microsoft 365 admin center).
 - The Office.js read/write layer (`src/excel/io.ts`) has not yet been run inside a real Excel; the engine and task pane have been tested in a browser only.
