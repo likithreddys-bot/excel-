@@ -6,6 +6,7 @@ import { LiveColumn, PivotSpec, liveColumns, livePivot } from "./engine/live";
 import { profile } from "./engine/profile";
 import type { Plan } from "./engine/plan";
 import { Cell, Sheets, Table, combine } from "./engine/table";
+import { sheetNameFor } from "./engine/naming";
 import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
 import { ExcelHost } from "./excel/io";
@@ -53,6 +54,7 @@ function post(kind: "user" | "bot" | "err", text = ""): HTMLDivElement {
 function setBusy(busy: boolean): void {
   state.busy = busy;
   $<HTMLButtonElement>("send").disabled = busy || !state.host;
+  $<HTMLButtonElement>("send").textContent = busy ? "Working…" : "Preview";
   $<HTMLTextAreaElement>("input").disabled = busy || !state.host;
 }
 
@@ -212,6 +214,7 @@ async function preview(text: string): Promise<void> {
   const notes: string[] = [];
   try {
     result = applyPlan(sheets, plan, files, notes);
+    if (result.size === 1) result = new Map([[sheetNameFor(plan), result.values().next().value as Table]]);
   } catch (e) {
     state.pending = null;
     if (e instanceof PlanError) { post("err", `This can't run on your data: ${e.message}`); return; }
