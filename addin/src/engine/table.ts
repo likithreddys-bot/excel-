@@ -14,6 +14,8 @@ export interface Column {
   format?: string;
   /** Fixed display order for text values (weekday names). */
   order?: string[];
+  /** A date column where some cells are real Excel dates and others are text (typical after pasting). */
+  mixedDates?: boolean;
 }
 
 export interface Table {
@@ -62,6 +64,13 @@ export function makeColumn(name: string, values: Cell[], format?: string): Colum
     return { name, kind: "number", values, format };
   }
   const strings = filled.filter((v): v is string => typeof v === "string");
+  const numbers = filled.filter((v): v is number => typeof v === "number");
+  if (strings.length && numbers.length && numbers.length + strings.length === filled.length
+    && numbers.every((n) => n >= 20000 && n <= 80000) // plausible Excel serial dates (1954-2119)
+    && strings.filter((s) => parseDateText(s) !== null).length / strings.length > 0.8) {
+    const time = values.map((v) => (typeof v === "number" ? serialToMs(v) : typeof v === "string" ? parseDateText(v) : null));
+    return { name, kind: "date", values, format, time, mixedDates: true };
+  }
   if (strings.length && strings.length === filled.length) {
     const sample = strings.slice(0, 200);
     const allDigits = sample.every((s) => /^\s*\d+(\.\d+)?\s*$/.test(s));

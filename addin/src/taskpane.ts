@@ -75,6 +75,11 @@ function showSource(label: string, t: Table): void {
   const box = $("columns");
   box.replaceChildren(...t.columns.map((c) => el("span", "chip", c.name)));
   $("columns-box").classList.remove("hidden");
+  const mixed = t.columns.filter((c) => c.mixedDates).map((c) => c.name);
+  $("source-warning").textContent = mixed.length
+    ? `Heads up: in ${mixed.join(", ")}, some dates are real Excel dates and some are plain text. I read both, but check them: Excel may have swapped day and month when they were typed or pasted.`
+    : "";
+  $("source-warning").classList.toggle("hidden", mixed.length === 0);
   showExamples(t);
 }
 

@@ -64,4 +64,14 @@ describe("data read from Excel", () => {
     expect(out.columns[1].values).toEqual([serial(2024, 1, 15), serial(2025, 3, 5), null]);
     expect(out.columns[1].format).toBe("dd/mm/yyyy");
   });
+
+  it("reads a date column that mixes real dates and text dates (as after pasting)", () => {
+    const rows = [[serial(2025, 10, 3), 5], ["20/03/2025", 6], ["25/03/2025", 7]];
+    const t = makeTable(["date", "n"], rows, ["dd/mm/yyyy", "0"]);
+    expect(t.columns[0].kind).toBe("date");
+    expect(t.columns[0].mixedDates).toBe(true);
+    const plan = makePlan(new Map([["Result", t]]), "in march 2025");
+    expect(plan.clarification_question).toBeNull();
+    expect(applyPlan(new Map([["Result", t]]), plan).get("Result")!.nrows).toBe(2);
+  });
 });
