@@ -10,7 +10,8 @@ import { sheetNameFor } from "./engine/naming";
 import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
 import { ExcelHost, progress } from "./excel/io";
-import { Host, HostError, SourceRef } from "./host";
+import { Host, HostError, MAX_CELLS, SourceRef, TooWideError } from "./host";
+import type { WebHooks } from "./web/ui";
 import { Field, TEMPLATES, Template, Values, build, columnChoices, visibleFields } from "./builder";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -33,6 +34,11 @@ const state = {
   table: null as Table | null,
   pending: null as Pending | null,
   busy: false,
+  /** Wide tables: the columns being read (undefined = all of them), and every header in the file. */
+  columns: undefined as string[] | undefined,
+  headers: [] as string[],
+  /** Set on the website: file picking, downloads and charts on the page. */
+  web: null as WebHooks | null,
 };
 
 // ---------- small DOM helpers ----------
@@ -101,6 +107,12 @@ function showSource(label: string, t: Table): void {
   const box = $("columns");
   box.replaceChildren(...t.columns.map((c) => el("span", "chip", c.name)));
   $("columns-box").classList.remove("hidden");
+  const note = document.getElementById("columns-note");
+  if (note) {
+    const partial = state.headers.length > t.columns.length;
+    note.classList.toggle("hidden", !partial);
+    if (partial) $("columns-note-text").textContent = `Reading ${t.columns.length} of ${state.headers.length} columns. Name another column in your sentence and I'll read it too.`;
+  }
   const mixed = t.columns.filter((c) => c.mixedDates).map((c) => c.name);
   $("source-warning").textContent = mixed.length
     ? `Heads up: in ${mixed.join(", ")}, some dates are real Excel dates and some are plain text. I read both, but check them: Excel may have swapped day and month when they were typed or pasted.`
@@ -151,12 +163,80 @@ function showExamples(t: Table): void {
 }
 
 async function readSource(ref?: SourceRef, fresh = false): Promise<Table> {
-  const src = await state.host!.readSource(ref, fresh);
+  let src;
+  try {
+    src = await state.host!.readSource(ref, fresh, state.columns);
+  } catch (e) {
+    if (!(e instanceof TooWideError)) throw e;
+    state.columns = await pickColumns(e.headers, e.rows, e.message);
+    src = await state.host!.readSource(ref, true, state.columns);
+  }
   state.ref = src.ref;
   state.label = src.label;
   state.table = src.table;
+  state.headers = src.headers;
   showSource(src.label, src.table);
   return src.table;
+}
+
+const spaced = (s: string): string => ` ${s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
+
+/** Headers of the file that the sentence names but that weren't read (only some columns are loaded). */
+function unreadMentioned(text: string): string[] {
+  if (!state.columns || !state.table) return [];
+  const have = new Set(state.table.columns.map((c) => c.name.toLowerCase()));
+  const said = spaced(text);
+  return state.headers.filter((h) => !have.has(h.toLowerCase()) && spaced(h).trim().length >= 3 && said.includes(spaced(h)));
+}
+
+/** A card with a searchable list of the file's columns; resolves with the ones the user ticks. */
+function pickColumns(headers: string[], rows: number, message: string, chosen: string[] = []): Promise<string[]> {
+  return new Promise((resolve) => {
+    const card = post("bot", message);
+    card.append(el("div", "muted", "Tick every column you might need: a column added later means reading the file again."));
+    const search = el("input");
+    search.type = "search";
+    search.placeholder = "Search the columns…";
+    search.setAttribute("aria-label", "Search the columns");
+    const list = el("div", "picker");
+    const count = el("div", "muted");
+    const go = el("button", "primary", "Read these columns");
+    go.type = "button";
+    const have = new Set(chosen.map((c) => c.toLowerCase()));
+    const rowsText = rows >= 0 ? num(rows) : "many";
+    const boxes = headers.map((h) => {
+      const row = el("label", "pick");
+      const input = el("input");
+      input.type = "checkbox";
+      input.checked = have.has(h.toLowerCase());
+      row.append(input, document.createTextNode(" " + h));
+      list.append(row);
+      return { row, input, name: h };
+    });
+    const update = () => {
+      const n = boxes.filter((b) => b.input.checked).length;
+      const tooMany = rows > 0 && n * rows > MAX_CELLS;
+      count.textContent = `${n} column${n === 1 ? "" : "s"} picked × ${rowsText} rows` + (tooMany ? ". That is too many cells: pick fewer columns." : "");
+      go.disabled = n === 0 || tooMany;
+    };
+    for (const b of boxes) b.input.addEventListener("change", update);
+    search.addEventListener("input", () => {
+      const q = search.value.trim().toLowerCase();
+      for (const b of boxes) b.row.classList.toggle("hidden", !!q && !b.name.toLowerCase().includes(q));
+    });
+    go.addEventListener("click", () => {
+      const names = boxes.filter((b) => b.input.checked).map((b) => b.name);
+      go.disabled = true;
+      search.disabled = true;
+      list.classList.add("hidden");
+      count.textContent = `Reading: ${names.join(", ")}`;
+      resolve(names);
+    });
+    const actions = el("div", "actions");
+    actions.append(go);
+    card.append(search, list, count, actions);
+    update();
+  });
 }
 
 // ---------- commands ----------
@@ -185,11 +265,17 @@ function liveOptions(plan: Plan, source: Table, result: Sheets): { pivot: PivotS
   return { pivot: livePivot(plan, source), liveCols: result.size === 1 && first ? liveColumns(plan, first) : null };
 }
 
-const isLive = (): boolean => $<HTMLInputElement>("live").checked;
+const isLive = (): boolean => document.getElementById("live") instanceof HTMLInputElement && $<HTMLInputElement>("live").checked;
 
 async function preview(text: string): Promise<void> {
   post("user", text);
-  const table = await readSource(state.ref);
+  let table = await readSource(state.ref);
+  const extra = unreadMentioned(text);
+  if (extra.length) {
+    state.columns = [...state.columns!, ...extra];
+    table = await readSource(state.ref, true);
+    post("bot", `I also read ${extra.join(", ")}.`).classList.add("muted");
+  }
   const sheets: Sheets = new Map([["Result", table]]);
 
   // A reply that is only column names answers the "which column?" question asked just before.
@@ -320,6 +406,7 @@ async function execute(p: Pending): Promise<void> {
     undo.disabled = true;
     await state.host!.removeSheets(made!.map((m) => m.name));
     if (state.ref && made!.some((m) => m.name === state.ref!.sheet)) state.ref = undefined;
+    state.web?.sheetsChanged();
     post("bot", "Undone. The new sheets are removed.");
   }));
   actions.append(undo);
@@ -328,6 +415,7 @@ async function execute(p: Pending): Promise<void> {
     carry.type = "button";
     carry.addEventListener("click", () => guarded(async () => {
       carry.disabled = true;
+      state.columns = undefined; // the result has its own columns
       state.ref = await state.host!.refOf(made![0].name);
       await readSource(state.ref);
       post("bot", `OK. The next commands work on “${made![0].name}”. Press “Use my table” to go back to your own table.`);
@@ -335,6 +423,7 @@ async function execute(p: Pending): Promise<void> {
     actions.append(carry);
   }
   card.append(actions);
+  state.web?.afterRun(made, p, card, actions);
 }
 
 async function guarded(fn: () => Promise<void>): Promise<void> {
@@ -417,9 +506,18 @@ async function openBuilder(): Promise<void> {
 // ---------- start up ----------
 
 function wire(): void {
-  const live = $<HTMLInputElement>("live");
-  try { live.checked = localStorage.getItem("sheet-assistant-live") === "1"; } catch { /* storage can be blocked: the default is fine */ }
-  live.addEventListener("change", () => { try { localStorage.setItem("sheet-assistant-live", live.checked ? "1" : "0"); } catch { /* ignore */ } });
+  const live = document.getElementById("live") as HTMLInputElement | null;
+  if (live) {
+    try { live.checked = localStorage.getItem("sheet-assistant-live") === "1"; } catch { /* storage can be blocked: the default is fine */ }
+    live.addEventListener("change", () => { try { localStorage.setItem("sheet-assistant-live", live.checked ? "1" : "0"); } catch { /* ignore */ } });
+  }
+  document.getElementById("change-columns")?.addEventListener("click", () => {
+    if (state.busy || !state.host) return;
+    void guarded(async () => {
+      state.columns = await pickColumns(state.headers, state.table?.nrows ?? -1, "Choose the columns I should read:", state.columns ?? state.table?.columns.map((c) => c.name) ?? []);
+      await readSource(state.ref, true);
+    });
+  });
   $("ask").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const box = $<HTMLTextAreaElement>("input");
@@ -433,9 +531,10 @@ function wire(): void {
     if (k.key === "Enter" && !k.shiftKey) { k.preventDefault(); $<HTMLFormElement>("ask").requestSubmit(); }
   });
   $("open-builder").addEventListener("click", () => { if (!state.busy && state.host) void guarded(() => openBuilder()); });
-  $("use-selection").addEventListener("click", () => void guarded(async () => {
+  document.getElementById("use-selection")?.addEventListener("click", () => void guarded(async () => {
     state.ref = undefined;
     state.asked = null;
+    state.columns = undefined;
     await readSource(undefined, true);
   }));
 }
@@ -445,6 +544,24 @@ async function start(): Promise<void> {
   progress.report = setStatus;
   // New messages scroll into view above the input area, not behind it.
   new ResizeObserver(() => document.documentElement.style.setProperty("--dock-h", `${$("dock").offsetHeight}px`)).observe($("dock"));
+  if (document.body.dataset.mode === "web") {
+    const { WebHost } = await import("./web/host");
+    const { initWeb } = await import("./web/ui");
+    const host = new WebHost();
+    host.progress = setStatus;
+    state.host = host;
+    state.web = initWeb({
+      host,
+      post,
+      guarded,
+      readSource: (ref, fresh) => readSource(ref, fresh),
+      reset: () => { state.ref = undefined; state.asked = null; state.columns = undefined; state.pending = null; },
+      miniTable,
+      setStatus,
+    });
+    setBusy(false);
+    return;
+  }
   let inExcel = false;
   if (typeof Office !== "undefined") {
     const info = await Office.onReady();

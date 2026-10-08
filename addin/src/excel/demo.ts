@@ -47,7 +47,7 @@ export class DemoHost implements Host {
   async readSource(ref?: SourceRef, _fresh?: boolean): Promise<Source> {
     const sheet = ref?.sheet ?? "Transactions";
     const table = this.sheets.get(sheet)!;
-    return { ref: { sheet, address: "A1" }, label: `${sheet}!A1:H${table.nrows + 1}`, table };
+    return { ref: { sheet, address: "A1" }, label: `${sheet}!A1:H${table.nrows + 1}`, table, headers: table.columns.map((c) => c.name) };
   }
 
   async writeResult(sheets: Sheets, _formats?: unknown, _live?: unknown): Promise<WriteOutcome> {

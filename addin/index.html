@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sheet Assistant</title>
+<meta name="description" content="Open an Excel or CSV file and say what you want done, in plain words. Your file never leaves your computer.">
+<link rel="stylesheet" href="/src/taskpane.css">
+</head>
+<body data-mode="web">
+<header>
+  <img src="/assets/icon-32.png" width="24" height="24" alt="">
+  <div>
+    <h1>Sheet Assistant</h1>
+    <p>Open a file, then say what you want done with it, in plain words. Your file stays on your computer: nothing is uploaded.</p>
+  </div>
+</header>
+
+<section id="source" class="card">
+  <div id="drop-box">
+    <div class="drop-hint">Drop an Excel (.xlsx) or CSV file here</div>
+    <div><button id="open-file" class="primary">Choose a file…</button></div>
+    <input id="file-input" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt,.xls,.xlsb" multiple hidden>
+  </div>
+  <div id="sheet-row" class="row hidden">
+    <label for="sheet-picker" class="muted">Working on</label>
+    <select id="sheet-picker" class="grow"></select>
+    <button id="open-more" class="secondary" type="button">Open another file…</button>
+  </div>
+  <div id="source-text" class="muted">No file opened yet.</div>
+  <div id="source-warning" class="note hidden"></div>
+  <div id="columns-note" class="row hidden"><span id="columns-note-text" class="grow muted"></span><button id="change-columns" class="secondary" type="button">Change columns…</button></div>
+  <div id="findings" class="hidden"></div>
+  <details id="columns-box" class="hidden">
+    <summary>Columns I can see</summary>
+    <div id="columns" class="chips"></div>
+  </details>
+</section>
+
+<main id="thread" aria-live="polite"></main>
+
+<footer id="dock">
+  <section id="examples-box" class="hidden">
+    <div class="label">Try one of these</div>
+    <div id="examples" class="chips"></div>
+  </section>
+  <div id="builder-row"><button type="button" id="open-builder" class="linklike">Build it with menus…</button></div>
+  <div id="status" class="muted hidden" role="status" aria-live="polite"></div>
+  <form id="ask">
+    <textarea id="input" rows="2" placeholder="e.g. only debits over 5000, split by category"></textarea>
+    <button id="send" class="primary">Preview</button>
+  </form>
+</footer>
+
+<script type="module" src="/src/taskpane.ts"></script>
+</body>
+</html>

@@ -1,0 +1,133 @@
+/** The website's extras around the shared pane: opening files, picking a sheet, downloading results, drawing charts. */
+import { chartTable, FormatStep, liveFormats } from "../engine/format";
+import { Sheets, Table, combine } from "../engine/table";
+import type { SourceRef } from "../host";
+import { drawChart } from "./chart";
+import type { WebHost } from "./host";
+
+export interface WebContext {
+  host: WebHost;
+  post(kind: "user" | "bot" | "err", text?: string): HTMLElement;
+  guarded(fn: () => Promise<void>): Promise<void>;
+  readSource(ref?: SourceRef, fresh?: boolean): Promise<Table>;
+  /** Forget the chosen sheet/columns/question: a different table is about to be read. */
+  reset(): void;
+  miniTable(t: Table, limit?: number): HTMLElement;
+  setStatus(text: string): void;
+}
+
+export interface WebHooks {
+  /** Results were added or removed: refresh the sheet picker. */
+  sheetsChanged(): void;
+  /** A command just ran: add download / view / chart buttons to its "Done" card. */
+  afterRun(made: { name: string; rows: number }[], p: { result: Sheets; formats: FormatStep[] }, card: HTMLElement, actions: HTMLElement): void;
+}
+
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+const num = (n: number) => n.toLocaleString("en-IN");
+
+function button(label: string, cls = ""): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  if (cls) b.className = cls;
+  return b;
+}
+
+function save(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+export function initWeb(ctx: WebContext): WebHooks {
+  const { host } = ctx;
+  const input = $<HTMLInputElement>("file-input");
+  const picker = $<HTMLSelectElement>("sheet-picker");
+
+  const refresh = () => {
+    const sheets = host.sheetList();
+    picker.replaceChildren();
+    const mine = document.createElement("optgroup");
+    mine.label = "Your files";
+    const made = document.createElement("optgroup");
+    made.label = "Results made here";
+    for (const s of sheets) (s.result ? made : mine).append(new Option(s.name, s.name));
+    if (mine.children.length) picker.append(mine);
+    if (made.children.length) picker.append(made);
+    if (host.current) picker.value = host.current;
+    $("sheet-row").classList.toggle("hidden", sheets.length === 0);
+  };
+
+  const load = (files: File[]) => ctx.guarded(async () => {
+    ctx.setStatus("Opening your file…");
+    const { added, problems } = await host.addFiles(files);
+    for (const p of problems) ctx.post("err", p);
+    if (!added.length) return;
+    refresh();
+    $("drop-box").classList.add("compact");
+    ctx.reset();
+    ctx.post("bot", added.length === 1 ? `Opened “${added[0]}”.` : `Opened ${added.length} sheets: ${added.join(", ")}. Pick which one to work on above; the others can be used for lookups (for example “bring manager from ${added[1]} on branch”).`);
+    await ctx.readSource({ sheet: host.current!, address: "A1" }, true);
+  });
+
+  $("open-file").addEventListener("click", () => input.click());
+  $("open-more").addEventListener("click", () => input.click());
+  input.addEventListener("change", () => {
+    const files = Array.from(input.files ?? []);
+    input.value = "";
+    if (files.length) void load(files);
+  });
+  picker.addEventListener("change", () => void ctx.guarded(async () => {
+    ctx.reset();
+    await ctx.readSource({ sheet: picker.value, address: "A1" }, true);
+  }));
+
+  // drag a file anywhere onto the page
+  let depth = 0;
+  const over = (on: boolean) => document.body.classList.toggle("dragging", on);
+  document.addEventListener("dragenter", (e) => { if (e.dataTransfer?.types.includes("Files")) { depth++; over(true); } });
+  document.addEventListener("dragleave", () => { depth = Math.max(0, depth - 1); if (!depth) over(false); });
+  document.addEventListener("dragover", (e) => { if (e.dataTransfer?.types.includes("Files")) e.preventDefault(); });
+  document.addEventListener("drop", (e) => {
+    depth = 0;
+    over(false);
+    if (!e.dataTransfer?.files.length) return;
+    e.preventDefault();
+    void load(Array.from(e.dataTransfer.files));
+  });
+
+  return {
+    sheetsChanged: refresh,
+    afterRun(made, p, card, actions) {
+      refresh();
+      const names = made.filter((m) => m.rows >= 0).map((m) => m.name);
+      if (!names.length) return;
+      const dl = button("Download as Excel", "primary");
+      dl.addEventListener("click", () => void ctx.guarded(async () => {
+        const blob = await host.xlsxOf(names);
+        save(blob, `${names.length === 1 ? names[0] : "results"}.xlsx`);
+      }));
+      actions.prepend(dl);
+      const view = button("Show more rows");
+      let shown: HTMLElement | null = null;
+      view.addEventListener("click", () => void ctx.guarded(async () => {
+        if (shown) { shown.remove(); shown = null; view.textContent = "Show more rows"; return; }
+        const t = await host.readSheet(names[0]);
+        shown = ctx.miniTable(t, 100);
+        shown.classList.add("tall");
+        card.append(shown);
+        view.textContent = t.nrows > 100 ? `Hide rows (showing 100 of ${num(t.nrows)})` : "Hide rows";
+      }));
+      actions.append(view);
+      for (const f of liveFormats(p.formats, p.result)) {
+        if (f.op === "chart") card.append(drawChart(chartTable(combine(p.result), f), f));
+      }
+    },
+  };
+}

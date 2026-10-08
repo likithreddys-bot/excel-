@@ -13,6 +13,13 @@ Excel where they are. Everything else happens on each user's own computer.
 | Is there AI? | No. A fixed set of rules turns a sentence into a plan, and plain code runs it. The same sentence on the same data always gives the same result. |
 | Excel version | Excel on the web, Excel for Windows or Mac (Microsoft 365, or 2019 and later) with ExcelApi 1.8. |
 
+## The website version needs no manifest
+
+The same build also contains the website, `index.html`. Once the files are hosted (step 1), the team simply opens the
+site's address (for GitHub Pages: `https://<owner>.github.io/<repo>/`). Steps 2 onward (manifest, admin center) are only for
+the Excel add-in. The website reads each file inside the browser tab; nothing is uploaded, so the security answers in the
+table above apply to it as well (it does not load `office.js`).
+
 ## 1. Host the files
 
 Build, then put the contents of `dist/` on any static web host (an internal web server, Azure Static Web Apps,

@@ -22,6 +22,13 @@ Describe what you want done with your table in plain English, inside Excel. The 
 
 Results are written as values by default, so they match the preview exactly. Tick **Keep results live** in the pane and, where Excel can do it exactly, a new column becomes a real formula in the result table (`=IF([@[amount]]>10000,"High","Low")`), and a plain total or pivot on your own table becomes a native PivotTable. After writing formulas the add-in reads Excel's answers back; a column where Excel disagrees with the preview is kept as values and you are told.
 
+## Two ways to use it
+
+- **Inside Excel** (the add-in): `taskpane.html`. Works on the table you click in, and writes results to new sheets.
+- **As a website**: `index.html`, the same engine in an ordinary browser tab. Drop in an `.xlsx` or `.csv`, say what you want, look at the result on the page, and **Download as Excel**. No install, works on any computer. The file is read in the browser: nothing is uploaded anywhere.
+
+The website reads files by streaming them, and reads **only the columns a command needs**, so a 1,00,000-row × 300-column sheet works: it asks which columns you want (or reads the ones your sentence names). Not on the website: live formulas and native PivotTables (they need Excel). Charts are drawn on the page, and a downloaded file has highlights, number formats, frozen header and filter buttons but no chart object.
+
 ## Run it
 
 ```bash
@@ -56,9 +63,11 @@ sentence ──► parser.ts ──► Plan (typed steps) ──► engine.ts �
 
 ## Big tables
 
-Tables of up to about 8 million cells (for example 800,000 rows by 10 columns) are read; bigger ones are refused with a message telling you to select fewer columns or filter first. Reading and writing in Excel go in chunks that shrink automatically if Excel says a request is too big, with progress shown in the pane. A big table is read once and reused until something on its sheet changes (press **Use my table** to force a fresh read).
+Tables of up to about 8 million cells (for example 800,000 rows by 10 columns) are read. A bigger one (say 1,00,000 rows × 300 columns) shows a column picker: tick the columns you need and only those are read. Naming an unread column in a sentence reads it too (on the website that means reading the file again). Reading and writing in Excel go in chunks that shrink automatically if Excel says a request is too big, with progress shown in the pane. A big table is read once and reused until something on its sheet changes (press **Use my table** to force a fresh read).
 
-On the add-in's side (not counting Excel's own reading and writing time), 1,000,000 rows by 10 columns take a few seconds per command (`npm run bench -- 1000000` prints the timings). `python3 tools/make_big_file.py 200000 big.xlsx` makes a fake bank file of any size to try it on.
+On the add-in's side (not counting Excel's own reading and writing time), 1,000,000 rows by 10 columns take a few seconds per command (`npm run bench -- 1000000` prints the timings).
+
+Website timings, measured in headless Chromium on a modest server (a laptop is usually faster): a 2,00,000-row × 10-column .xlsx opens in about 4 s, each command then takes about 1 s, and downloading the result as .xlsx about 5 s. A 1,06,394-row × 298-column, 173 MB .xlsx takes about 20 s to read 4 columns (most of it is unpacking 1.4 GB of XML inside the file, which no program can skip), after which commands take 0.2 s. For huge files, saving as CSV is usually faster to read. `python3 tools/make_big_file.py 200000 big.xlsx` makes a fake bank file of any size to try it on.
 
 ## Putting it in front of a team
 
@@ -77,4 +86,4 @@ When porting a new feature, add its commands to `tools/gen_golden.py` first. Gen
 ## Not done yet
 
 - Tried so far in real Excel (on the web): reading a table, previews, writing result sheets, charts, highlights, formulas, lookups and the menus. Still to prove: reading and writing lakhs of rows inside Excel itself (the add-in's own work is measured, see "Big tables"), and Excel for Windows and Mac.
-- Hosting at a real web address for a team (see `DEPLOY.md`).
+- The website has been tested in headless Chromium with generated files, not yet by your team's real files and browsers. `.xls` and `.xlsb` files must be saved as `.xlsx` first.

@@ -15,6 +15,8 @@ export interface Source {
   /** "Sheet1!A1:H2001" for display. */
   label: string;
   table: Table;
+  /** Every column header of the table in the file, even when only some columns were read. */
+  headers: string[];
 }
 
 export interface Created {
@@ -29,9 +31,13 @@ export interface WriteOutcome {
 }
 
 export interface Host {
-  kind: "excel" | "demo";
-  /** Read the user's table: from `ref` if given, else from their current selection. */
-  readSource(ref?: SourceRef, fresh?: boolean): Promise<Source>;
+  kind: "excel" | "demo" | "web";
+  /**
+   * Read the user's table: from `ref` if given, else from their current selection. With `columns`, only those
+   * columns are read (wide tables are too big to hold whole); a table that is too big to read whole without
+   * them raises a TooWideError.
+   */
+  readSource(ref?: SourceRef, fresh?: boolean, columns?: string[]): Promise<Source>;
   /** Names of the workbook's visible sheets (other sheets can be looked up, appended or compared). */
   listSheets(): Promise<string[]>;
   /** The whole used range of a sheet, first row as headers. */
@@ -46,3 +52,13 @@ export interface Host {
 }
 
 export class HostError extends Error {}
+
+/** The table is too big to read in full: the user must pick the columns they need. */
+export class TooWideError extends HostError {
+  constructor(message: string, readonly headers: string[], readonly rows: number) {
+    super(message);
+  }
+}
+
+/** Most cells the add-in will hold in memory at once (rows x columns read). */
+export const MAX_CELLS = 8_000_000;

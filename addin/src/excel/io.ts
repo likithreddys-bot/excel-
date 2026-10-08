@@ -1,16 +1,14 @@
 /** Reads and writes real Excel worksheets through Office.js. */
 import { FormatStep, liveFormats } from "../engine/format";
-import { Cell, Sheets, Table, makeTable } from "../engine/table";
+import { Cell, Sheets, Table, headerNames, makeTable } from "../engine/table";
 import { addCharts, formatSheet } from "./format";
 import type { LiveColumn, PivotSpec } from "../engine/live";
-import { Created, Host, HostError, Source, SourceRef, WriteOutcome } from "../host";
+import { Created, Host, HostError, MAX_CELLS, Source, SourceRef, TooWideError, WriteOutcome } from "../host";
 
 const READ_CELLS_PER_CHUNK = 100_000;
 const WRITE_CELLS_PER_CHUNK = 50_000;
 /** Excel's own request limit is about 5 MB; stay well under it when a chunk holds long text. */
 const WRITE_BYTES_PER_CHUNK = 1_500_000;
-/** More cells than this and the browser tab holding them gets unreliable. */
-const MAX_CELLS = 8_000_000;
 
 /** The pane sets this to show progress ("Reading 300,000 of 1,000,000 rows…") during long reads and writes. */
 export const progress: { report: (message: string) => void } = { report: () => {} };
@@ -18,18 +16,6 @@ const num = (n: number) => n.toLocaleString("en-IN");
 
 /** Excel refused a request because it was too big: worth retrying in smaller pieces. */
 const isTooBig = (e: unknown) => /payload|too large|size limit|RequestPayload|ResponsePayload|exceeds/i.test(`${(e as { code?: string })?.code ?? ""} ${(e as Error)?.message ?? ""}`);
-
-/** Header text for each column: blanks become "Column N", repeats get " (2)". */
-function headerNames(raw: unknown[]): string[] {
-  const seen = new Set<string>();
-  return raw.map((h, i) => {
-    let name = String(h ?? "").trim() || `Column ${i + 1}`;
-    const base = name;
-    for (let n = 2; seen.has(name.toLowerCase()); n++) name = `${base} (${n})`;
-    seen.add(name.toLowerCase());
-    return name;
-  });
-}
 
 async function locate(ctx: Excel.RequestContext, ref?: SourceRef): Promise<{ range: Excel.Range; region: boolean }> {
   if (ref) {
@@ -50,42 +36,63 @@ async function locate(ctx: Excel.RequestContext, ref?: SourceRef): Promise<{ ran
 }
 
 /** Read a range (first row = headers) into a table, in chunks so big sheets stay under Excel's request size limit. */
-async function readTable(ctx: Excel.RequestContext, range: Excel.Range): Promise<Table> {
+async function readTable(ctx: Excel.RequestContext, range: Excel.Range, wanted?: string[]): Promise<{ table: Table; headers: string[] }> {
   range.load("rowCount,columnCount");
   await ctx.sync();
   const { rowCount, columnCount } = range;
   if (rowCount < 2) throw new HostError("I need a header row and at least one row of data. Click a cell inside your table first.");
-  if (rowCount * columnCount > MAX_CELLS) {
-    throw new HostError(`This table has ${num(rowCount - 1)} rows and ${columnCount} columns (${num(rowCount * columnCount)} cells), which is more than I can safely work on at once (about ${num(MAX_CELLS)} cells). `
-      + "Select just the columns you need, or filter the data in Excel first, then try again.");
-  }
 
-  // The first data row's number formats tell dates from plain numbers.
+  // The header row, and the first data row's number formats (they tell dates from plain numbers).
   const firstData = range.getRow(1);
   firstData.load("numberFormat");
   const header = range.getRow(0);
   header.load("values");
   await ctx.sync();
-  const names = headerNames(header.values[0]);
-  const formats = firstData.numberFormat[0].map((f) => String(f));
+  const headers = headerNames(header.values[0]);
+  const allFormats = firstData.numberFormat[0].map((f) => String(f));
 
-  const rows: Cell[][] = [];
-  let step = Math.max(1, Math.floor(READ_CELLS_PER_CHUNK / columnCount));
-  for (let r = 1; r < rowCount;) {
-    const h = Math.min(step, rowCount - r);
-    try {
-      const part = range.getCell(r, 0).getResizedRange(h - 1, columnCount - 1);
-      part.load("values");
-      await ctx.sync();
-      for (const row of part.values) rows.push(row as Cell[]);
-      r += h;
-      if (rowCount > 20_000) progress.report(`Reading your table: ${num(Math.min(r - 1, rowCount - 1))} of ${num(rowCount - 1)} rows…`);
-    } catch (e) {
-      if (!isTooBig(e) || step <= 50) throw e;
-      step = Math.max(50, Math.floor(step / 2)); // Excel said that was too much at once: try half
+  const wantedKeys = wanted ? new Set(wanted.map((w) => w.toLowerCase())) : null;
+  const picked = headers.map((h, j) => j).filter((j) => !wantedKeys || wantedKeys.has(headers[j].toLowerCase()));
+  if (!picked.length) throw new HostError("None of the columns you picked are in this table any more. Pick the columns again.");
+  if ((rowCount - 1) * picked.length > MAX_CELLS) {
+    if (!wanted) {
+      throw new TooWideError(`This table has ${num(rowCount - 1)} rows and ${columnCount} columns (${num(rowCount * columnCount)} cells), which is more than I can hold at once. `
+        + "Pick the columns you need and I'll read only those.", headers, rowCount - 1);
+    }
+    throw new HostError(`Even those ${picked.length} columns are too much: ${num(rowCount - 1)} rows × ${picked.length} columns is more than I can hold at once (about ${num(MAX_CELLS)} cells). Pick fewer columns, or filter the data in Excel first.`);
+  }
+
+  // Neighbouring picked columns are read together, so a few big requests instead of one per column.
+  const runs: [number, number][] = [];
+  for (const j of picked) {
+    const last = runs[runs.length - 1];
+    if (last && last[1] === j - 1) last[1] = j;
+    else runs.push([j, j]);
+  }
+  const rows: Cell[][] = Array.from({ length: rowCount - 1 }, () => []);
+  const width = picked.length;
+  let doneCells = 0;
+  const totalCells = (rowCount - 1) * width;
+  for (const [from, to] of runs) {
+    const w = to - from + 1;
+    let step = Math.max(1, Math.floor(READ_CELLS_PER_CHUNK / w));
+    for (let r = 1; r < rowCount;) {
+      const h = Math.min(step, rowCount - r);
+      try {
+        const part = range.getCell(r, from).getResizedRange(h - 1, w - 1);
+        part.load("values");
+        await ctx.sync();
+        for (let i = 0; i < h; i++) for (const v of part.values[i]) rows[r - 1 + i].push(v as Cell);
+        r += h;
+        doneCells += h * w;
+        if (totalCells > 200_000) progress.report(`Reading your table: ${num(Math.min(Math.round(doneCells / width), rowCount - 1))} of ${num(rowCount - 1)} rows…`);
+      } catch (e) {
+        if (!isTooBig(e) || step <= 50) throw e;
+        step = Math.max(50, Math.floor(step / 2)); // Excel said that was too much at once: try half
+      }
     }
   }
-  return makeTable(names, rows, formats);
+  return { table: makeTable(picked.map((j) => headers[j]), rows, picked.map((j) => allFormats[j])), headers };
 }
 
 export class ExcelHost implements Host {
@@ -95,7 +102,7 @@ export class ExcelHost implements Host {
   private cache: { key: string; source: Source; dirty: boolean } | null = null;
   private watching = new Set<string>();
 
-  async readSource(ref?: SourceRef, fresh = false): Promise<Source> {
+  async readSource(ref?: SourceRef, fresh = false, columns?: string[]): Promise<Source> {
     return Excel.run(async (ctx) => {
       const { range, region } = await locate(ctx, ref);
       range.load("address");
@@ -103,10 +110,11 @@ export class ExcelHost implements Host {
       await ctx.sync();
       const sheet = range.worksheet.name;
       const address = range.address.split("!").pop()!;
-      const key = `${sheet}!${address}`;
+      const where = `${sheet}!${address}`;
+      const key = `${where}|${columns ? [...columns].sort().join("\u0001") : ""}`;
       if (!fresh && this.cache && this.cache.key === key && !this.cache.dirty) return { ...this.cache.source, ref: { sheet, address, region } };
-      const table = await readTable(ctx, range);
-      const source: Source = { ref: { sheet, address, region }, label: key, table };
+      const { table, headers } = await readTable(ctx, range, columns);
+      const source: Source = { ref: { sheet, address, region }, label: where, table, headers };
       if (table.nrows > 20_000) {
         this.cache = { key, source, dirty: false };
         if (!this.watching.has(sheet)) {
@@ -137,7 +145,7 @@ export class ExcelHost implements Host {
       used.load("rowCount");
       await ctx.sync();
       if (used.rowCount < 2) throw new HostError(`The sheet “${name}” has a header row but no data rows yet. Add the rows you want to look up, then try again.`);
-      return readTable(ctx, used);
+      return (await readTable(ctx, used)).table;
     }).catch(rethrow);
   }
 
