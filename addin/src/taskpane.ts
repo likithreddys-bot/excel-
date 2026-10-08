@@ -9,7 +9,7 @@ import { Cell, Sheets, Table, combine } from "./engine/table";
 import { sheetNameFor } from "./engine/naming";
 import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
-import { ExcelHost } from "./excel/io";
+import { ExcelHost, progress } from "./excel/io";
 import { Host, HostError, SourceRef } from "./host";
 import { Field, TEMPLATES, Template, Values, build, columnChoices, visibleFields } from "./builder";
 
@@ -51,7 +51,14 @@ function post(kind: "user" | "bot" | "err", text = ""): HTMLDivElement {
   return m;
 }
 
+function setStatus(text: string): void {
+  const box = $("status");
+  box.textContent = text;
+  box.classList.toggle("hidden", !text);
+}
+
 function setBusy(busy: boolean): void {
+  if (!busy) setStatus("");
   state.busy = busy;
   $<HTMLButtonElement>("send").disabled = busy || !state.host;
   $<HTMLButtonElement>("send").textContent = busy ? "Working…" : "Preview";
@@ -143,8 +150,8 @@ function showExamples(t: Table): void {
   $("examples-box").classList.toggle("hidden", usable.length === 0);
 }
 
-async function readSource(ref?: SourceRef): Promise<Table> {
-  const src = await state.host!.readSource(ref);
+async function readSource(ref?: SourceRef, fresh = false): Promise<Table> {
+  const src = await state.host!.readSource(ref, fresh);
   state.ref = src.ref;
   state.label = src.label;
   state.table = src.table;
@@ -429,12 +436,13 @@ function wire(): void {
   $("use-selection").addEventListener("click", () => void guarded(async () => {
     state.ref = undefined;
     state.asked = null;
-    await readSource(undefined);
+    await readSource(undefined, true);
   }));
 }
 
 async function start(): Promise<void> {
   wire();
+  progress.report = setStatus;
   // New messages scroll into view above the input area, not behind it.
   new ResizeObserver(() => document.documentElement.style.setProperty("--dock-h", `${$("dock").offsetHeight}px`)).observe($("dock"));
   let inExcel = false;

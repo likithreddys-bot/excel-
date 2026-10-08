@@ -153,7 +153,17 @@ function mergeSameColumn(conds: Condition[], match: "all" | "any"): [Condition[]
   return [out, match];
 }
 
-const distinct = (values: Cell[]): number => new Set(values.filter((v) => !isBlankCell(v)).map((v) => JSON.stringify(v))).size;
+/** Distinct non-blank values of a column, worked out once per column (a 1,000,000-row table is scanned a single time). */
+const distinctCache = new WeakMap<Column, Cell[]>();
+function distinctValues(c: Column): Cell[] {
+  let d = distinctCache.get(c);
+  if (!d) {
+    d = [...new Set(c.values)].filter((v) => !isBlankCell(v));
+    distinctCache.set(c, d);
+  }
+  return d;
+}
+const distinct = (values: Cell[] | Column): number => (Array.isArray(values) ? new Set(values.filter((v) => !isBlankCell(v))).size : distinctValues(values).length);
 
 const localIso = (d: Date): string =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -243,7 +253,7 @@ export class Parser {
     let nums = this.numericCols.filter((c) => !ids.has(c));
     if (!nums.length) nums = [...this.numericCols];
     nums.sort((a, b) => Number(!colWords(a).some((w) => AMOUNT_WORDS.has(w))) - Number(!colWords(b).some((w) => AMOUNT_WORDS.has(w))));
-    const nun = (c: string) => distinct(this.col(c).values);
+    const nun = (c: string) => distinct(this.col(c));
     let cats = this.columns.filter((c) => !this.numericCols.includes(c) && !this.dateCols.includes(c) && nun(c) >= 2 && nun(c) <= 50);
     if (!cats.length) cats = this.numericCols.filter((c) => nun(c) >= 2 && nun(c) <= 50);
     cats.sort((a, b) => nun(a) - nun(b));
@@ -255,19 +265,21 @@ export class Parser {
       out.push(words.length ? `pivot ${num} by ${words[0]}_month` : `total ${num} by month`);
     }
     if (num) {
-      const xs = this.col(num).values.filter((v): v is number => typeof v === "number").sort((a, b) => a - b);
+      // A sample is plenty to pick a sensible example threshold (and keeps this fast on huge tables).
+      const all = this.col(num).values;
+      const stride = Math.max(1, Math.floor(all.length / 20000));
+      const xs: number[] = [];
+      for (let i = 0; i < all.length; i += stride) if (typeof all[i] === "number") xs.push(all[i] as number);
+      xs.sort((a, b) => a - b);
       const median = xs.length ? (xs.length % 2 ? xs[(xs.length - 1) / 2] : (xs[xs.length / 2 - 1] + xs[xs.length / 2]) / 2) : NaN;
       const threshold = Number.isFinite(median) && median ? fmt(Number(median.toPrecision(2))) : "0";
       out.push(`only rows where ${num} > ${threshold}`, `sort by ${num} descending`, `top 10 by ${num}`);
     }
     if (cat) {
-      const counts = new Map<string, { v: Cell; n: number }>();
-      for (const v of this.col(cat).values) if (!isBlankCell(v)) {
-        const k = JSON.stringify(v);
-        counts.set(k, { v, n: (counts.get(k)?.n ?? 0) + 1 });
-      }
-      const best = [...counts.values()].sort((a, b) => b.n - a.n || (a.v! < b.v! ? -1 : 1))[0];
-      out.push(`only rows where ${cat} is ${typeof best.v === "number" ? fmt(best.v) : String(best.v)}`, `split by ${cat}`);
+      const counts = new Map<Cell, number>();
+      for (const v of this.col(cat).values) if (!isBlankCell(v)) counts.set(v, (counts.get(v) ?? 0) + 1);
+      const best = [...counts].sort((a, b) => b[1] - a[1] || (a[0]! < b[0]! ? -1 : 1))[0][0];
+      out.push(`only rows where ${cat} is ${typeof best === "number" ? fmt(best) : String(best)}`, `split by ${cat}`);
     }
     if (nums.length >= 2) out.push(`add column ratio = ${nums[1]} * 100 / ${nums[0]}`);
     if (num) out.push(`add column size = IF(${num} > 1000, "High", "Low")`);
@@ -281,7 +293,7 @@ export class Parser {
     const index = new Map<string, Map<string, string>>();
     for (const c of this.table.columns) {
       if (c.kind !== "text") continue;
-      const uniques = unique(c.values.filter((v) => v !== null).map(String));
+      const uniques = distinctValues(c).map(String);
       if (uniques.length > 20000) continue;
       for (const v of uniques) {
         const k = singular(key(v));
@@ -301,7 +313,7 @@ export class Parser {
       if (n === null) throw new ParseError(`'${raw}' is not a number, but '${col}' is a numeric column.`);
       return fmt(n);
     }
-    const uniques = unique(c.values.filter((v) => v !== null).map(String));
+    const uniques = distinctValues(c).map(String);
     const byKey = new Map(uniques.map((v) => [singular(key(v)), v]));
     const k = singular(key(raw));
     const hit = byKey.get(k);
@@ -1255,7 +1267,7 @@ export class Parser {
       // Count the distinct parts without building the column twice.
       return distinct(this.datePartCells(s));
     }
-    return distinct(this.col(name).values);
+    return distinct(this.col(name));
   }
 
   private datePartCells(s: DatePartStep): Cell[] {
@@ -1267,8 +1279,8 @@ export class Parser {
     for (const c of cols) {
       const n = this.distinctCount(c, steps);
       if (n > MAX_SPLIT_SHEETS) {
-        const good = this.columns.filter((x) => { const k = distinct(this.col(x).values); return k >= 2 && k <= MAX_SPLIT_SHEETS; })
-          .map((x) => `${x} (${distinct(this.col(x).values)})`);
+        const good = this.columns.filter((x) => { const k = distinct(this.col(x)); return k >= 2 && k <= MAX_SPLIT_SHEETS; })
+          .map((x) => `${x} (${distinct(this.col(x))})`);
         throw new ParseError(`'${c}' has ${n.toLocaleString("en-US")} different values, so it would create ${n.toLocaleString("en-US")} ${what}. `
           + `Columns with fewer values (${what}): ` + (good.join(", ") || "none"));
       }

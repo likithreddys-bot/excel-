@@ -44,7 +44,7 @@ export class DemoHost implements Host {
     return this.sheets.get(name)!;
   }
 
-  async readSource(ref?: SourceRef): Promise<Source> {
+  async readSource(ref?: SourceRef, _fresh?: boolean): Promise<Source> {
     const sheet = ref?.sheet ?? "Transactions";
     const table = this.sheets.get(sheet)!;
     return { ref: { sheet, address: "A1" }, label: `${sheet}!A1:H${table.nrows + 1}`, table };
