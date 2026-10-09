@@ -4,7 +4,7 @@
  */
 import type { FormatStep } from "../engine/format";
 import { Sheets, Table } from "../engine/table";
-import { Created, Host, HostError, MAX_CELLS, Source, SourceRef, TooWideError, WriteOutcome } from "../host";
+import { Cancelled, Created, Host, HostError, MAX_CELLS, Source, SourceRef, TooWideError, WriteOutcome } from "../host";
 import { readCsv, csvHead } from "./csv";
 import { buildXlsx, sheetNames } from "./xlsx-write";
 import { XlsxBook, openXlsx, readSheet as readXlsxSheet, sheetHead } from "./xlsx-read";
@@ -25,6 +25,17 @@ export class WebHost implements Host {
   current: string | null = null;
   private cache: { key: string; source: Source } | null = null;
   progress: (message: string) => void = () => {};
+  private stop = false;
+
+  /** Ask a read in progress to stop (it checks at every progress report). */
+  cancel(): void {
+    this.stop = true;
+  }
+
+  private report = (message: string): void => {
+    if (this.stop) throw new Cancelled();
+    this.progress(message);
+  };
 
   /** Open files (.xlsx or .csv). Returns what was added, and the first problem per file that could not be read. */
   async addFiles(list: File[]): Promise<{ added: string[]; problems: string[] }> {
@@ -90,13 +101,14 @@ export class WebHost implements Host {
   }
 
   async readSheet(name: string): Promise<Table> {
+    this.stop = false;
     const e = this.entry(name);
     if (e.kind === "result") return e.table;
     const { headers, rows } = await this.head(name, e);
     if (rows >= 0 && rows * headers.length > MAX_CELLS) throw new HostError(`The sheet “${name}” is too big to look things up in (${num(rows)} rows × ${headers.length} columns).`);
     const f = this.files.get(e.file)!;
     try {
-      return (f.book ? await readXlsxSheet(f.book, e.sheet, undefined, this.progress) : await readCsv(f.blob, undefined, this.progress)).table;
+      return (f.book ? await readXlsxSheet(f.book, e.sheet, undefined, this.report) : await readCsv(f.blob, undefined, this.report)).table;
     } catch (err) {
       const m = (err as Error).message;
       throw new HostError(m.startsWith("I need") ? `The sheet “${name}” has a header row but no data rows yet. Add the rows you want to look up, then try again.` : m);
@@ -104,6 +116,7 @@ export class WebHost implements Host {
   }
 
   async readSource(ref?: SourceRef, _fresh = false, columns?: string[]): Promise<Source> {
+    this.stop = false;
     const name = ref?.sheet ?? this.current;
     if (!name) throw new HostError("Open a file first: drop an Excel (.xlsx) or CSV file onto the page.");
     const e = this.entry(name);
@@ -125,7 +138,7 @@ export class WebHost implements Host {
         throw new HostError(`Even those ${width} columns are too much: ${num(rows)} rows × ${width} columns is more than I can hold at once (about ${num(MAX_CELLS)} cells). Pick fewer columns.`);
       }
       const f = this.files.get(e.file)!;
-      const got = f.book ? await readXlsxSheet(f.book, e.sheet, columns, this.progress) : await readCsv(f.blob, columns, this.progress);
+      const got = f.book ? await readXlsxSheet(f.book, e.sheet, columns, this.report) : await readCsv(f.blob, columns, this.report);
       source = { ref: { sheet: name, address: "A1" }, label: `${name}${f.book ? "" : ` (${f.name})`}`, table: got.table, headers: got.headers };
     }
     this.cache = { key, source };
@@ -166,7 +179,7 @@ export class WebHost implements Host {
       const e = this.sheets.get(n);
       if (e?.kind === "result") { out.set(n, e.table); formats.push(...e.formats); }
     }
-    return buildXlsx(out, formats, this.progress);
+    return buildXlsx(out, formats, this.report);
   }
 
   /** The formats a result sheet was made with (charts are drawn by the page). */

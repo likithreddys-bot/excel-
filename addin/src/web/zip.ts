@@ -4,6 +4,7 @@
  * hundreds of MB, so nothing here ever holds a whole entry (or the whole file) in memory.
  */
 import { Inflate } from "fflate";
+import { Cancelled } from "../host";
 
 export interface ZipEntry {
   name: string;
@@ -118,6 +119,7 @@ export async function streamEntry(file: Blob, entry: ZipEntry, onChunk: (chunk: 
       inflate.push(await bytes(file, at, Math.min(end, at + SLICE)), last);
       await breathe();
     } catch (e) {
+      if (e instanceof Cancelled) throw e;
       failure = e as Error;
       break;
     }

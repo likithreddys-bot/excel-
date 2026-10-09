@@ -53,6 +53,13 @@ export interface Host {
 
 export class HostError extends Error {}
 
+/** The user pressed Cancel during a long read. */
+export class Cancelled extends HostError {
+  constructor() {
+    super("Cancelled. Nothing was changed.");
+  }
+}
+
 /** The table is too big to read in full: the user must pick the columns they need. */
 export class TooWideError extends HostError {
   constructor(message: string, readonly headers: string[], readonly rows: number) {
