@@ -27,6 +27,8 @@ Results are written as values by default, so they match the preview exactly. Tic
 - **Inside Excel** (the add-in): `taskpane.html`. Works on the table you click in, and writes results to new sheets.
 - **As a website**: `index.html`, the same engine in an ordinary browser tab. Drop in an `.xlsx` or `.csv`, say what you want, look at the result on the page, and **Download as Excel**. No install, works on any computer. The file is read in the browser: nothing is uploaded anywhere.
 
+The page has a landing screen with a **Try it with sample data** button, a data grid of your table (click a column heading to put its name in your sentence), a "What can I ask?" guide, a progress bar with **Cancel** while a big file is read, up/down arrows to bring back earlier sentences, light and dark themes, and a stacked layout on phones.
+
 The website reads files by streaming them, and reads **only the columns a command needs**, so a 1,00,000-row × 300-column sheet works: it asks which columns you want (or reads the ones your sentence names). Not on the website: live formulas and native PivotTables (they need Excel). Charts are drawn on the page, and a downloaded file has highlights, number formats, frozen header and filter buttons but no chart object.
 
 ## Run it

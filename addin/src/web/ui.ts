@@ -14,9 +14,14 @@ export interface WebContext {
   reset(): void;
   miniTable(t: Table, limit?: number): HTMLElement;
   setStatus(text: string): void;
+  cellText(t: Table, col: number, row: number): string;
 }
 
 export interface WebHooks {
+  /** The pane's status line changed (reading / writing progress): drive the progress bar. */
+  status(text: string): void;
+  /** A table was read: show it in the data grid. */
+  sourceShown(t: Table): void;
   /** Results were added or removed: refresh the sheet picker. */
   sheetsChanged(): void;
   /** A command just ran: add download / view / chart buttons to its "Done" card. */
@@ -70,7 +75,7 @@ export function initWeb(ctx: WebContext): WebHooks {
     for (const p of problems) ctx.post("err", p);
     if (!added.length) return;
     refresh();
-    $("drop-box").classList.add("compact");
+    showApp();
     ctx.reset();
     ctx.post("bot", added.length === 1 ? `Opened “${added[0]}”.` : `Opened ${added.length} sheets: ${added.join(", ")}. Pick which one to work on above; the others can be used for lookups (for example “bring manager from ${added[1]} on branch”).`);
     await ctx.readSource({ sheet: host.current!, address: "A1" }, true);
@@ -88,6 +93,104 @@ export function initWeb(ctx: WebContext): WebHooks {
     await ctx.readSource({ sheet: picker.value, address: "A1" }, true);
   }));
 
+  const showApp = () => {
+    $("landing").classList.add("hidden");
+    $("app").classList.remove("hidden");
+    $("open-more").classList.remove("hidden");
+    $("site-foot").classList.add("hidden");
+    window.scrollTo(0, 0);
+  };
+
+  // the big drop box is a button too (click or Enter/Space)
+  const box = $("drop-box");
+  box.addEventListener("click", (e) => { if (!(e.target as HTMLElement).closest("button")) input.click(); });
+  box.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } });
+  $("try-sample").addEventListener("click", () => void ctx.guarded(async () => {
+    const { sampleFile } = await import("./sample");
+    await load([await sampleFile()]);
+  }));
+
+  // light / dark
+  $("theme").addEventListener("click", () => {
+    const root = document.documentElement;
+    const dark = (root.dataset.theme ?? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light")) === "dark";
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("sheet-assistant-theme", root.dataset.theme); } catch { /* storage can be blocked */ }
+  });
+
+  // "What can I ask?": a chip starts a sentence, with its first [placeholder] selected ready to overwrite
+  $("help").addEventListener("click", (e) => {
+    const chip = (e.target as HTMLElement).closest("button.chip");
+    if (!chip) return;
+    const box = $<HTMLTextAreaElement>("input");
+    box.value = chip.textContent ?? "";
+    box.focus();
+    const at = box.value.indexOf("[");
+    if (at >= 0) box.setSelectionRange(at, box.value.indexOf("]", at) + 1);
+  });
+
+  // once the user starts asking, the cheat sheet gets out of the way of the conversation
+  $("ask").addEventListener("submit", () => { ($("help") as HTMLDetailsElement).open = false; });
+  // on a phone the grid starts folded away so the conversation is within reach
+  if (matchMedia("(max-width: 860px)").matches) ($("grid-card") as HTMLDetailsElement).open = false;
+
+  // cancel a long read
+  $("cancel-read").addEventListener("click", () => host.cancel());
+
+  // the data grid
+  let shown: Table | null = null;
+  const gridRows = $<HTMLSelectElement>("grid-rows");
+  const KIND = { number: "123", date: "date", text: "abc" } as const;
+  const MAX_COLS = 60;
+  const drawGrid = () => {
+    const t = shown;
+    const card = $("grid-card");
+    card.classList.toggle("hidden", !t);
+    if (!t) return;
+    const nShow = Math.min(t.nrows, Number(gridRows.value));
+    const cols = t.columns.slice(0, MAX_COLS);
+    $("grid-sub").textContent = `· first ${num(nShow)} of ${num(t.nrows)} rows` + (t.columns.length > MAX_COLS ? ` · first ${MAX_COLS} of ${t.columns.length} columns` : "");
+    const table = document.createElement("table");
+    const head = table.createTHead().insertRow();
+    const corner = document.createElement("th");
+    corner.className = "rn";
+    corner.textContent = "#";
+    head.append(corner);
+    for (const c of cols) {
+      const th = document.createElement("th");
+      th.title = `Add “${c.name}” to your sentence`;
+      th.dataset.col = c.name;
+      const badge = document.createElement("span");
+      badge.className = `kind ${c.kind}`;
+      badge.textContent = KIND[c.kind];
+      th.append(badge, c.name);
+      head.append(th);
+    }
+    const body = table.createTBody();
+    for (let i = 0; i < nShow; i++) {
+      const tr = body.insertRow();
+      const rn = tr.insertCell();
+      rn.className = "rn";
+      rn.textContent = String(i + 1);
+      cols.forEach((c, j) => {
+        const td = tr.insertCell();
+        const text = ctx.cellText(t, j, i);
+        if (text === "") { td.className = "blank"; td.textContent = "–"; } else { td.textContent = text; if (c.kind === "number") td.className = "num"; }
+      });
+    }
+    $("grid").replaceChildren(table);
+  };
+  gridRows.addEventListener("change", drawGrid);
+  $("grid").addEventListener("click", (e) => {
+    const th = (e.target as HTMLElement).closest("th[data-col]") as HTMLElement | null;
+    if (!th) return;
+    const box = $<HTMLTextAreaElement>("input");
+    const at = box.selectionStart ?? box.value.length;
+    const name = th.dataset.col!;
+    box.value = box.value.slice(0, at) + (at && !/\s$/.test(box.value.slice(0, at)) ? " " : "") + name + box.value.slice(box.selectionEnd ?? at);
+    box.focus();
+  });
+
   // drag a file anywhere onto the page
   let depth = 0;
   const over = (on: boolean) => document.body.classList.toggle("dragging", on);
@@ -103,6 +206,18 @@ export function initWeb(ctx: WebContext): WebHooks {
   });
 
   return {
+    status(text) {
+      const busy = $("busy"), bar = $("bar");
+      busy.classList.toggle("hidden", !text);
+      const pct = /(\d{1,3})%/.exec(text);
+      bar.classList.toggle("wait", !pct);
+      (bar.firstElementChild as HTMLElement).style.width = pct ? `${Math.min(100, Number(pct[1]))}%` : "";
+      $("cancel-read").classList.toggle("hidden", !/^Reading/.test(text));
+    },
+    sourceShown(t) {
+      shown = t;
+      drawGrid();
+    },
     sheetsChanged: refresh,
     afterRun(made, p, card, actions) {
       refresh();

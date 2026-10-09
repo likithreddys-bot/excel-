@@ -24,17 +24,20 @@ function demoRows(n = 400): Cell[][] {
   });
 }
 
+/** The made-up workbook: a Transactions sheet and a small Branches sheet (for trying lookups). */
+export function demoTables(rows = 400): Map<string, Table> {
+  const names = ["txn_id", "txn_date", "description", "category", "txn_type", "amount", "balance", "branch"];
+  return new Map([
+    ["Transactions", makeTable(names, demoRows(rows))],
+    ["Branches", makeTable(["branch", "manager", "region"], [
+      ["Mumbai", "A. Rao", "West"], ["Pune", "S. Iyer", "West"], ["Delhi", "R. Singh", "North"],
+    ])],
+  ]);
+}
+
 export class DemoHost implements Host {
   kind = "demo" as const;
-  private sheets = new Map<string, Table>();
-
-  constructor() {
-    const names = ["txn_id", "txn_date", "description", "category", "txn_type", "amount", "balance", "branch"];
-    this.sheets.set("Transactions", makeTable(names, demoRows()));
-    this.sheets.set("Branches", makeTable(["branch", "manager", "region"], [
-      ["Mumbai", "A. Rao", "West"], ["Pune", "S. Iyer", "West"], ["Delhi", "R. Singh", "North"],
-    ]));
-  }
+  private sheets = demoTables();
 
   async listSheets(): Promise<string[]> {
     return [...this.sheets.keys()];

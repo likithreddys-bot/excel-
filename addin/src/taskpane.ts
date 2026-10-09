@@ -10,7 +10,7 @@ import { sheetNameFor } from "./engine/naming";
 import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
 import { ExcelHost, progress } from "./excel/io";
-import { Host, HostError, MAX_CELLS, SourceRef, TooWideError } from "./host";
+import { Cancelled, Host, HostError, MAX_CELLS, SourceRef, TooWideError } from "./host";
 import type { WebHooks } from "./web/ui";
 import { Field, TEMPLATES, Template, Values, build, columnChoices, visibleFields } from "./builder";
 
@@ -34,6 +34,8 @@ const state = {
   table: null as Table | null,
   pending: null as Pending | null,
   busy: false,
+  /** Commands typed so far, for the up/down arrows. */
+  history: [] as string[],
   /** Wide tables: the columns being read (undefined = all of them), and every header in the file. */
   columns: undefined as string[] | undefined,
   headers: [] as string[],
@@ -61,6 +63,7 @@ function setStatus(text: string): void {
   const box = $("status");
   box.textContent = text;
   box.classList.toggle("hidden", !text);
+  state.web?.status(text);
 }
 
 function setBusy(busy: boolean): void {
@@ -120,6 +123,7 @@ function showSource(label: string, t: Table): void {
   $("source-warning").classList.toggle("hidden", mixed.length === 0);
   showFindings(t);
   showExamples(t);
+  state.web?.sourceShown(t);
 }
 
 /** Beginner mode: tell the user what looks wrong with their table, with a one-click way to start each fix. */
@@ -431,7 +435,8 @@ async function guarded(fn: () => Promise<void>): Promise<void> {
   try {
     await fn();
   } catch (e) {
-    post("err", e instanceof HostError ? e.message : `Something went wrong: ${(e as Error).message ?? e}`);
+    if (e instanceof Cancelled) post("bot", e.message);
+    else post("err", e instanceof HostError ? e.message : `Something went wrong: ${(e as Error).message ?? e}`);
   } finally {
     setBusy(false);
   }
@@ -524,11 +529,21 @@ function wire(): void {
     const text = box.value.trim();
     if (!text || state.busy) return;
     box.value = "";
+    if (state.history[state.history.length - 1] !== text) state.history.push(text);
+    browsing = -1;
     void guarded(() => preview(text));
   });
+  // Up/down arrows walk back through earlier commands, like a terminal.
+  let browsing = -1;
   $("input").addEventListener("keydown", (ev) => {
     const k = ev as KeyboardEvent;
-    if (k.key === "Enter" && !k.shiftKey) { k.preventDefault(); $<HTMLFormElement>("ask").requestSubmit(); }
+    const box = $<HTMLTextAreaElement>("input");
+    if (k.key === "Enter" && !k.shiftKey) { k.preventDefault(); $<HTMLFormElement>("ask").requestSubmit(); return; }
+    if ((k.key === "ArrowUp" || k.key === "ArrowDown") && state.history.length && (box.value === "" || browsing >= 0)) {
+      k.preventDefault();
+      browsing = k.key === "ArrowUp" ? (browsing < 0 ? state.history.length - 1 : Math.max(0, browsing - 1)) : browsing + 1;
+      if (browsing >= state.history.length) { browsing = -1; box.value = ""; } else box.value = state.history[browsing];
+    }
   });
   $("open-builder").addEventListener("click", () => { if (!state.busy && state.host) void guarded(() => openBuilder()); });
   document.getElementById("use-selection")?.addEventListener("click", () => void guarded(async () => {
@@ -558,6 +573,7 @@ async function start(): Promise<void> {
       reset: () => { state.ref = undefined; state.asked = null; state.columns = undefined; state.pending = null; },
       miniTable,
       setStatus,
+      cellText,
     });
     setBusy(false);
     return;
