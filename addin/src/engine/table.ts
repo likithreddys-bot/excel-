@@ -87,6 +87,18 @@ export function makeTable(names: string[], rows: Cell[][], formats?: (string | u
   return { columns, nrows: rows.length };
 }
 
+/** Header text for each column: blanks become "Column N", repeats get " (2)". */
+export function headerNames(raw: unknown[]): string[] {
+  const seen = new Set<string>();
+  return raw.map((h, i) => {
+    let name = String(h ?? "").trim() || `Column ${i + 1}`;
+    const base = name;
+    for (let n = 2; seen.has(name.toLowerCase()); n++) name = `${base} (${n})`;
+    seen.add(name.toLowerCase());
+    return name;
+  });
+}
+
 /** Each row's date as UTC ms, for any column (text columns holding dates are read day-first). */
 export function timesOf(c: Column): (number | null)[] {
   if (c.time) return c.time;

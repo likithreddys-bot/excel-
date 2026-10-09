@@ -16,6 +16,6 @@ export default defineConfig({
   base: "./",
   plugins: trusted ? [] : [basicSsl()],
   server: { port: 3000, host: "localhost", https: trusted },
-  build: { target: "es2022", outDir: "dist", rollupOptions: { input: "taskpane.html" } },
+  build: { target: "es2022", outDir: "dist", rollupOptions: { input: { site: "index.html", taskpane: "taskpane.html" } } },
   test: { globals: true, include: ["test/**/*.test.ts"] },
 });
