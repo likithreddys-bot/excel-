@@ -34,6 +34,7 @@ const VERB = String.raw`(?:sort|order|arrange|split|segregate|separate|keep|remo
   String.raw`|highlight|colou?r|shade|format|display|draw|plot|do)`;
 const CLAUSE_SPLIT = new RegExp(
   String.raw`\s*(?:[;\n]+|(?<![Rr][Ss])\.\s+|\.$|,?\s*\b(?:and\s+then|and\s+also|and\s+now|then|also|now|and)\s+(?=${VERB}\b)` +
+  String.raw`|,?\s*\b(?:and\s+)?then\s+(?=(?:total|sums?|counts?|averages?|how\s+many|top|bottom|pivot|group)\b)` +
   String.raw`|,\s*(?=${VERB}\b))\s*`, "i");
 const NEXT_ASSIGNMENT = /(?:\s*,\s*|\s+)(?:and\s+)?(?=[A-Za-z_][\w%.]*\s*=(?!=))/gi;
 
@@ -434,6 +435,8 @@ export class Parser {
       groupText = cl.slice(g.index! + g[0].length);
       body = cl.slice(0, g.index);
     }
+    const ratio = this.parseRatio(body, groupText);
+    if (ratio) return ratio;
     const rule = /\b(?:where|with|having|that|who|which|whose)\s+(.+)$/i.exec(body);
     if (!rule) {
       if (!/\b(?:paid|unpaid|on\s*time|ontime|late|overdue|delinquen\w*|default\w*|success\w*|fail\w*|approv\w*|reject\w*|bounce\w*|npa|active|closed|dormant|convert\w*)\b/.test(low)) return null;
@@ -442,6 +445,8 @@ export class Parser {
       throw new ParseError(
         "I can't tell which rows count for that percentage, and I won't guess. Tell me the rule, like this:\n"
         + `- percentage of rows where ${flag} is <value>${by ? ` by ${by}` : " by <column>"}\n`
+        + `- to compare two amounts (paid vs due, say): ${this.numericCols[0] ?? "<amount>"} as percentage of ${this.numericCols[1] ?? "<other amount>"} by ${by ?? "<column>"}\n`
+        + `- if the rule is two columns: percentage of rows where <date column> <= <other date column> by ${by ?? "<column>"}\n`
         + `- or, for each group's share of the grand total: percentage share of <column> by ${by ?? "<column>"}`);
     }
     const [prefix, found] = groupText.trim() ? this.dims(groupText) : [[] as DatePartStep[], [] as Mention[]];
@@ -449,8 +454,44 @@ export class Parser {
     if (groupText.trim() && !groupCols.length) {
       throw new ParseError(`I couldn't find a column for “${groupText.trim()}”. Columns: ${this.columns.join(", ")}`);
     }
-    const when = this.parseFilter(rule[1].replace(/[\s,]+$/, ""));
-    return [...prefix, { op: "rate", columns: groupCols, when }];
+    const ruleText = rule[1].replace(/[\s,]+$/, "");
+    const formula = this.twoColumnRule(ruleText);
+    return [...prefix, { op: "rate", columns: groupCols, when: formula ? null : this.parseFilter(ruleText), formula }];
+  }
+
+  /** "repaid_date <= due_date" or "repaid_date is before due_date": two columns compared, as a formula. */
+  private twoColumnRule(text: string): string | null {
+    const m = /^\s*(.+?)\s*(<=|>=|<>|!=|==|<|>|=|\bis\s+not\s+equal\s+to\b|\bis\s+(?:on\s+or\s+before|before|on\s+or\s+after|after|equal\s+to|the\s+same\s+as|same\s+as)\b|\bis\b)\s*(.+?)\s*$/i.exec(text);
+    if (!m) return null;
+    const left = this.column(m[1].trim()), right = this.column(m[3].trim());
+    if (!left || !right || left === right) return null;
+    const w = m[2].toLowerCase().replace(/\s+/g, " ");
+    const op = /on or before/.test(w) ? "<=" : /before/.test(w) ? "<" : /on or after/.test(w) ? ">=" : /after/.test(w) ? ">"
+      : /not equal|!=|<>/.test(w) ? "<>" : /<=|>=|<|>/.test(w) ? w : "=";
+    // a blank cell compares as zero, so an unpaid row (blank paid date) would look "on time": blanks never match
+    return `AND(NOT(ISBLANK([${left}])), NOT(ISBLANK([${right}])), [${left}]${op}[${right}])`;
+  }
+
+  /** "b0_amt as percentage of alloc_amt by state": per group, total of one column as a percent of the total of another. */
+  private parseRatio(body: string, groupText: string): Step[] | null {
+    const m = /(?<a>[^,]+?)\s+as\s+(?:a\s+)?(?:percent(?:age)?|%)\s+of\s+(?<b>.+)$/i.exec(body)
+      ?? /(?:percent(?:age)?|%)\s+of\s+(?<a>.+?)\s+(?:to|over|vs\.?|versus|in|out\s+of)\s+(?<b>.+)$/i.exec(body);
+    if (!m) return null;
+    const one = (text: string): string | null => {
+      const cols = unique(this.findColumns(text).map((x) => x.column)).filter((c) => this.numericCols.includes(c));
+      return cols.length === 1 ? cols[0] : null;
+    };
+    const a = one(m.groups!.a), b = one(m.groups!.b);
+    if (!a || !b || a === b) return null;
+    const [prefix, found] = groupText.trim() ? this.dims(groupText) : [[] as DatePartStep[], [] as Mention[]];
+    const groupCols = unique(found.map((x) => x.column)).filter((c) => c !== a && c !== b);
+    if (groupText.trim() && !groupCols.length) throw new ParseError(`I couldn't find a column for “${groupText.trim()}”. Columns: ${this.columns.join(", ")}`);
+    const name = `${a} % of ${b}`;
+    return [...prefix, {
+      op: "group_by", columns: groupCols,
+      aggregations: [{ column: a, func: "sum" }, { column: b, func: "sum" }],
+      calculated: { [name]: `[${a}] / [${b}] * 100` },
+    }];
   }
 
   private isGroup(low: string): boolean {

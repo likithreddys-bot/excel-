@@ -74,3 +74,46 @@ describe("'X wise' elsewhere", () => {
     expect(plan.clarification_question).toBeNull();
   });
 });
+
+describe("amounts as a percent of each other, and two-column rules", () => {
+  const loans = (): Sheets => new Map([["Result", makeTable(
+    ["statename", "b0_amt", "alloc_amt", "due_date", "repaid_date"],
+    [
+      ["MAHARASHTRA", 1000, 1000, 45300, 45300], ["MAHARASHTRA", 0, 1000, 45300, 45310], ["MAHARASHTRA", 500, 1000, 45300, 45299],
+      ["KARNATAKA", 0, 2000, 45300, null], ["KARNATAKA", 2000, 2000, 45300, 45299],
+      ["DELHI", 0, 500, 45300, 45320],
+    ],
+    [undefined, undefined, undefined, "dd/mm/yyyy", "dd/mm/yyyy"],
+  )]]);
+  const go = (cmd: string) => {
+    const plan = makePlan(loans(), cmd);
+    expect(plan.clarification_question, cmd).toBeNull();
+    return [...applyPlan(loans(), plan).values()][0];
+  };
+  const by = (t: ReturnType<typeof go>, state: string, col: string) => t.columns.find((c) => c.name === col)!.values[t.columns[0].values.indexOf(state)];
+
+  it("'A as percentage of B by state' totals each, then divides (not a share of the grand total)", () => {
+    for (const cmd of ["b0_amt as percentage of alloc_amt by statename", "statename wise percentage of b0_amt to alloc_amt"]) {
+      const t = go(cmd);
+      expect(t.columns.map((c) => c.name)).toEqual(["statename", "sum_b0_amt", "sum_alloc_amt", "b0_amt % of alloc_amt"]);
+      expect(by(t, "MAHARASHTRA", "b0_amt % of alloc_amt")).toBe(50); // 1500 / 3000
+      expect(by(t, "KARNATAKA", "b0_amt % of alloc_amt")).toBe(50);   // 2000 / 4000
+      expect(by(t, "DELHI", "b0_amt % of alloc_amt")).toBe(0);
+    }
+  });
+
+  it("a rule comparing two columns (paid on or before the due date); a blank paid date never counts", () => {
+    for (const cmd of ["percentage of rows where repaid_date <= due_date by statename", "statename wise percentage of rows where repaid_date is on or before due_date"]) {
+      const t = go(cmd);
+      expect(by(t, "MAHARASHTRA", "% matching")).toBe(66.67); // 2 of 3
+      expect(by(t, "KARNATAKA", "% matching")).toBe(50);      // the blank one is not "on time"
+      expect(by(t, "DELHI", "% matching")).toBe(0);
+    }
+  });
+
+  it("'add column ..., then total ...' runs as two steps and totals the ratio the calculated-field way", () => {
+    const t = go("add column b0_paid_pct = b0_amt / alloc_amt * 100, then total b0_paid_pct by statename");
+    expect(by(t, "KARNATAKA", "b0_paid_pct")).toBe(50);
+    expect(by(t, "MAHARASHTRA", "b0_paid_pct")).toBe(50);
+  });
+});

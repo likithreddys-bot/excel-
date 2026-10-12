@@ -193,6 +193,11 @@ function formulaColumn(t: Table, step: FormulaStep, notes: string[]): Table {
   return putColumn(t, makeColumn(step.name, values, compiled.kind === "date" ? "dd/mm/yyyy" : old?.format));
 }
 
+/** Which rows a formula says yes to (errors and blanks count as no). */
+export function formulaMask(t: Table, formula: string): boolean[] {
+  return compileFor(t, formula).run(t).values.map((v) => v === true || (typeof v === "number" && v !== 0));
+}
+
 function formulaFilter(t: Table, step: FormulaFilterStep, notes: string[]): Table {
   const { values, errors } = compileFor(t, step.formula).run(t);
   if (errors) notes.push(`${errors.toLocaleString("en-US")} row(s) gave an error in the formula and were treated as not matching.`);
