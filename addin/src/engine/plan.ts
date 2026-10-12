@@ -1,4 +1,5 @@
 /** The structured plan the parser produces and the engine executes (mirrors plan.py). */
+import type { DefinitionRequest } from "./dictionary";
 
 export type Operator =
   | "equals" | "not_equals" | "contains" | "not_contains" | "in" | "not_in"
@@ -47,7 +48,7 @@ export interface FormulaStep { op: "formula"; name: string; formula: string; rep
 /** Keep (or remove) the rows where an Excel-style formula is true. */
 export interface FormulaFilterStep { op: "filter_formula"; formula: string; keep: boolean }
 export interface LabelCase { when: FilterStep; value: string }
-export interface LabelStep { op: "label"; name: string; cases: LabelCase[]; default: string | null; replace: boolean }
+export interface LabelStep { op: "label"; name: string; cases: LabelCase[]; default: string | null; replace: boolean; /** show the labels in the order given (first case first), not alphabetically */ ordered?: boolean }
 export interface LookupStep { op: "lookup"; file: string; left_on: string; right_on: string; columns: string[] }
 export interface AppendStep { op: "append"; file: string }
 export interface CompareStep { op: "compare"; file: string; left_on: string | null; right_on: string | null; keep: "only_here" | "only_there" | "both" }
@@ -76,4 +77,6 @@ export interface Plan {
   steps: Step[];
   /** The question can be answered by replying with column names. */
   awaits_columns: boolean;
+  /** Set when a word in the question (e.g. "old users") has no definition yet: the app asks the user to pick one. */
+  needs_definition?: DefinitionRequest | null;
 }

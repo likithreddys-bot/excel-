@@ -219,7 +219,9 @@ function label(t: Table, step: LabelStep): Table {
   for (let k = step.cases.length - 1; k >= 0; k--) { // first matching case wins
     for (let i = 0; i < t.nrows; i++) if (masks[k][i]) out[i] = put(step.cases[k].value);
   }
-  return putColumn(t, makeColumn(step.name, out, old?.format));
+  const made = makeColumn(step.name, out, old?.format);
+  if (step.ordered) made.order = [...step.cases.map((c) => c.value), ...(step.default !== null ? [step.default] : [])];
+  return putColumn(t, made);
 }
 
 function unsupported(step: Step): never {

@@ -3,6 +3,7 @@
  * ("state" finds statename, "paid" finds repaid_amt), so people never have to pick columns by hand.
  */
 import { MAX_CELLS } from "./host";
+import { mentionsSegment } from "./engine/dictionary";
 
 const STOP = new Set(("show me the of by per each and or all get give what is are to a an with where for in on rows row percentage percent percentages " +
   "total totals sum count average avg mean number how many wise top bottom highest lowest sort sorted ascending descending than greater less more equal " +
@@ -49,7 +50,10 @@ const spaced = (s: string) => ` ${s.toLowerCase().replace(/[^a-z0-9]+/g, " ").tr
  * The columns to have loaded to answer `text`: the ones already loaded, plus those the sentence names or
  * (loosely) points at. Kept within the memory budget for `rows` rows. Returned in the file's column order.
  */
-export function autoColumns(headers: string[], rows: number, text: string, current: string[] = [], maxCells = MAX_CELLS): string[] {
+/** Columns that could say whether a user is old or new (read so the app can offer definitions). */
+const SEGMENT_CANDIDATES = /repeat|returning|existing|first_?time|is_?new|order_?(?:cnt|count|no|num)|loan_?(?:cnt|count|number|seq|no)|nth_?loan|total_?loans/i;
+
+export function autoColumns(headers: string[], rows: number, text: string, current: string[] = [], maxCells = MAX_CELLS, extra: string[] = []): string[] {
   const said = spaced(text);
   const have = new Set(current.map((c) => c.toLowerCase()));
   // Columns typed by their full name are certain; their own words must not also pull in look-alikes (tot_amt must not read every *_amt).
@@ -66,6 +70,11 @@ export function autoColumns(headers: string[], rows: number, text: string, curre
     const more = headers.filter((h) => !have.has(h.toLowerCase()) && !picked.includes(h) && isCompanion(h));
     picked = picked.concat(more.slice(0, 8));
   }
+  if (mentionsSegment(text)) {
+    // "old users and new users": the saved definition's column, or else the columns a definition could use
+    const wanted = extra.length ? extra : headers.filter((h) => SEGMENT_CANDIDATES.test(h)).slice(0, 6);
+    picked = [...picked, ...wanted.filter((h) => headers.includes(h) && !have.has(h.toLowerCase()) && !picked.includes(h))];
+  } else picked = [...picked, ...extra.filter((h) => headers.includes(h) && !have.has(h.toLowerCase()) && !picked.includes(h))];
   const room = Math.max(1, Math.floor(maxCells / Math.max(1, rows)) - have.size);
   const chosen = new Set([...current, ...picked.slice(0, room)].map((c) => c.toLowerCase()));
   return headers.filter((h) => chosen.has(h.toLowerCase()));
