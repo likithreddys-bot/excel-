@@ -19,6 +19,8 @@ export interface SortStep { op: "sort"; columns: string[]; ascending: boolean }
 export interface DedupeStep { op: "dedupe"; columns: string[] | null; keep: "first" | "last" }
 export interface Aggregation { column: string; func: "count" | "sum" | "mean" | "min" | "max" | "nunique" }
 export interface GroupByStep { op: "group_by"; columns: string[]; aggregations: Aggregation[]; calculated: Record<string, string> }
+/** For each group: how many rows there are and what percent of them meet `when` ("percent of customers paid on time, by state"). */
+export interface RateStep { op: "rate"; columns: string[]; when: FilterStep }
 export interface SplitByStep { op: "split_by"; column: string }
 export interface PivotStep {
   op: "pivot"; rows: string[]; columns: string[]; values: string | null;
@@ -63,7 +65,7 @@ export interface ChartStep {
 
 export type Step =
   | FilterStep | SelectColumnsStep | DropColumnsStep | SortStep | DedupeStep | GroupByStep
-  | SplitByStep | PivotStep | TopNStep | DatePartStep | CalculateStep
+  | SplitByStep | RateStep | PivotStep | TopNStep | DatePartStep | CalculateStep
   | CleanTextStep | FillBlanksStep | DropBlankRowsStep | ReplaceStep | SplitColumnStep
   | MergeColumnsStep | RenameStep | ConvertStep | ComputeStep | LabelStep | FormulaStep | FormulaFilterStep
   | LookupStep | AppendStep | CompareStep | HighlightStep | NumberFormatStep | ChartStep;

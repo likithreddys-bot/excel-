@@ -62,7 +62,7 @@ export class Cancelled extends HostError {
 
 /** The table is too big to read in full: the user must pick the columns they need. */
 export class TooWideError extends HostError {
-  constructor(message: string, readonly headers: string[], readonly rows: number) {
+  constructor(message: string, readonly headers: string[], readonly rows: number, readonly approx = false) {
     super(message);
   }
 }

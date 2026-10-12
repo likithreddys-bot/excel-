@@ -1,6 +1,6 @@
 /** Runs a Plan on tables. Pure functions: the only code that touches the data. */
 import type { ComputeStep, FormulaFilterStep, FormulaStep, Condition, DatePart, DatePartStep, FilterStep, LabelStep, Plan, Step } from "./plan";
-import { calculate, groupBy, pivot, topN } from "./aggregate";
+import { calculate, groupBy, pivot, rate, topN } from "./aggregate";
 import { cleanText, convertColumns, dropBlankRows, fillBlanks, mergeColumns, renameColumns, replaceText, splitColumn } from "./clean";
 import { evaluate } from "./evaluate";
 import { FormulaSyntaxError, columnResolver, compileFormula } from "./formula";
@@ -235,6 +235,7 @@ function applyStep(t: Table, step: Step, files: Files, notes: string[]): Table |
     case "split_by": return splitBy(t, step.column);
     case "date_part": return addDatePart(t, step);
     case "group_by": return groupBy(t, step);
+    case "rate": return rate(t, step);
     case "pivot": return pivot(t, step);
     case "top_n": return topN(t, step);
     case "calculate": return calculate(t, step);

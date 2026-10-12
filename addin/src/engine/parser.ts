@@ -370,11 +370,14 @@ export class Parser {
   // ---------- clauses ----------
 
   parseClause(cl: string): Step[] {
+    cl = this.normaliseWise(cl);
     const low = cl.toLowerCase();
     if (Object.keys(this.files).length && FILE_VERBS.test(cl)) {
       const fm = this.findFile(cl);
       if (fm) return this.parseFileCommand(cl, fm);
     }
+    const rated = this.parseRate(cl);
+    if (rated) return rated;
     // Formatting first: "highlight duplicates in pan" must colour rows, never remove them.
     const ff = /^\s*(?:please\s+)?(keep|show|only|select|filter|remove|delete|drop|exclude|hide)(?:\s+(?:only\s+)?(?:the\s+)?rows?)?\s+(?:where|if|when|with|for)\s*=\s*(.+)$/i.exec(cl);
     if (ff) return [this.formulaFilter(ff[2], !/^(?:remove|delete|drop|exclude|hide)$/i.test(ff[1]))];
@@ -398,6 +401,56 @@ export class Parser {
     const step = this.parseColumns(cl);
     if (step) return [step];
     return [this.parseFilter(cl)];
+  }
+
+  /** "state wise total amount" means "total amount by state" (also "month-wise"). Only when the word before "wise" is a column or a date part. */
+  private normaliseWise(cl: string): string {
+    const m = /\b([A-Za-z][A-Za-z0-9_]*)(?:\s+|-)wise\b/i.exec(cl);
+    if (!m) return cl;
+    let word = m[1];
+    if (!/^(?:month|year|quarter|week|day|date|weekday)$/i.test(word) && !this.findColumns(word).length) {
+      // "state wise" for a column called statename: a single column that starts with the word
+      const k = key(word);
+      const starts = k.length >= 3 ? this.columns.filter((c) => key(c).startsWith(k)) : [];
+      if (starts.length !== 1) return cl;
+      word = starts[0];
+    }
+    const rest = (cl.slice(0, m.index) + " " + cl.slice(m.index + m[0].length)).replace(/\s{2,}/g, " ").trim();
+    return `${rest} by ${word}`;
+  }
+
+  /**
+   * "percentage of rows where status is PAID by state": for each state, what percent of its rows meet the rule.
+   * A percentage that talks about paid / on time / late but gives no rule is a question, never a guess.
+   */
+  private parseRate(cl: string): Step[] | null {
+    if (!new RegExp(PERCENT.source, "i").test(cl)) return null;
+    const low = cl.toLowerCase();
+    if (/\bshare\b|\bof\s+(?:the\s+)?(?:grand\s+)?total\b|\brank|\b(?:running|cumulative)\b/.test(low)) return null; // each group's share of the total: the older path
+    let body = cl, groupText = "";
+    const markers = [...cl.matchAll(/\b(?:by|per|for\s+each|in\s+each|across|each)\b/gi)];
+    if (markers.length) {
+      const g = markers[markers.length - 1];
+      groupText = cl.slice(g.index! + g[0].length);
+      body = cl.slice(0, g.index);
+    }
+    const rule = /\b(?:where|with|having|that|who|which|whose)\s+(.+)$/i.exec(body);
+    if (!rule) {
+      if (!/\b(?:paid|unpaid|on\s*time|ontime|late|overdue|delinquen\w*|default\w*|success\w*|fail\w*|approv\w*|reject\w*|bounce\w*|npa|active|closed|dormant|convert\w*)\b/.test(low)) return null;
+      const by = groupText.trim() ? this.findColumns(groupText).map((x) => x.column)[0] : undefined;
+      const flag = this.columns.find((c) => /paid|status|flag|ontime|on_time|result/i.test(c)) ?? this.columns[0];
+      throw new ParseError(
+        "I can't tell which rows count for that percentage, and I won't guess. Tell me the rule, like this:\n"
+        + `- percentage of rows where ${flag} is <value>${by ? ` by ${by}` : " by <column>"}\n`
+        + `- or, for each group's share of the grand total: percentage share of <column> by ${by ?? "<column>"}`);
+    }
+    const [prefix, found] = groupText.trim() ? this.dims(groupText) : [[] as DatePartStep[], [] as Mention[]];
+    const groupCols = unique(found.map((x) => x.column));
+    if (groupText.trim() && !groupCols.length) {
+      throw new ParseError(`I couldn't find a column for “${groupText.trim()}”. Columns: ${this.columns.join(", ")}`);
+    }
+    const when = this.parseFilter(rule[1].replace(/[\s,]+$/, ""));
+    return [...prefix, { op: "rate", columns: groupCols, when }];
   }
 
   private isGroup(low: string): boolean {
