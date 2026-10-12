@@ -1,6 +1,7 @@
 /** Summaries: group totals, pivots, top N, percent of total / running total / rank. */
 import { PlanError, SortKey, col, compareKeys, keyLabel, need, numberOf, sortKeys, sortRows } from "./core";
-import type { Aggregation, CalculateStep, GroupByStep, PivotStep, TopNStep } from "./plan";
+import type { Aggregation, CalculateStep, GroupByStep, PivotStep, RateStep, TopNStep } from "./plan";
+import { filterMask } from "./engine";
 import { evaluate } from "./evaluate";
 import { Cell, Column, Table, isBlankCell, makeColumn, pick } from "./table";
 
@@ -98,6 +99,20 @@ export function groupBy(t: Table, step: GroupByStep): Table {
   }
   const calc = calculatedTotals(t, groups, step.calculated);
   Object.keys(step.calculated).forEach((name, i) => out.push(makeColumn(name, calc[i])));
+  return { columns: out, nrows: groups.length };
+}
+
+/** Per group: rows, rows that meet the condition, and the percent that do (2 decimals). A blank group is kept and shown last. */
+export function rate(t: Table, step: RateStep): Table {
+  need(t, [...step.columns, ...step.when.conditions.map((c) => c.column)]);
+  const keys = step.columns.map((n) => col(t, n));
+  const groups = groupRows(t, keys);
+  const hit = filterMask(t, step.when);
+  const matching = groups.map((g) => g.filter((i) => hit[i]).length);
+  const out: Column[] = keys.map((k) => makeColumn(k.name, firstCells(k, groups), k.format));
+  out.push(makeColumn("rows", groups.map((g) => g.length)));
+  out.push(makeColumn("matching rows", matching));
+  out.push(makeColumn("% matching", groups.map((g, j) => (g.length ? Math.round((matching[j] / g.length) * 1e4) / 100 : null))));
   return { columns: out, nrows: groups.length };
 }
 

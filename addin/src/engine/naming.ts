@@ -8,6 +8,7 @@ const list = (xs: string[]) => xs.join(", ");
 function describeOne(step: Step): string | null {
   switch (step.op) {
     case "group_by": return `Totals by ${list(step.columns)}`;
+    case "rate": return `% by ${list(step.columns)}`;
     case "pivot": return `Pivot by ${list(step.rows)}`;
     case "top_n": return step.column ? `Top ${step.n} by ${step.column}` : `${step.largest ? "First" : "Last"} ${step.n} rows`;
     case "filter": case "filter_formula": return "Filtered";

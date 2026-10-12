@@ -9,7 +9,7 @@ import { readCsv, csvHead } from "./csv";
 import { buildXlsx, sheetNames } from "./xlsx-write";
 import { XlsxBook, openXlsx, readSheet as readXlsxSheet, sheetHead } from "./xlsx-read";
 
-interface FileSheet { kind: "file"; file: string; sheet: string; headers?: string[]; rows?: number }
+interface FileSheet { kind: "file"; file: string; sheet: string; headers?: string[]; rows?: number; /** a CSV's row count is worked out from its size, so it is only close */ estimated?: boolean }
 interface ResultSheet { kind: "result"; table: Table; formats: FormatStep[] }
 type Entry = FileSheet | ResultSheet;
 
@@ -23,7 +23,8 @@ export class WebHost implements Host {
   private sheets = new Map<string, Entry>();
   /** The sheet the user is working on (the table commands run on). */
   current: string | null = null;
-  private cache: { key: string; source: Source } | null = null;
+  /** The last couple of reads of file sheets (reading a big file again is slow). Result sheets are already in memory. */
+  private cache = new Map<string, Source>();
   progress: (message: string) => void = () => {};
   private stop = false;
 
@@ -92,6 +93,7 @@ export class WebHost implements Host {
       const h = f.book ? await sheetHead(f.book, e.sheet) : await csvHead(f.blob);
       e.headers = h.headers;
       e.rows = h.rows;
+      e.estimated = !f.book;
     }
     return { headers: e.headers, rows: e.rows ?? -1 };
   }
@@ -122,18 +124,21 @@ export class WebHost implements Host {
     const e = this.entry(name);
     this.current = name;
     const key = `${name}|${columns ? [...columns].sort().join("\u0001") : ""}`;
-    if (this.cache?.key === key) return this.cache.source;
-    let source: Source;
     if (e.kind === "result") {
-      source = { ref: { sheet: name, address: "A1" }, label: name, table: e.table, headers: e.table.columns.map((c) => c.name) };
-    } else {
+      return { ref: { sheet: name, address: "A1" }, label: name, table: e.table, headers: e.table.columns.map((c) => c.name) };
+    }
+    const cached = this.cache.get(key);
+    if (cached) return cached;
+    let source: Source;
+    {
       const { headers, rows } = await this.head(name, e);
       const width = columns ? headers.filter((h) => columns.some((c) => c.toLowerCase() === h.toLowerCase())).length : headers.length;
       if (width === 0) throw new HostError("None of the columns you picked are in this sheet any more. Pick the columns again.");
       const tooBig = rows >= 0 ? rows * width > MAX_CELLS : width > 100;
       if (tooBig) {
         if (!columns) {
-          throw new TooWideError(`This table has ${rows >= 0 ? num(rows) : "a lot of"} rows and ${headers.length} columns, which is more than I can hold at once. Pick the columns you need and I'll read only those.`, headers, rows);
+          const approx = !!e.estimated;
+          throw new TooWideError(`This table has ${rows >= 0 ? (approx ? "about " : "") + num(rows) : "a lot of"} rows and ${headers.length} columns, which is more than I can hold at once. Pick the columns you need and I'll read only those.`, headers, rows, approx);
         }
         throw new HostError(`Even those ${width} columns are too much: ${num(rows)} rows × ${width} columns is more than I can hold at once (about ${num(MAX_CELLS)} cells). Pick fewer columns.`);
       }
@@ -141,7 +146,8 @@ export class WebHost implements Host {
       const got = f.book ? await readXlsxSheet(f.book, e.sheet, columns, this.report) : await readCsv(f.blob, columns, this.report);
       source = { ref: { sheet: name, address: "A1" }, label: `${name}${f.book ? "" : ` (${f.name})`}`, table: got.table, headers: got.headers };
     }
-    this.cache = { key, source };
+    this.cache.set(key, source);
+    if (this.cache.size > 2) this.cache.delete(this.cache.keys().next().value!);
     return source;
   }
 
@@ -164,7 +170,6 @@ export class WebHost implements Host {
   async removeSheets(names: string[]): Promise<void> {
     for (const n of names) if (this.sheets.get(n)?.kind === "result") this.sheets.delete(n);
     if (this.current && !this.sheets.has(this.current)) this.current = this.sheets.keys().next().value ?? null;
-    this.cache = null;
   }
 
   async refOf(sheetName: string): Promise<SourceRef> {

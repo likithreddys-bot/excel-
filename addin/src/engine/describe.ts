@@ -48,6 +48,7 @@ export function describe(step: Step): string {
       const note = Object.entries(step.calculated).some(([n, e]) => e !== `[${n}]`) ? CALCULATED_NOTE : "";
       return `Group by ${step.columns.join(", ")} with ${parts.join(", ")}${note}`;
     }
+    case "rate": return `For each ${step.columns.join(", ")}: the percent of rows where ${noPrefix(describeFilter(step.when))}`;
     case "split_by": return `Split into one sheet per ${step.column}`;
     case "pivot": {
       if (Object.keys(step.calculated).length) {

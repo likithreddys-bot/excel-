@@ -39,6 +39,8 @@ const state = {
   /** Wide tables: the columns being read (undefined = all of them), and every header in the file. */
   columns: undefined as string[] | undefined,
   headers: [] as string[],
+  /** The user's own table (as opposed to a result sheet they continued from): where the picked columns apply. */
+  sourceRef: undefined as SourceRef | undefined,
   /** Set on the website: file picking, downloads and charts on the page. */
   web: null as WebHooks | null,
 };
@@ -166,19 +168,25 @@ function showExamples(t: Table): void {
   $("examples-box").classList.toggle("hidden", usable.length === 0);
 }
 
+/** Is `ref` a result sheet the user continued from, rather than their own table? */
+const isResultRef = (ref?: SourceRef): boolean => !!ref && !!state.sourceRef && ref.sheet !== state.sourceRef.sheet;
+
 async function readSource(ref?: SourceRef, fresh = false): Promise<Table> {
+  const result = isResultRef(ref);
+  const columns = result ? undefined : state.columns; // a result sheet is small and has its own columns
   let src;
   try {
-    src = await state.host!.readSource(ref, fresh, state.columns);
+    src = await state.host!.readSource(ref, fresh, columns);
   } catch (e) {
     if (!(e instanceof TooWideError)) throw e;
-    state.columns = await pickColumns(e.headers, e.rows, e.message);
+    state.columns = await pickColumns(e.headers, e.rows, e.message, [], e.approx);
     src = await state.host!.readSource(ref, true, state.columns);
   }
   state.ref = src.ref;
   state.label = src.label;
   state.table = src.table;
   state.headers = src.headers;
+  if (!result) state.sourceRef = src.ref; // remembered, so Undo / "go back" returns to the same table and the same columns
   showSource(src.label, src.table);
   return src.table;
 }
@@ -187,14 +195,30 @@ const spaced = (s: string): string => ` ${s.toLowerCase().replace(/[^a-z0-9]+/g,
 
 /** Headers of the file that the sentence names but that weren't read (only some columns are loaded). */
 function unreadMentioned(text: string): string[] {
-  if (!state.columns || !state.table) return [];
+  if (!state.columns || !state.table || isResultRef(state.ref)) return [];
   const have = new Set(state.table.columns.map((c) => c.name.toLowerCase()));
   const said = spaced(text);
   return state.headers.filter((h) => !have.has(h.toLowerCase()) && spaced(h).trim().length >= 3 && said.includes(spaced(h)));
 }
 
+const SKIP_WORDS = new Set(["show", "me", "the", "wise", "of", "on", "in", "by", "per", "for", "each", "and", "or", "all", "get", "give", "what", "is", "are", "to", "a", "an", "with", "where", "rows", "row", "percentage", "percent", "total", "how", "many"]);
+
+/** When only some columns were read: file columns that share a word with the sentence, best matches first. */
+function unreadColumnsFor(text: string): string[] {
+  if (!state.table || state.headers.length <= state.table.columns.length) return [];
+  const have = new Set(state.table.columns.map((c) => c.name.toLowerCase()));
+  const words = [...new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 2 && !SKIP_WORDS.has(w)))];
+  return state.headers
+    .filter((h) => !have.has(h.toLowerCase()))
+    .map((h) => ({ h, score: words.filter((w) => h.toLowerCase().includes(w)).length }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 12)
+    .map((x) => x.h);
+}
+
 /** A card with a searchable list of the file's columns; resolves with the ones the user ticks. */
-function pickColumns(headers: string[], rows: number, message: string, chosen: string[] = []): Promise<string[]> {
+function pickColumns(headers: string[], rows: number, message: string, chosen: string[] = [], approx = false): Promise<string[]> {
   return new Promise((resolve) => {
     const card = post("bot", message);
     card.append(el("div", "muted", "Tick every column you might need: a column added later means reading the file again."));
@@ -207,7 +231,7 @@ function pickColumns(headers: string[], rows: number, message: string, chosen: s
     const go = el("button", "primary", "Read these columns");
     go.type = "button";
     const have = new Set(chosen.map((c) => c.toLowerCase()));
-    const rowsText = rows >= 0 ? num(rows) : "many";
+    const rowsText = rows >= 0 ? (approx ? "about " : "") + num(rows) : "many";
     const boxes = headers.map((h) => {
       const row = el("label", "pick");
       const input = el("input");
@@ -295,6 +319,8 @@ async function preview(text: string): Promise<void> {
     state.pending = null;
     state.asked = plan.awaits_columns ? (reply ? state.asked : text) : null;
     const card = post("bot", problems.length ? problems.join("\n") : plan.clarification_question);
+    const maybe = unreadColumnsFor(text);
+    if (maybe.length) card.append(el("div", "note", `Columns in your file that might be what you mean (not read yet): ${maybe.join(", ")}. Press “Change columns…”, tick them, and ask again.`));
     if (!plan.awaits_columns) {
       const actions = el("div", "actions");
       const b = el("button", "", "Build it with menus instead");
@@ -409,7 +435,7 @@ async function execute(p: Pending): Promise<void> {
   undo.addEventListener("click", () => guarded(async () => {
     undo.disabled = true;
     await state.host!.removeSheets(made!.map((m) => m.name));
-    if (state.ref && made!.some((m) => m.name === state.ref!.sheet)) state.ref = undefined;
+    if (state.ref && made!.some((m) => m.name === state.ref!.sheet)) state.ref = state.sourceRef;
     state.web?.sheetsChanged();
     post("bot", "Undone. The new sheets are removed.");
   }));
@@ -419,7 +445,6 @@ async function execute(p: Pending): Promise<void> {
     carry.type = "button";
     carry.addEventListener("click", () => guarded(async () => {
       carry.disabled = true;
-      state.columns = undefined; // the result has its own columns
       state.ref = await state.host!.refOf(made![0].name);
       await readSource(state.ref);
       post("bot", `OK. The next commands work on “${made![0].name}”. Press “Use my table” to go back to your own table.`);
@@ -550,6 +575,7 @@ function wire(): void {
     state.ref = undefined;
     state.asked = null;
     state.columns = undefined;
+    state.sourceRef = undefined;
     await readSource(undefined, true);
   }));
 }
@@ -570,7 +596,7 @@ async function start(): Promise<void> {
       post,
       guarded,
       readSource: (ref, fresh) => readSource(ref, fresh),
-      reset: () => { state.ref = undefined; state.asked = null; state.columns = undefined; state.pending = null; },
+      reset: () => { state.ref = undefined; state.asked = null; state.columns = undefined; state.sourceRef = undefined; state.pending = null; },
       miniTable,
       setStatus,
       cellText,
