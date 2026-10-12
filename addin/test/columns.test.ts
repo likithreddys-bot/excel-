@@ -44,6 +44,16 @@ describe("autoColumns", () => {
   });
 });
 
+describe("autoColumns on real phrasing", () => {
+  const H = HEADERS.concat(["loan_due_date", "loan_repaid_date", "marital_status", "overdue_amt", "principal_amt", "status_code"]);
+  it("'state wise repayment percentage of b0 amount' reads the right columns and not unrelated ones", () => {
+    const cols = autoColumns(H, 106_394, "show state wise repayment percentage of b0 amount");
+    expect(cols).toEqual(expect.arrayContaining(["statename", "b0_amt", "alloc_amt", "repaid_amt"]));
+    for (const unrelated of ["marital_status", "overdue_amt", "status_code", "salary"]) expect(cols).not.toContain(unrelated);
+    expect(cols.length).toBeLessThan(20);
+  });
+});
+
 describe("suggestPercentages", () => {
   const t = makeTable(
     ["statename", "b0_amt", "alloc_amt", "due_date", "repaid_date", "cur_bucket"],

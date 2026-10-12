@@ -117,3 +117,67 @@ describe("amounts as a percent of each other, and two-column rules", () => {
     expect(by(t, "MAHARASHTRA", "b0_paid_pct")).toBe(50);
   });
 });
+
+describe("repayment percentage, as people actually phrase it (real column names)", () => {
+  // b0_amt = repaid on time (bucket B0), alloc_amt = amount due
+  const loans = (): Sheets => new Map([["Result", makeTable(
+    ["statename", "before_b0_amt", "b0_amt", "alloc_amt", "tot_amt", "repaid_amt", "marital_status"],
+    [
+      ["MAHARASHTRA", 1000, 1000, 1000, 1000, 1000, "Single"], ["MAHARASHTRA", 1000, 0, 1000, 1000, 1200, "married"],
+      ["KARNATAKA", 0, 0, 2000, 0, 0, "Single"], ["KARNATAKA", 2000, 2000, 2000, 2000, 2000, "married"],
+      ["DELHI", 500, 500, 500, 500, 500, "Single"],
+    ],
+  )]]);
+  const go = (cmd: string) => {
+    const plan = makePlan(loans(), cmd);
+    return { plan, out: plan.clarification_question ? null : [...applyPlan(loans(), plan).values()][0] };
+  };
+  const pct = (t: NonNullable<ReturnType<typeof go>["out"]>, state: string) => t.columns[t.columns.length - 1].values[t.columns[0].values.indexOf(state)];
+
+  it.each([
+    "show state wise repayment percentage of b0 amount",
+    "i want total statewise repaid b0 percentage",
+    "show statename wise b0 repayment percentage",
+  ])("%s -> b0_amt as a percent of alloc_amt per state", (cmd) => {
+    const { plan, out } = go(cmd);
+    expect(plan.clarification_question, cmd).toBeNull();
+    expect(out!.columns.map((c) => c.name)).toEqual(["statename", "sum_b0_amt", "sum_alloc_amt", "b0_amt % of alloc_amt"]);
+    expect(pct(out!, "MAHARASHTRA")).toBe(50);  // 1000 of 2000
+    expect(pct(out!, "KARNATAKA")).toBe(50);    // 2000 of 4000
+    expect(pct(out!, "DELHI")).toBe(100);
+  });
+
+  it("'b0 amount' means the column b0_amt; 'statewise' without a space means by state", () => {
+    const { plan, out } = go("statewise total b0 amount");
+    expect(plan.clarification_question).toBeNull();
+    expect(out!.columns.map((c) => c.name)).toEqual(["statename", "sum_b0_amt"]);
+  });
+
+  it("'state wise' means statename, not state_category", () => {
+    const sheets: Sheets = new Map([["Result", makeTable(
+      ["statename", "state_category", "b0_amt", "alloc_amt"],
+      [["MH", "A", 100, 200], ["KA", "B", 50, 100], ["DL", "A", 0, 100]],
+    )]]);
+    const plan = makePlan(sheets, "show state wise repayment percentage of b0 amount");
+    expect(plan.clarification_question).toBeNull();
+    const t = [...applyPlan(sheets, plan).values()][0];
+    expect(t.columns[0].name).toBe("statename");
+    expect(t.nrows).toBe(3);
+  });
+
+  it("total repayment: tot_amt over alloc_amt", () => {
+    const { out } = go("statewise repayment percentage of tot_amt");
+    expect(pct(out!, "MAHARASHTRA")).toBe(100);
+    expect(pct(out!, "KARNATAKA")).toBe(50);
+  });
+
+  it("'repaid percentage' alone is repaid_amt over what was due", () => {
+    const { out } = go("statename wise repaid percentage");
+    expect(out!.columns.map((c) => c.name)).toEqual(["statename", "sum_repaid_amt", "sum_alloc_amt", "repaid_amt % of alloc_amt"]);
+    expect(pct(out!, "KARNATAKA")).toBe(50);
+  });
+
+  it("an on-time percentage that points at no amount is still a question", () => {
+    expect(go("statename wise on time percentage").plan.clarification_question).toMatch(/won't guess/);
+  });
+});

@@ -316,7 +316,14 @@ function liveOptions(plan: Plan, source: Table, result: Sheets): { pivot: PivotS
 
 const isLive = (): boolean => document.getElementById("live") instanceof HTMLInputElement && $<HTMLInputElement>("live").checked;
 
+function clearChat(): void {
+  $("thread").replaceChildren();
+  state.pending = null;
+  state.asked = null;
+}
+
 async function preview(text: string): Promise<void> {
+  if (/^\s*(?:please\s+)?(?:clear|reset|clean)\s+(?:the\s+|this\s+|my\s+)?(?:chat|conversation|messages?|screen|history)\s*\.?\s*$/i.test(text)) { clearChat(); return; }
   post("user", text);
   const had = new Set(state.table?.columns.map((c) => c.name));
   const table = await readSource(state.ref, false, text);
@@ -404,7 +411,7 @@ function renderPreview(p: Pending, title = "Here's what I'll do:"): void {
   else if (p.liveCols) card.append(el("div", "note", `Live: ${p.liveCols.map((c) => `“${c.name}”`).join(", ")} will be formulas that update by themselves.`));
   const first = p.result.get(names[0])!;
   const paint = highlightPainter(first, liveFormats(p.formats, p.result));
-  if (first.nrows) card.append(miniTable(first, 5, paint), el("div", "muted", names.length > 1 ? `First rows of “${names[0]}”` : "First rows of the result"));
+  if (first.nrows) card.append(miniTable(first, first.nrows <= 50 ? first.nrows : 10, paint), el("div", "muted", first.nrows <= 50 ? (names.length > 1 ? `“${names[0]}”` : "The result") : names.length > 1 ? `First rows of “${names[0]}”` : "First rows of the result"));
   else card.append(el("div", "note", "No rows match. Nothing would be written."));
   for (const f of liveFormats(p.formats, p.result)) {
     if (f.op !== "chart") continue;
@@ -572,6 +579,7 @@ function wire(): void {
     try { live.checked = localStorage.getItem("sheet-assistant-live") === "1"; } catch { /* storage can be blocked: the default is fine */ }
     live.addEventListener("change", () => { try { localStorage.setItem("sheet-assistant-live", live.checked ? "1" : "0"); } catch { /* ignore */ } });
   }
+  document.getElementById("clear-chat")?.addEventListener("click", clearChat);
   document.getElementById("change-columns")?.addEventListener("click", () => {
     if (state.busy || !state.host) return;
     void guarded(async () => {

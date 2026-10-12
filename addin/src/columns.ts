@@ -11,11 +11,20 @@ const STOP = new Set(("show me the of by per each and or all get give what is ar
 
 /** Words that say "a rate / how much was paid", so the amounts it is probably compared with are worth reading too. */
 const RATE_WORDS = /\b(?:paid|unpaid|on\s*time|ontime|late|overdue|delinquen\w*|default\w*|collect\w*|recover\w*|repay\w*|percent(?:age)?|%|ratio|rate)\b/i;
-/** Column names that usually hold "what was due / total / paid". */
-const COMPANIONS = /alloc|due|repaid|paid|principal|emi|tot(?:al)?_?amt|outstanding|overdue|bucket|status/i;
+/** Words that mean the same thing in a sentence and in a header. */
+const SAME: Record<string, string> = { repayment: "repaid", repayments: "repaid", repaying: "repaid", amount: "amt", amounts: "amt" };
+
+/** Columns that usually hold "what was due / total / paid": amounts and dates about dues and repayments, and the delay bucket. */
+const COMPANION_NAMES = new Set(["alloc", "due", "repaid", "principal", "emi", "outstanding"]);
+function isCompanion(header: string): boolean {
+  const toks = tokens(header);
+  const last = toks[toks.length - 1];
+  return toks[toks.length - 1] === "bucket" || (toks[0] === "tot" || toks[0] === "total") && last === "amt"
+    || toks.some((t) => COMPANION_NAMES.has(t)) && (last === "amt" || last === "amount" || last === "date");
+}
 
 export const sentenceWords = (text: string): string[] =>
-  [...new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 2 && !STOP.has(w)))];
+  [...new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 2 && !STOP.has(w)).map((w) => SAME[w] ?? w))];
 
 const tokens = (header: string): string[] => header.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 
@@ -33,7 +42,7 @@ export function matchScore(header: string, words: string[]): number {
   return score;
 }
 
-const spaced = (s: string) => ` ${s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
+const spaced = (s: string) => ` ${s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `.replace(/ amounts? /g, " amt "); // "b0 amount" is typing b0_amt
 
 /**
  * The columns to have loaded to answer `text`: the ones already loaded, plus those the sentence names or
@@ -53,8 +62,8 @@ export function autoColumns(headers: string[], rows: number, text: string, curre
     .sort((a, b) => b.score - a.score);
   let picked = [...typed.filter((h) => !have.has(h.toLowerCase())), ...scored.slice(0, 14).map((x) => x.h)];
   if (RATE_WORDS.test(text) && picked.length) {
-    const more = headers.filter((h) => !have.has(h.toLowerCase()) && !picked.includes(h) && COMPANIONS.test(h));
-    picked = picked.concat(more.slice(0, 10));
+    const more = headers.filter((h) => !have.has(h.toLowerCase()) && !picked.includes(h) && isCompanion(h));
+    picked = picked.concat(more.slice(0, 8));
   }
   const room = Math.max(1, Math.floor(maxCells / Math.max(1, rows)) - have.size);
   const chosen = new Set([...current, ...picked.slice(0, room)].map((c) => c.toLowerCase()));
