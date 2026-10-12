@@ -215,8 +215,9 @@ export class Parser {
         const words = toks.slice(i, j).map((t) => t.k);
         if (!words.every(Boolean) || words.every((w) => STOP.has(w))) continue;
         const k = words.join("");
+        const ka = k.replace(/amounts?/g, "amt"); // "b0 amount" (two or more words) means the column b0_amt; a lone "amount" is left alone so a text column "amt" still gets the "saved as text" hint
         for (const [c, ck] of this.colKeys) {
-          if (k === ck || singular(k) === singular(ck)) cands.push({ level: 3, len: j - i, i, j, column: c });
+          if (k === ck || singular(k) === singular(ck) || (words.length > 1 && ka !== k && ka === ck.replace(/amounts?/g, "amt"))) cands.push({ level: 3, len: j - i, i, j, column: c });
           else if (k.length >= 5 && similarity(k, ck) >= 0.88) cands.push({ level: 2, len: j - i, i, j, column: c });
         }
         if (j === i + 1 && k.length >= 4 && !STOP.has(k)) {
@@ -406,18 +407,33 @@ export class Parser {
 
   /** "state wise total amount" means "total amount by state" (also "month-wise"). Only when the word before "wise" is a column or a date part. */
   private normaliseWise(cl: string): string {
-    const m = /\b([A-Za-z][A-Za-z0-9_]*)(?:\s+|-)wise\b/i.exec(cl);
-    if (!m) return cl;
-    let word = m[1];
-    if (!/^(?:month|year|quarter|week|day|date|weekday)$/i.test(word) && !this.findColumns(word).length) {
-      // "state wise" for a column called statename: a single column that starts with the word
-      const k = key(word);
-      const starts = k.length >= 3 ? this.columns.filter((c) => key(c).startsWith(k)) : [];
-      if (starts.length !== 1) return cl;
-      word = starts[0];
+    for (const m of cl.matchAll(/\b([A-Za-z][A-Za-z0-9_]*?)(?:\s+|-)?wise\b/gi)) {
+      let word = m[1];
+      if (!/^(?:month|year|quarter|week|day|date|weekday)$/i.test(word)) {
+        const col = this.wiseColumn(word);
+        if (!col) continue; // "otherwise", "likewise": not a column
+        word = col;
+      }
+      const rest = (cl.slice(0, m.index) + " " + cl.slice(m.index! + m[0].length)).replace(/\s{2,}/g, " ").trim();
+      return `${rest} by ${word}`;
     }
-    const rest = (cl.slice(0, m.index) + " " + cl.slice(m.index + m[0].length)).replace(/\s{2,}/g, " ").trim();
-    return `${rest} by ${word}`;
+    return cl;
+  }
+
+  /** The column "state" means in "state wise": the exact name, else statename / state_name, else the shortest column starting with it. */
+  private wiseColumn(word: string): string | null {
+    const k = key(word);
+    const exact = this.columns.find((c) => key(c) === k);
+    if (exact) return exact;
+    if (k.length >= 3) {
+      const starts = this.columns.filter((c) => key(c).startsWith(k)).sort((x, y) => key(x).length - key(y).length);
+      const named = starts.find((c) => key(c) === `${k}name` || key(c) === `${k}s` || key(c) === `${k}nm`);
+      if (named) return named;
+      if (starts.length === 1 || (starts.length > 1 && key(starts[0]).length < key(starts[1]).length)) return starts[0];
+      if (starts.length > 1) return null; // equally plausible: don't guess
+    }
+    const found = this.findColumns(word);
+    return found.length === 1 ? found[0].column : null;
   }
 
   /**
@@ -435,11 +451,11 @@ export class Parser {
       groupText = cl.slice(g.index! + g[0].length);
       body = cl.slice(0, g.index);
     }
-    const ratio = this.parseRatio(body, groupText);
+    const ratio = this.parseRatio(body, groupText) ?? this.repayRatio(body, groupText);
     if (ratio) return ratio;
     const rule = /\b(?:where|with|having|that|who|which|whose)\s+(.+)$/i.exec(body);
     if (!rule) {
-      if (!/\b(?:paid|unpaid|on\s*time|ontime|late|overdue|delinquen\w*|default\w*|success\w*|fail\w*|approv\w*|reject\w*|bounce\w*|npa|active|closed|dormant|convert\w*)\b/.test(low)) return null;
+      if (!/\b(?:paid|unpaid|repay\w*|repaid|collect\w*|recover\w*|on\s*time|ontime|late|overdue|delinquen\w*|default\w*|success\w*|fail\w*|approv\w*|reject\w*|bounce\w*|npa|active|closed|dormant|convert\w*)\b/.test(low)) return null;
       const by = groupText.trim() ? this.findColumns(groupText).map((x) => x.column)[0] : undefined;
       const g = by ?? "<group column>";
       throw new ParseError(
@@ -486,12 +502,41 @@ export class Parser {
     const [prefix, found] = groupText.trim() ? this.dims(groupText) : [[] as DatePartStep[], [] as Mention[]];
     const groupCols = unique(found.map((x) => x.column)).filter((c) => c !== a && c !== b);
     if (groupText.trim() && !groupCols.length) throw new ParseError(`I couldn't find a column for “${groupText.trim()}”. Columns: ${this.columns.join(", ")}`);
+    return this.ratioSteps(a, b, prefix, groupCols);
+  }
+
+  private ratioSteps(a: string, b: string, prefix: DatePartStep[], groupCols: string[]): Step[] {
     const name = `${a} % of ${b}`;
     return [...prefix, {
       op: "group_by", columns: groupCols,
       aggregations: [{ column: a, func: "sum" }, { column: b, func: "sum" }],
       calculated: { [name]: `round([${a}] / [${b}] * 100, 2)` },
     }];
+  }
+
+  /**
+   * "repayment percentage of b0 amount by state", "total statewise repaid b0 percentage": how much of what was due was repaid.
+   * The repaid amount is the b0 / repaid / total column the sentence points at; what was due is the allocated / due / EMI amount.
+   */
+  private repayRatio(body: string, groupText: string): Step[] | null {
+    if (!/\b(?:repay\w*|repaid|paid|collect\w*|recover\w*)\b/i.test(body)) return null;
+    const paidish = (c: string) => /(^|_)(b\d+|repaid|paid|tot|total|collected|recovered)(_|$)/i.test(c);
+    const plain = (n: string) => n.split(/[^a-z0-9]+/i).length * 1000 + n.length;
+    let nums = unique(this.findColumns(body).map((x) => x.column)).filter((c) => this.numericCols.includes(c) && paidish(c));
+    // A named bucket ("b0") beats a loosely matched word ("repaid"): b0_amt, the plainest of the b0 columns.
+    const bucket = /\bb(\d+)\b/i.exec(body);
+    if (bucket) {
+      const inBucket = this.numericCols.filter((c) => new RegExp(`(^|_)b${bucket[1]}(_|$)`, "i").test(c)).sort((x, y) => plain(x) - plain(y));
+      if (inBucket.length) nums = inBucket;
+    }
+    if (!nums.length) return null;
+    const a = nums[0];
+    const due = [/alloc/i, /due/i, /emi/i].map((re) => this.numericCols.find((c) => re.test(c) && c !== a && /amt|amount/i.test(c))).find(Boolean);
+    if (!due) return null;
+    const [prefix, found] = groupText.trim() ? this.dims(groupText) : [[] as DatePartStep[], [] as Mention[]];
+    const groupCols = unique(found.map((x) => x.column)).filter((c) => c !== a && c !== due);
+    if (groupText.trim() && !groupCols.length) return null;
+    return this.ratioSteps(a, due, prefix, groupCols);
   }
 
   private isGroup(low: string): boolean {
