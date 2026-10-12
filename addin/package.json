@@ -2,7 +2,7 @@
   "name": "sheet-assistant-addin",
   "version": "0.1.0",
   "private": true,
-  "description": "Excel add-in: describe what you want done to a table in plain English. Rule-based, no AI, data never leaves the machine.",
+  "description": "Excel Agent (AI-planned, engine-calculated analysis of several files) and the rule-based Sheet Assistant Excel add-in.",
   "type": "module",
   "scripts": {
     "dev": "vite",

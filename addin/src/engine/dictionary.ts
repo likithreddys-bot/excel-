@@ -16,6 +16,8 @@ export interface SegmentDef {
 
 export interface Dictionary {
   segments: { user_type?: SegmentDef };
+  /** Answers the person gave to the AI planner's questions ("old user: cx_repeat_flag is 1"), kept for this file layout. */
+  notes?: string[];
 }
 
 export interface DefinitionOption { label: string; def: SegmentDef }

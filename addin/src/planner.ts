@@ -28,7 +28,7 @@ export function schemaOf(t: Table): Schema {
 
 export interface PlannerContext { schema: Schema; dictionary: Dictionary }
 export type PlannerResult =
-  | { kind: "plan"; plan: Plan }
+  | { kind: "plan"; plan: Plan; /** the assumptions behind it, in plain words */ reading?: string[] }
   | { kind: "question"; question: string; options?: string[] };
 
 export interface Planner {
@@ -50,14 +50,19 @@ function reads(step: Step): string[] {
     case "date_part": return [step.column];
     case "label": return step.cases.flatMap((c) => c.when.conditions.map((x) => x.column));
     case "compute": case "formula": return refs("expr" in step ? step.expr : step.formula);
+    case "filter_formula": return refs(step.formula);
+    case "lookup": return [step.left_on];
+    case "compare": return step.left_on ? [step.left_on] : [];
     default: return [];
   }
 }
 const refs = (expr: string): string[] => [...expr.matchAll(/\[([^\]]+)\]/g)].map((m) => m[1]);
 
-function adds(step: Step, available: Set<string>): Set<string> {
+function adds(step: Step, available: Set<string>, others: (name: string) => string[]): Set<string> {
   const next = new Set(available);
   switch (step.op) {
+    case "lookup": for (const c of step.columns) next.add(available.has(c) ? `${c} (${step.file})` : c); break;
+    case "append": for (const c of others(step.file)) next.add(c); break;
     case "label": case "compute": case "formula": case "date_part": next.add(step.name); break;
     case "group_by": return new Set([...step.columns, ...step.aggregations.map((a) => `${a.func}_${a.column}`), ...Object.keys(step.calculated)]);
     case "pivot": return new Set([...step.rows, ...Object.keys(step.calculated), ...(step.values ? [step.values] : [])]);
@@ -69,7 +74,7 @@ function adds(step: Step, available: Set<string>): Set<string> {
 }
 
 /** Problems with a plan, in plain words. Empty means it is safe to run. */
-export function validatePlan(plan: Plan, t: Table): string[] {
+export function validatePlan(plan: Plan, t: Table, others: (name: string) => string[] = () => []): string[] {
   const problems: string[] = [];
   if (!plan.steps.length) problems.push("The plan has no steps.");
   let available = new Set(t.columns.map((c) => c.name));
@@ -77,7 +82,7 @@ export function validatePlan(plan: Plan, t: Table): string[] {
     for (const c of reads(step)) {
       if (!available.has(c)) problems.push(`Step ${i + 1} (${step.op}) uses the column “${c}”, which does not exist here.`);
     }
-    available = adds(step, available);
+    available = adds(step, available, others);
   });
   return problems;
 }

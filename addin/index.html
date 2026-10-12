@@ -3,165 +3,110 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sheet Assistant</title>
-<meta name="description" content="Open an Excel or CSV file and say what you want done, in plain words. Totals, pivots, filters, clean-up, lookups and charts. Your file never leaves your computer.">
+<title>Excel Agent</title>
+<meta name="description" content="Add your Excel or CSV files and ask for any analysis or report in plain words. The AI plans the work; every number is calculated on your computer.">
 <link rel="icon" href="/assets/icon-32.png">
 <script>
-  // Apply a saved light/dark choice before the page paints (no flash).
   try { var t = localStorage.getItem("sheet-assistant-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
 </script>
-<link rel="stylesheet" href="/src/taskpane.css">
+<link rel="stylesheet" href="/src/agent/agent.css">
 </head>
-<body data-mode="web">
+<body>
 
-<header id="top">
-  <a class="brand" href="./" aria-label="Sheet Assistant home">
-    <img src="/assets/icon-32.png" width="28" height="28" alt="">
-    <span>Sheet Assistant</span>
+<header class="top">
+  <a class="brand" href="./" aria-label="Excel Agent home">
+    <img src="/assets/icon-32.png" width="26" height="26" alt="">
+    <span>Excel Agent</span>
   </a>
-  <span class="pill private" title="Files are read inside this browser tab. Nothing is uploaded.">
-    <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M8 1a3.5 3.5 0 0 0-3.5 3.5V6H4a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1h-.5V4.5A3.5 3.5 0 0 0 8 1Zm2 5H6V4.5a2 2 0 1 1 4 0V6Z"/></svg>
-    Your files never leave this computer
-  </span>
+  <span class="pill" title="Files are read in this browser tab. The AI sees column facts, never your rows.">Calculations run on your computer</span>
   <span class="grow"></span>
-  <button id="open-more" class="ghost hidden" type="button">Open file…</button>
-  <button id="theme" class="ghost icon" type="button" aria-label="Switch between light and dark" title="Light / dark">
-    <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 1.5a.75.75 0 0 1 .75.75v1a.75.75 0 0 1-1.5 0v-1A.75.75 0 0 1 8 1.5Zm0 10a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0-1.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm5.7-2a.75.75 0 0 1 0 1.5h-1a.75.75 0 0 1 0-1.5h1ZM8 12.5a.75.75 0 0 1 .75.75v1a.75.75 0 0 1-1.5 0v-1A.75.75 0 0 1 8 12.5ZM3.3 7.25a.75.75 0 0 1 0 1.5h-1a.75.75 0 0 1 0-1.5h1Z"/></svg>
-  </button>
+  <a class="link small" href="classic.html" title="The earlier rule-based assistant, no AI">Classic app</a>
+  <button id="open-settings" class="ghost" type="button">AI settings</button>
+  <button id="theme" class="ghost icon" type="button" aria-label="Switch between light and dark" title="Light / dark"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 1.5a.75.75 0 0 1 .75.75v1a.75.75 0 0 1-1.5 0v-1A.75.75 0 0 1 8 1.5Zm0 10a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm0-1.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm5.7-2a.75.75 0 0 1 0 1.5h-1a.75.75 0 0 1 0-1.5h1ZM8 12.5a.75.75 0 0 1 .75.75v1a.75.75 0 0 1-1.5 0v-1A.75.75 0 0 1 8 12.5ZM3.3 7.25a.75.75 0 0 1 0 1.5h-1a.75.75 0 0 1 0-1.5h1Z"/></svg></button>
 </header>
 
-<!-- ============ before a file is opened ============ -->
-<div id="landing">
-  <section class="hero">
-    <h1>Ask your spreadsheet anything, in plain words.</h1>
-    <p class="lead">Filter, total, pivot, clean up, compare and chart your Excel or CSV data. No formulas to learn.</p>
-
-    <div id="drop-box" role="button" tabindex="0" aria-label="Choose a file">
-      <svg viewBox="0 0 48 48" width="44" height="44" aria-hidden="true"><rect x="8" y="5" width="32" height="38" rx="4" fill="none" stroke="currentColor" stroke-width="2.5"/><path d="M16 17h16M16 25h16M16 33h9" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>
-      <div class="drop-hint">Drop an Excel or CSV file here</div>
-      <div class="drop-sub">.xlsx, .csv or .tsv. Lakhs of rows are fine.</div>
-      <div class="drop-actions">
-        <button id="open-file" class="primary big" type="button">Choose a file…</button>
-        <button id="try-sample" class="big" type="button">Try it with sample data</button>
+<div class="layout">
+  <aside id="files" aria-label="Your files">
+    <div class="panel-head"><h2>Files</h2></div>
+    <div id="drop" class="drop" role="button" tabindex="0" aria-label="Add files">
+      <strong>Drop Excel or CSV files here</strong>
+      <span class="muted small">New customers, old customers, repayments, policy… several at once.</span>
+      <div class="row">
+        <button id="add-files" class="primary" type="button">Add files…</button>
+        <button id="try-sample" type="button">Try sample data</button>
       </div>
       <input id="file-input" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt,.xls,.xlsb" multiple hidden>
     </div>
-    <p class="fine">Nothing is uploaded: your file is read inside this browser tab, and it's gone when you close it.</p>
-  </section>
-
-  <section class="steps3" aria-label="How it works">
-    <div><span class="stepnum">1</span><h2>Open a file</h2><p>Drop in any Excel or CSV file. Big ones are fine: you pick just the columns you need.</p></div>
-    <div><span class="stepnum">2</span><h2>Say what you want</h2><p>Type it like you'd tell a colleague: <em>total amount by branch</em>, <em>only debits over 5000</em>.</p></div>
-    <div><span class="stepnum">3</span><h2>Check, then download</h2><p>You see exactly what will happen before it does. Your original data is never changed.</p></div>
-  </section>
-
-  <section class="facts" aria-label="Good to know">
-    <div><strong>No AI, no guessing.</strong> Fixed rules turn your sentence into steps, so the same sentence always gives the same answer.</div>
-    <div><strong>Private by design.</strong> There is no server that receives your data. Close the tab and it's gone.</div>
-    <div><strong>Built for banking-size data.</strong> Tested with 2 lakh rows and a 173 MB, 298-column file.</div>
-  </section>
-</div>
-
-<!-- ============ once a file is open ============ -->
-<div id="app" class="hidden">
-  <section id="data-panel" aria-label="Your data">
-    <div id="source" class="card">
-      <div id="sheet-row" class="row hidden">
-        <label for="sheet-picker" class="muted">Working on</label>
-        <select id="sheet-picker" class="grow"></select>
-      </div>
-      <div id="source-text" class="muted">No file opened yet.</div>
-      <div id="source-warning" class="note hidden"></div>
-      <div id="columns-note" class="row hidden"><span id="columns-note-text" class="grow muted"></span><button id="change-columns" class="secondary" type="button">Change columns…</button></div>
-      <div id="findings" class="hidden"></div>
-      <details id="columns-box" class="hidden">
-        <summary>Columns I can see</summary>
-        <div id="columns" class="chips"></div>
-      </details>
+    <ul id="table-list" class="tables"></ul>
+    <div class="panel-foot">
+      <button id="download-report" class="primary wide" type="button" disabled>Download report (.xlsx)</button>
+      <button id="forget-notes" class="ghost small wide" type="button">Forget saved definitions</button>
     </div>
+  </aside>
 
-    <details id="grid-card" class="card hidden" open>
-      <summary class="grid-head">
-        <span><strong>Your data</strong> <span id="grid-sub" class="muted"></span></span>
-        <label class="muted small" onclick="event.stopPropagation()">Show
-          <select id="grid-rows"><option>25</option><option selected>100</option><option>500</option></select> rows
-        </label>
-      </summary>
-      <div id="grid" class="grid-wrap" tabindex="0"></div>
-      <div class="muted small">Click a column heading to put its name in your sentence.</div>
-    </details>
-  </section>
-
-  <section id="assistant" aria-label="Assistant">
-    <details id="help">
-      <summary>What can I ask?</summary>
-      <div class="help-body">
-        <p class="muted small">Click one to start a sentence, then change the column names to yours.</p>
-        <div class="help-group"><div class="label">Find and sort</div><div class="chips">
-          <button type="button" class="chip">only rows where [amount] &gt; 5000</button>
-          <button type="button" class="chip">only rows where [city] is Mumbai</button>
-          <button type="button" class="chip">sort by [amount] descending</button>
-          <button type="button" class="chip">top 10 by [amount]</button>
-          <button type="button" class="chip">remove duplicates</button>
-        </div></div>
-        <div class="help-group"><div class="label">Totals and pivots</div><div class="chips">
-          <button type="button" class="chip">total [amount] by [branch]</button>
-          <button type="button" class="chip">how many rows per [category]</button>
-          <button type="button" class="chip">average [amount] by [branch] and [category]</button>
-          <button type="button" class="chip">percentage of rows where [status] is [PAID] by [state]</button>
-          <button type="button" class="chip">repayment percentage of old users and new users as pivot table</button>
-          <button type="button" class="chip">[paid amount] as percentage of [due amount] by [state]</button>
-          <button type="button" class="chip">percentage of rows where [paid date] &lt;= [due date] by [state]</button>
-          <button type="button" class="chip">monthly totals by [category]</button>
-          <button type="button" class="chip">pivot [amount] by [category] and [type]</button>
-        </div></div>
-        <div class="help-group"><div class="label">New columns (if / else)</div><div class="chips">
-          <button type="button" class="chip">add column grade = IF([amount]&gt;50000,"High","Low")</button>
-          <button type="button" class="chip">add column gst = [amount] * 0.18</button>
-          <button type="button" class="chip">add % of total [amount]</button>
-          <button type="button" class="chip">rank by [amount]</button>
-        </div></div>
-        <div class="help-group"><div class="label">Tidy up</div><div class="chips">
-          <button type="button" class="chip">trim spaces</button>
-          <button type="button" class="chip">fill blank [city] with Unknown</button>
-          <button type="button" class="chip">convert [amount] to number</button>
-          <button type="button" class="chip">split [name] into first and last</button>
-        </div></div>
-        <div class="help-group"><div class="label">Other sheets, charts, colours</div><div class="chips">
-          <button type="button" class="chip">bring [manager] from [Branches] on [branch]</button>
-          <button type="button" class="chip">bar chart of total [amount] by [category]</button>
-          <button type="button" class="chip">highlight rows where [amount] &gt; 1 lakh in red</button>
-          <button type="button" class="chip">show [amount] in rupees</button>
-        </div></div>
+  <main id="chat" aria-label="Agent">
+    <div id="setup" class="banner hidden">
+      <div><strong>Connect the AI to start.</strong> Paste a free Gemini API key in AI settings. The key stays in this browser.</div>
+      <button id="setup-open" class="primary" type="button">Open AI settings</button>
+    </div>
+    <div id="thread" aria-live="polite">
+      <div class="msg agent intro">
+        <p><strong>Hi, I'm your Excel agent.</strong> Add your files on the left, then ask for what you need, in your own words. For example:</p>
+        <ul>
+          <li>Repayment % of old vs new customers as a pivot table</li>
+          <li>Monthly collection report by state, with a chart</li>
+          <li>Compare repayment under the old and new policy</li>
+        </ul>
+        <p class="muted small">I plan the work and explain it; every number is calculated on this computer by an exact engine, and each result is a sheet you can download.</p>
       </div>
-    </details>
-
-    <div id="chat-bar"><button id="clear-chat" class="ghost small" type="button" title="Remove the messages below (your data stays loaded)">Clear chat</button></div>
-    <main id="thread" aria-live="polite"></main>
-
-    <footer id="dock">
-      <section id="examples-box" class="hidden">
-        <div class="label">Try one of these</div>
-        <div id="examples" class="chips"></div>
-      </section>
-      <div id="builder-row"><button type="button" id="open-builder" class="linklike">Build it with menus…</button></div>
-      <div id="busy" class="hidden">
-        <div id="status" class="muted hidden" role="status" aria-live="polite"></div>
-        <div id="bar" aria-hidden="true"><i></i></div>
-        <button id="cancel-read" class="small" type="button">Cancel</button>
+    </div>
+    <div id="suggestions" class="chips hidden"></div>
+    <div id="status" class="status hidden" role="status"><span class="spinner" aria-hidden="true"></span><span id="status-text"></span></div>
+    <form id="ask">
+      <textarea id="input" rows="2" placeholder="Ask for an analysis or a report…" aria-label="Your request"></textarea>
+      <div class="ask-buttons">
+        <button id="send" class="primary" type="submit">Send</button>
+        <button id="stop" class="hidden" type="button">Stop</button>
       </div>
-      <form id="ask">
-        <textarea id="input" rows="1" placeholder="Say what you want, e.g. total amount by branch" aria-label="What do you want done?"></textarea>
-        <button id="send" class="primary">Preview</button>
-      </form>
-    </footer>
+    </form>
+    <div class="row thin"><button id="new-chat" class="ghost small" type="button">New conversation</button></div>
+  </main>
+
+  <section id="viewer" aria-label="Sheet viewer">
+    <div class="panel-head">
+      <h2 id="viewer-title">Sheets</h2>
+      <span class="grow"></span>
+      <button id="download-sheet" class="small hidden" type="button">Download this sheet</button>
+    </div>
+    <div id="viewer-body" class="viewer-body"><p class="muted">Results appear here as sheets. Click a file or a result on the left to look at it.</p></div>
   </section>
 </div>
 
-<footer id="site-foot" class="fine">
-  Sheet Assistant runs entirely in your browser. No AI, no uploads, no tracking.
-</footer>
+<dialog id="settings" aria-label="AI settings">
+  <form method="dialog" class="settings">
+    <h2>AI settings</h2>
+    <label class="field">Gemini API key
+      <input id="s-key" type="password" autocomplete="off" placeholder="Paste your key">
+    </label>
+    <p class="muted small">Get a free key at <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. It is stored in this browser only.</p>
+    <label class="field">Model
+      <input id="s-model" type="text" placeholder="gemini-2.5-flash">
+    </label>
+    <label class="check"><input id="s-share" type="checkbox"> Share the common values of category columns (state, status, policy name, 0/1 flags)</label>
+    <label class="check"><input id="s-results" type="checkbox"> Let the AI read small summary results (up to 60 rows, no personal or id columns) so it can explain them</label>
+    <div class="note">
+      <strong>Sent to Google:</strong> your request, table and column names, each column's type, range and share of empty cells, and what the two boxes above allow.
+      <strong>Never sent:</strong> your rows, names, phone numbers, PAN, account numbers or ids. A free key may let Google use prompts to improve its products: use test or masked files with it.
+    </div>
+    <p id="s-status" class="small" role="status"></p>
+    <div class="row end">
+      <button id="s-test" type="button">Test the key</button>
+      <button value="cancel" type="submit">Close</button>
+      <button id="s-save" class="primary" type="button">Save</button>
+    </div>
+  </form>
+</dialog>
 
-<script type="module" src="/src/taskpane.ts"></script>
+<script type="module" src="/src/agent/main.ts"></script>
 </body>
 </html>

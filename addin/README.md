@@ -1,3 +1,19 @@
+# Excel Agent and Sheet Assistant
+
+## Excel Agent (the website's home page, `index.html`)
+
+An AI analyst for lending data. Add several files at once (new customers, old customers, loans, repayments, policy), ask for an analysis or a report in your own words, and get result sheets you can download as one Excel workbook.
+
+- **How it works:** a Gemini model plans the work with tools: it looks at the tables, runs plans (filters, pivots, ratios of totals, joins between files, stacking files, charts), checks the results and asks you when a definition matters ("what counts as an old customer?"). Every number is calculated in the browser by the same exact engine as the classic app, on every row.
+- **What the model sees:** your request, table and column names, each column's type, range and share of empty cells, the common values of category columns (state, status, policy name; can be switched off) and small summary results (at most 60 rows, no personal or id columns; can be switched off). **Never** your rows, names, phone numbers, PAN, account numbers or ids. Tests check this.
+- **Remembers definitions** you confirm (in this browser), and keeps the conversation so follow-ups work ("now by state").
+- **Report download:** every result sheet plus a **How calculated** sheet listing the steps and notes behind each one.
+- **Setup:** open **AI settings** and paste a Gemini API key (free at aistudio.google.com/apikey). The key stays in the browser. A free key may let Google use prompts to improve its products: use it with test or masked files. For real customer data, use a paid key under your company's agreement.
+- **Try it:** press **Try sample data** for made-up new/old customer, repayment and policy files.
+- Code: `src/agent/` (workspace, tools, agent loop, page), `src/ai/` (Gemini client, column profile, plan checker). Tests: `test/agent.test.ts`.
+
+The earlier rule-based assistant (no AI) is still there as `classic.html` and in the Excel add-in below.
+
 # Sheet Assistant: the Excel add-in
 
 Describe what you want done with your table in plain English, inside Excel. The answer appears on new sheets; your own data is never touched.
@@ -27,7 +43,7 @@ Results are written as values by default, so they match the preview exactly. Tic
 ## Two ways to use it
 
 - **Inside Excel** (the add-in): `taskpane.html`. Works on the table you click in, and writes results to new sheets.
-- **As a website**: `index.html`, the same engine in an ordinary browser tab. Drop in an `.xlsx` or `.csv`, say what you want, look at the result on the page, and **Download as Excel**. No install, works on any computer. The file is read in the browser: nothing is uploaded anywhere.
+- **As a website**: `classic.html` (the home page `index.html` is now the Excel Agent above), the same engine in an ordinary browser tab. Drop in an `.xlsx` or `.csv`, say what you want, look at the result on the page, and **Download as Excel**. No install, works on any computer. The file is read in the browser: nothing is uploaded anywhere.
 
 The page has a landing screen with a **Try it with sample data** button, a data grid of your table (click a column heading to put its name in your sentence), a "What can I ask?" guide, a progress bar with **Cancel** while a big file is read, up/down arrows to bring back earlier sentences, light and dark themes, and a stacked layout on phones.
 

@@ -14,6 +14,10 @@ import { Cancelled, Host, HostError, MAX_CELLS, Notice, SourceRef, TooWideError 
 import { autoColumns } from "./columns";
 import { Dictionary, SegmentDef, describeSegment, emptyDictionary, fingerprint, mentionsSegment } from "./engine/dictionary";
 import { suggestPercentages } from "./suggest";
+import { AiError, AiSettings, GeminiClient, defaultSettings } from "./ai/gemini";
+import { profileTable } from "./ai/profile";
+import { AiOutcome, aiColumns, aiPlan } from "./ai/run";
+import { initAiUi, loadAiSettings, renderUnderstood } from "./ai/ui";
 import type { WebHooks } from "./web/ui";
 import { Field, TEMPLATES, Template, Values, build, columnChoices, visibleFields } from "./builder";
 
@@ -50,6 +54,8 @@ const state = {
   wide: null as { headers: string[]; rows: number; approx: boolean } | null,
   /** Set on the website: file picking, downloads and charts on the page. */
   web: null as WebHooks | null,
+  /** The AI planner's settings (a Gemini key lives in this browser only). */
+  ai: defaultSettings() as AiSettings,
 };
 
 // ---------- small DOM helpers ----------
@@ -132,6 +138,7 @@ function showSource(label: string, t: Table): void {
   $("source-warning").classList.toggle("hidden", mixed.length === 0);
   showFindings(t);
   showExamples(t);
+  renderUnderstood(profileTable(t, { values: state.ai.shareValues }), state.headers.length);
   state.web?.sourceShown(t);
 }
 
@@ -182,7 +189,7 @@ async function readSource(ref?: SourceRef, fresh = false, hint?: string): Promis
   const result = isResultRef(ref);
   let columns = result ? undefined : state.columns;
   // A wide table: read the columns this sentence needs (plus those already loaded) instead of asking the user to pick.
-  if (!result && state.wide && hint !== undefined) columns = state.columns = autoColumns(state.wide.headers, state.wide.rows, hint, state.columns ?? [], undefined, dictionaryColumns());
+  if (!result && state.wide && hint !== undefined) columns = state.columns = await pickWide(state.wide.headers, state.wide.rows, hint);
   let src;
   try {
     src = await state.host!.readSource(ref, fresh, columns);
@@ -193,7 +200,7 @@ async function readSource(ref?: SourceRef, fresh = false, hint?: string): Promis
     loadDictionary();
     state.ref = state.sourceRef = e.ref ?? ref;
     showWide();
-    const cols = hint ? autoColumns(e.headers, e.rows, hint, state.columns ?? [], undefined, dictionaryColumns()) : [];
+    const cols = hint ? await pickWide(e.headers, e.rows, hint) : [];
     if (!cols.length) {
       throw new Notice(`This file has ${e.approx ? "about " : ""}${num(e.rows)} rows and ${e.headers.length} columns, too many to load all at once. `
         + (hint ? "I couldn't tell which columns you mean: name them (click a column name above to add it to your sentence)." : "Just type your question and I'll read the columns it needs."));
@@ -210,6 +217,25 @@ async function readSource(ref?: SourceRef, fresh = false, hint?: string): Promis
   showSource(src.label, src.table);
   return src.table;
 }
+
+/**
+ * The columns of a wide file this sentence needs. The rules pick by the words used; with AI on, the model also reads
+ * the column names and adds the ones it thinks the request needs (it sees names only, never data).
+ */
+async function pickWide(headers: string[], rows: number, hint: string): Promise<string[]> {
+  const base = autoColumns(headers, rows, hint, state.columns ?? [], undefined, dictionaryColumns());
+  if (!aiOn() || state.asked) return base;
+  try {
+    setStatus("Working out which columns I need…");
+    const more = await aiColumns(new GeminiClient(state.ai), hint, headers, state.dictionary.notes ?? []);
+    return [...new Set([...base, ...more])];
+  } catch (e) {
+    if (e instanceof AiError) return base; // the answer step reports AI problems; reading falls back to the rules
+    throw e;
+  }
+}
+
+const aiOn = (): boolean => state.ai.enabled && state.ai.apiKey.trim() !== "";
 
 /** Columns the saved definitions need (so a wide file reads them when "old users" is mentioned). */
 const dictionaryColumns = (): string[] => (state.dictionary.segments.user_type ? [state.dictionary.segments.user_type.column] : []);
@@ -358,6 +384,9 @@ async function preview(text: string): Promise<void> {
 async function answer(text: string, table: Table, quiet: boolean, reading = 0): Promise<void> {
   const sheets: Sheets = new Map([["Result", table]]);
 
+  // With AI on, the model reads the sheet's profile and plans; the rules below are the fallback.
+  if (aiOn() && !quiet && !reading && !state.asked && (await answerWithAi(text, table, []))) return;
+
   // A reply that is only column names answers the "which column?" question asked just before.
   const reply = state.asked ? replyColumns(sheets, text) : null;
   if (reply && reply[1].length) {
@@ -427,6 +456,79 @@ async function answer(text: string, table: Table, quiet: boolean, reading = 0): 
     offerDefinitionNote(plan);
     offerAlternatives(text, table, plan);
   }
+}
+
+/**
+ * Plan with the model. Returns true when it handled the sentence (a preview, a question, or an explained failure),
+ * false to let the built-in rules try (for example when there is no internet or the key is refused).
+ */
+async function answerWithAi(text: string, table: Table, clarifications: string[]): Promise<boolean> {
+  const sheets: Sheets = new Map([["Result", table]]);
+  setStatus("Understanding your question…");
+  let outcome: AiOutcome<{ result: Sheets; notes: string[] }>;
+  try {
+    outcome = await aiPlan(
+      new GeminiClient(state.ai),
+      { question: text, rows: table.nrows, columns: profileTable(table, { values: state.ai.shareValues }), totalColumns: state.headers.length, dictionary: state.dictionary, notes: state.dictionary.notes ?? [], clarifications },
+      table,
+      (plan): { ok: { result: Sheets; notes: string[] } } | { error: string } => {
+        const notes: string[] = [];
+        try { return { ok: { result: applyPlan(sheets, plan, {}, notes), notes } }; } catch (e) {
+          if (e instanceof PlanError) return { error: e.message };
+          throw e;
+        }
+      },
+    );
+  } catch (e) {
+    if (!(e instanceof AiError)) throw e;
+    post("err", `${e.message} I'll use the built-in rules for this one.`);
+    return false;
+  } finally {
+    setStatus("");
+  }
+  state.pending = null;
+  if (outcome.kind === "failed") {
+    post("bot", `I couldn't turn that into a plan I'm sure about (${outcome.reason}). I'll try the built-in rules.`).classList.add("muted");
+    return false;
+  }
+  if (outcome.kind === "question") {
+    const card = post("bot", outcome.question);
+    const answerWith = (choice: string): void => {
+      const line = `${outcome.question} → ${choice}`;
+      state.dictionary.notes = [...(state.dictionary.notes ?? []).filter((n) => !n.startsWith(`${outcome.question} →`)), line].slice(-20);
+      saveDictionary();
+      card.querySelectorAll("button, input").forEach((x) => ((x as HTMLButtonElement | HTMLInputElement).disabled = true));
+      post("user", choice).classList.add("muted");
+      void guarded(() => answerWithAi(text, table, [...clarifications, line]).then(() => undefined));
+    };
+    const box = el("div", "actions defs");
+    for (const o of outcome.options) {
+      const b = el("button", "primary", o);
+      b.type = "button";
+      b.addEventListener("click", () => answerWith(o));
+      box.append(b);
+    }
+    const own = el("input");
+    own.type = "text";
+    own.placeholder = "Or type your own answer and press Enter";
+    own.addEventListener("keydown", (ev) => { if ((ev as KeyboardEvent).key === "Enter" && own.value.trim()) { ev.preventDefault(); answerWith(own.value.trim()); } });
+    card.append(box, own);
+    return true;
+  }
+  const plan = outcome.plan;
+  let result = outcome.ran.result;
+  if (result.size === 1) result = new Map([[sheetNameFor(plan), result.values().next().value as Table]]);
+  const p: Pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(outcome.ran.notes)], formats: plan.steps.filter(isFormatStep),
+    ...liveOptions(plan, table, result), source: state.ref! };
+  state.pending = p;
+  if (outcome.reading.length) {
+    const card = post("bot", "How I read your question:");
+    const ul = el("ul", "steps");
+    for (const r of outcome.reading) ul.append(el("li", "", r));
+    card.append(ul);
+  }
+  renderPreview(p);
+  return true;
 }
 
 /** When the plan used a saved definition: say which, and let the user change it. */
@@ -703,6 +805,11 @@ function wire(): void {
 
 async function start(): Promise<void> {
   wire();
+  state.ai = loadAiSettings();
+  initAiUi({
+    changed: (s) => { state.ai = s; if (state.table) renderUnderstood(profileTable(state.table, { values: s.shareValues }), state.headers.length); },
+    forget: () => { state.dictionary.notes = []; saveDictionary(); },
+  });
   progress.report = setStatus;
   // New messages scroll into view above the input area, not behind it.
   new ResizeObserver(() => document.documentElement.style.setProperty("--dock-h", `${$("dock").offsetHeight}px`)).observe($("dock"));
