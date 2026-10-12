@@ -28,7 +28,7 @@ export function schemaOf(t: Table): Schema {
 
 export interface PlannerContext { schema: Schema; dictionary: Dictionary }
 export type PlannerResult =
-  | { kind: "plan"; plan: Plan }
+  | { kind: "plan"; plan: Plan; /** the assumptions behind it, in plain words */ reading?: string[] }
   | { kind: "question"; question: string; options?: string[] };
 
 export interface Planner {
