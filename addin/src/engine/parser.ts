@@ -441,13 +441,13 @@ export class Parser {
     if (!rule) {
       if (!/\b(?:paid|unpaid|on\s*time|ontime|late|overdue|delinquen\w*|default\w*|success\w*|fail\w*|approv\w*|reject\w*|bounce\w*|npa|active|closed|dormant|convert\w*)\b/.test(low)) return null;
       const by = groupText.trim() ? this.findColumns(groupText).map((x) => x.column)[0] : undefined;
-      const flag = this.columns.find((c) => /paid|status|flag|ontime|on_time|result/i.test(c)) ?? this.columns[0];
+      const g = by ?? "<group column>";
       throw new ParseError(
-        "I can't tell which rows count for that percentage, and I won't guess. Tell me the rule, like this:\n"
-        + `- percentage of rows where ${flag} is <value>${by ? ` by ${by}` : " by <column>"}\n`
-        + `- to compare two amounts (paid vs due, say): ${this.numericCols[0] ?? "<amount>"} as percentage of ${this.numericCols[1] ?? "<other amount>"} by ${by ?? "<column>"}\n`
-        + `- if the rule is two columns: percentage of rows where <date column> <= <other date column> by ${by ?? "<column>"}\n`
-        + `- or, for each group's share of the grand total: percentage share of <column> by ${by ?? "<column>"}`);
+        "I can't tell which rows count for that percentage, so I won't guess. Tell me the rule in one of these ways:\n"
+        + `- percentage of rows where <column> is <value> by ${g}\n`
+        + `- <amount column> as percentage of <other amount column> by ${g}\n`
+        + `- percentage of rows where <date column> <= <other date column> by ${g}\n`
+        + `- percentage share of <column> by ${g}  (each group's share of the grand total)`);
     }
     const [prefix, found] = groupText.trim() ? this.dims(groupText) : [[] as DatePartStep[], [] as Mention[]];
     const groupCols = unique(found.map((x) => x.column));
@@ -455,12 +455,12 @@ export class Parser {
       throw new ParseError(`I couldn't find a column for “${groupText.trim()}”. Columns: ${this.columns.join(", ")}`);
     }
     const ruleText = rule[1].replace(/[\s,]+$/, "");
-    const formula = this.twoColumnRule(ruleText);
-    return [...prefix, { op: "rate", columns: groupCols, when: formula ? null : this.parseFilter(ruleText), formula }];
+    const two = this.twoColumnRule(ruleText);
+    return [...prefix, { op: "rate", columns: groupCols, when: two ? null : this.parseFilter(ruleText), formula: two ? two.formula : null, ...(two ? { label: two.label } : {}) }];
   }
 
   /** "repaid_date <= due_date" or "repaid_date is before due_date": two columns compared, as a formula. */
-  private twoColumnRule(text: string): string | null {
+  private twoColumnRule(text: string): { formula: string; label: string } | null {
     const m = /^\s*(.+?)\s*(<=|>=|<>|!=|==|<|>|=|\bis\s+not\s+equal\s+to\b|\bis\s+(?:on\s+or\s+before|before|on\s+or\s+after|after|equal\s+to|the\s+same\s+as|same\s+as)\b|\bis\b)\s*(.+?)\s*$/i.exec(text);
     if (!m) return null;
     const left = this.column(m[1].trim()), right = this.column(m[3].trim());
@@ -469,7 +469,7 @@ export class Parser {
     const op = /on or before/.test(w) ? "<=" : /before/.test(w) ? "<" : /on or after/.test(w) ? ">=" : /after/.test(w) ? ">"
       : /not equal|!=|<>/.test(w) ? "<>" : /<=|>=|<|>/.test(w) ? w : "=";
     // a blank cell compares as zero, so an unpaid row (blank paid date) would look "on time": blanks never match
-    return `AND(NOT(ISBLANK([${left}])), NOT(ISBLANK([${right}])), [${left}]${op}[${right}])`;
+    return { formula: `AND(NOT(ISBLANK([${left}])), NOT(ISBLANK([${right}])), [${left}]${op}[${right}])`, label: `${left} ${op} ${right} (a blank date never counts)` };
   }
 
   /** "b0_amt as percentage of alloc_amt by state": per group, total of one column as a percent of the total of another. */
@@ -490,7 +490,7 @@ export class Parser {
     return [...prefix, {
       op: "group_by", columns: groupCols,
       aggregations: [{ column: a, func: "sum" }, { column: b, func: "sum" }],
-      calculated: { [name]: `[${a}] / [${b}] * 100` },
+      calculated: { [name]: `round([${a}] / [${b}] * 100, 2)` },
     }];
   }
 

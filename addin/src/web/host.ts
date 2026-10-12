@@ -138,7 +138,7 @@ export class WebHost implements Host {
       if (tooBig) {
         if (!columns) {
           const approx = !!e.estimated;
-          throw new TooWideError(`This table has ${rows >= 0 ? (approx ? "about " : "") + num(rows) : "a lot of"} rows and ${headers.length} columns, which is more than I can hold at once. Pick the columns you need and I'll read only those.`, headers, rows, approx);
+          throw new TooWideError(`This table has ${rows >= 0 ? (approx ? "about " : "") + num(rows) : "a lot of"} rows and ${headers.length} columns, which is more than I can hold at once. Pick the columns you need and I'll read only those.`, headers, rows, approx, { sheet: name, address: "A1" });
         }
         throw new HostError(`Even those ${width} columns are too much: ${num(rows)} rows × ${width} columns is more than I can hold at once (about ${num(MAX_CELLS)} cells). Pick fewer columns.`);
       }

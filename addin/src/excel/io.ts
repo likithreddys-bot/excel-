@@ -113,7 +113,14 @@ export class ExcelHost implements Host {
       const where = `${sheet}!${address}`;
       const key = `${where}|${columns ? [...columns].sort().join("\u0001") : ""}`;
       if (!fresh && this.cache && this.cache.key === key && !this.cache.dirty) return { ...this.cache.source, ref: { sheet, address, region } };
-      const { table, headers } = await readTable(ctx, range, columns);
+      let read;
+      try {
+        read = await readTable(ctx, range, columns);
+      } catch (e) {
+        if (e instanceof TooWideError) throw new TooWideError(e.message, e.headers, e.rows, e.approx, { sheet, address, region });
+        throw e;
+      }
+      const { table, headers } = read;
       const source: Source = { ref: { sheet, address, region }, label: where, table, headers };
       if (table.nrows > 20_000) {
         this.cache = { key, source, dirty: false };

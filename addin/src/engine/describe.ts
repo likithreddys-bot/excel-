@@ -49,7 +49,7 @@ export function describe(step: Step): string {
       return `Group by ${step.columns.join(", ")} with ${parts.join(", ")}${note}`;
     }
     case "rate": {
-      const rule = step.formula ? step.formula.replace(/\[([^\]]+)\]/g, "$1") : noPrefix(describeFilter(step.when!));
+      const rule = step.formula ? step.label ?? step.formula.replace(/\[([^\]]+)\]/g, "$1") : noPrefix(describeFilter(step.when!));
       return `${step.columns.length ? `For each ${step.columns.join(", ")}: the` : "The"} percent of rows where ${rule}`;
     }
     case "split_by": return `Split into one sheet per ${step.column}`;

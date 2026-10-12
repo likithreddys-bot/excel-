@@ -21,7 +21,7 @@ export interface WebHooks {
   /** The pane's status line changed (reading / writing progress): drive the progress bar. */
   status(text: string): void;
   /** A table was read: show it in the data grid. */
-  sourceShown(t: Table): void;
+  sourceShown(t: Table | null): void;
   /** Results were added or removed: refresh the sheet picker. */
   sheetsChanged(): void;
   /** A command just ran: add download / view / chart buttons to its "Done" card. */

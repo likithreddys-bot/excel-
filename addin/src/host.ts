@@ -53,6 +53,9 @@ export interface Host {
 
 export class HostError extends Error {}
 
+/** Something to tell the user, not an error (shown as a normal message). */
+export class Notice extends HostError {}
+
 /** The user pressed Cancel during a long read. */
 export class Cancelled extends HostError {
   constructor() {
@@ -62,7 +65,7 @@ export class Cancelled extends HostError {
 
 /** The table is too big to read in full: the user must pick the columns they need. */
 export class TooWideError extends HostError {
-  constructor(message: string, readonly headers: string[], readonly rows: number, readonly approx = false) {
+  constructor(message: string, readonly headers: string[], readonly rows: number, readonly approx = false, readonly ref?: SourceRef) {
     super(message);
   }
 }
