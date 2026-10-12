@@ -51,7 +51,17 @@ const ctx = {
   saveNotes,
   ask: (question: string, options: string[]) => askPerson(question, options),
 };
-let agent = new Agent(new GeminiClient(state.settings), ctx, { step: showStep, status: setStatus });
+/** A Gemini client that remembers it when it had to switch to another model (a retired one, for example). */
+function client(s: AiSettings): GeminiClient {
+  const c = new GeminiClient(s);
+  c.onModelChange = (model) => {
+    if (s === state.settings) saveAiSettings(state.settings);
+    const box = document.getElementById("s-model") as HTMLInputElement | null;
+    if (box) box.value = model;
+  };
+  return c;
+}
+let agent = new Agent(client(state.settings), ctx, { step: showStep, status: setStatus });
 
 // ---------- chat ----------
 
@@ -314,6 +324,7 @@ function download(blob: Blob, name: string): void {
 function openSettings(): void {
   const s = state.settings;
   $<HTMLInputElement>("s-key").value = s.apiKey;
+  $<HTMLInputElement>("s-model").placeholder = DEFAULT_MODEL;
   $<HTMLInputElement>("s-model").value = s.model;
   $<HTMLInputElement>("s-share").checked = s.shareValues;
   $<HTMLInputElement>("s-results").checked = s.readResults;
@@ -336,7 +347,7 @@ function formSettings(): AiSettings {
 function applySettings(s: AiSettings): void {
   state.settings = s;
   saveAiSettings(s);
-  agent = new Agent(new GeminiClient(s), ctx, { step: showStep, status: setStatus });
+  agent = new Agent(client(s), ctx, { step: showStep, status: setStatus });
   $("setup").classList.toggle("hidden", ready());
   $("open-settings").textContent = ready() ? "AI settings" : "AI settings (not set up)";
 }
@@ -399,8 +410,10 @@ function wire(): void {
   $("s-test").addEventListener("click", async () => {
     $("s-status").textContent = "Testing…";
     try {
-      await new GeminiClient(formSettings()).ask("Reply with the JSON object {\"ok\":true}.", "ping");
-      $("s-status").textContent = "The key works.";
+      const s = formSettings();
+      const asked = s.model;
+      await client(s).ask("Reply with the JSON object {\"ok\":true}.", "ping");
+      $("s-status").textContent = s.model === asked ? `The key works (model ${s.model}).` : `The key works. “${asked}” isn't available, so I'll use ${s.model}. Press Save to keep it.`;
     } catch (e) {
       $("s-status").textContent = e instanceof AiError ? e.message : "The test failed.";
     }
