@@ -30,6 +30,9 @@ Steps (omit optional fields):
 - {"op":"clean_text","columns":[...]|null,"action":"trim"|"upper"|"lower"|"title"}   {"op":"fill_blanks","columns":[...]|null,"method":"value"|"down"|"up","value":"Unknown"}   {"op":"drop_blank_rows","how":"all"|"any"}
 - {"op":"replace","columns":[...]|null,"find":"a","replace":"b"}   {"op":"split_column","column":C,"delimiter":" ","names":["first","last"]}   {"op":"merge_columns","columns":[...],"separator":" ","name":"full"}   {"op":"rename","mapping":{"old":"new"}}   {"op":"convert","columns":[...],"to":"number"|"date"|"text"}
 - {"op":"highlight","when":{"op":"filter","match":"all","conditions":[...]},"color":"red"}   {"op":"number_format","columns":[...]|null,"style":"rupees"|"commas"|"percent"|"decimals"|"date","decimals":2}
+- {"op":"lookup","file":"<other table name>","left_on":C,"right_on":C2,"columns":[...]}  brings columns from another table by a key (like XLOOKUP; the first match is used).
+- {"op":"append","file":"<other table name>"}  stacks the rows of another table under this one (columns matched by name).
+- {"op":"compare","file":"<other table name>","left_on":C,"right_on":C2,"keep":"only_here"|"only_there"|"both"}  rows whose key is only in this table, only in the other, or in both.
 - {"op":"chart","kind":"column"|"bar"|"line"|"pie","x":C,"y":C|null,"func":"sum"|"mean"|"count"|"min"|"max","title":"..."}  (a chart is the LAST step, after the table it draws)
 `.trim();
 
@@ -147,6 +150,14 @@ function one(raw: unknown, i: number, problems: string[]): Step | null {
     }
     case "number_format":
       return need(["rupees", "commas", "percent", "decimals", "date"].includes(String(s.style)), "needs a style.") ? { op: "number_format", columns: strs(s.columns) ? (s.columns as string[]) : null, style: s.style as never, decimals: typeof s.decimals === "number" ? s.decimals : 2, date_pattern: typeof s.date_pattern === "string" ? s.date_pattern : "dd-mmm-yyyy" } : null;
+    case "lookup":
+      return need(typeof s.file === "string" && typeof s.left_on === "string" && typeof s.right_on === "string" && strs(s.columns) && (s.columns as string[]).length > 0, "needs file, left_on, right_on and columns.")
+        ? { op: "lookup", file: s.file as string, left_on: s.left_on as string, right_on: s.right_on as string, columns: s.columns as string[] } : null;
+    case "append":
+      return need(typeof s.file === "string", "needs the other table's name in \"file\".") ? { op: "append", file: s.file as string } : null;
+    case "compare":
+      return need(typeof s.file === "string", "needs the other table's name in \"file\".")
+        ? { op: "compare", file: s.file as string, left_on: typeof s.left_on === "string" ? s.left_on : null, right_on: typeof s.right_on === "string" ? s.right_on : null, keep: s.keep === "only_there" ? "only_there" : s.keep === "both" ? "both" : "only_here" } : null;
     case "chart":
       return need(["column", "bar", "line", "pie"].includes(String(s.kind)) && typeof s.x === "string", "needs kind and x.")
         ? { op: "chart", kind: s.kind as never, x: s.x as string, x_part: null, y: typeof s.y === "string" ? s.y : null, func: ["sum", "mean", "count", "min", "max"].includes(String(s.func)) ? (s.func as never) : "sum", title: typeof s.title === "string" ? s.title : "Chart", when: null } : null;

@@ -9,10 +9,22 @@ export interface AiSettings {
   model: string;
   /** Send the common values of category columns (state, status, 0/1 flags). Off = column names, types and ranges only. */
   shareValues: boolean;
+  /** Let the agent read small summary results (at most 60 rows, no personal or id columns) so it can explain them. */
+  readResults: boolean;
 }
 
 export const DEFAULT_MODEL = "gemini-2.5-flash";
-export const defaultSettings = (): AiSettings => ({ enabled: false, apiKey: "", model: DEFAULT_MODEL, shareValues: true });
+export const defaultSettings = (): AiSettings => ({ enabled: false, apiKey: "", model: DEFAULT_MODEL, shareValues: true, readResults: true });
+
+/** One turn of a Gemini conversation, kept exactly as the API returned it (parts may carry thought signatures). */
+export interface Content { role: "user" | "model"; parts: Part[] }
+export interface Part {
+  text?: string;
+  functionCall?: { name: string; args?: Record<string, unknown> };
+  functionResponse?: { name: string; response: Record<string, unknown> };
+  [other: string]: unknown;
+}
+export interface FunctionDeclaration { name: string; description: string; parameters?: Record<string, unknown> }
 
 export type AiErrorKind = "key" | "quota" | "network" | "bad" | "blocked";
 export class AiError extends Error {
@@ -28,17 +40,39 @@ export class GeminiClient {
 
   /** Send one request and return the model's reply parsed as JSON. */
   async ask(system: string, user: string, signal?: AbortSignal): Promise<unknown> {
+    const content = await this.generate({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: [{ text: user }] }],
+      generationConfig: { temperature: 0, responseMimeType: "application/json", maxOutputTokens: 8192 },
+    }, signal);
+    const text = content.parts.map((p) => p.text ?? "").join("");
+    if (!text.trim()) throw new AiError("Gemini gave an empty answer. Try rephrasing the question.", "bad");
+    try {
+      return JSON.parse(text.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, ""));
+    } catch {
+      throw new AiError("Gemini's answer was not in the expected format. Try again.", "bad");
+    }
+  }
+
+  /** One step of a tool-using conversation: returns the model's turn (text and/or function calls). */
+  async chat(system: string, contents: Content[], tools: FunctionDeclaration[], signal?: AbortSignal): Promise<Content> {
+    return this.generate({
+      systemInstruction: { parts: [{ text: system }] },
+      contents,
+      tools: [{ functionDeclarations: tools }],
+      toolConfig: { functionCallingConfig: { mode: "AUTO" } },
+      generationConfig: { temperature: 0, maxOutputTokens: 8192 },
+    }, signal);
+  }
+
+  private async generate(body: Record<string, unknown>, signal?: AbortSignal): Promise<Content> {
     if (!this.settings.apiKey.trim()) throw new AiError("Add your Gemini API key in the AI settings first.", "key");
     let res;
     try {
       res = await this.fetchImpl(`${ENDPOINT}/${encodeURIComponent(this.settings.model || DEFAULT_MODEL)}:generateContent`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-goog-api-key": this.settings.apiKey.trim() },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: system }] },
-          contents: [{ role: "user", parts: [{ text: user }] }],
-          generationConfig: { temperature: 0, responseMimeType: "application/json", maxOutputTokens: 8192 },
-        }),
+        body: JSON.stringify(body),
         signal,
       });
     } catch (e) {
@@ -55,15 +89,14 @@ export class GeminiClient {
       if (res.status === 404) throw new AiError(`Gemini has no model called “${this.settings.model}”. Change it in the AI settings.`, "bad");
       throw new AiError(`Gemini returned an error (${res.status}). ${detail}`.trim(), "bad");
     }
-    let body: { candidates?: { content?: { parts?: { text?: string }[] }; finishReason?: string }[]; promptFeedback?: { blockReason?: string } };
-    try { body = JSON.parse(raw); } catch { throw new AiError("Gemini sent a reply I could not read.", "bad"); }
-    if (body.promptFeedback?.blockReason) throw new AiError(`Gemini blocked this request (${body.promptFeedback.blockReason}).`, "blocked");
-    const text = body.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
-    if (!text.trim()) throw new AiError("Gemini gave an empty answer. Try rephrasing the question.", "bad");
-    try {
-      return JSON.parse(text.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, ""));
-    } catch {
-      throw new AiError("Gemini's answer was not in the expected format. Try again.", "bad");
+    let parsed: { candidates?: { content?: Content; finishReason?: string }[]; promptFeedback?: { blockReason?: string } };
+    try { parsed = JSON.parse(raw); } catch { throw new AiError("Gemini sent a reply I could not read.", "bad"); }
+    if (parsed.promptFeedback?.blockReason) throw new AiError(`Gemini blocked this request (${parsed.promptFeedback.blockReason}).`, "blocked");
+    const content = parsed.candidates?.[0]?.content;
+    if (!content?.parts?.length) {
+      const why = parsed.candidates?.[0]?.finishReason;
+      throw new AiError(`Gemini gave an empty answer${why ? ` (${why})` : ""}. Try rephrasing the question.`, "bad");
     }
+    return { role: "model", parts: content.parts };
   }
 }

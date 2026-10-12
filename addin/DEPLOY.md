@@ -15,8 +15,10 @@ Excel where they are. Everything else happens on each user's own computer.
 
 ## The website version needs no manifest
 
-The same build also contains the website, `index.html`. Once the files are hosted (step 1), the team simply opens the
-site's address (for GitHub Pages: `https://<owner>.github.io/<repo>/`). Steps 2 onward (manifest, admin center) are only for
+The same build also contains the website: `index.html` (the Excel Agent, which needs a Gemini API key and calls
+generativelanguage.googleapis.com with column facts only, see README) and `classic.html` (the rule-based assistant, no
+network calls). Once the files are hosted (step 1), the team simply opens the site's address (for GitHub Pages:
+`https://<owner>.github.io/<repo>/`). Steps 2 onward (manifest, admin center) are only for
 the Excel add-in. The website reads each file inside the browser tab; nothing is uploaded, so the security answers in the
 table above apply to it as well (it does not load `office.js`).
 

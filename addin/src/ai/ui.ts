@@ -65,7 +65,7 @@ export function initAiUi(hooks: AiUiHooks): { open(): void; refresh(): void } {
   dlg.append(title, onLabel, keyLabel, keyHelp, modelLabel, shareLabel, what, status, row);
   document.body.append(dlg);
 
-  const current = (): AiSettings => ({ enabled: on.checked, apiKey: key.value.trim(), model: model.value.trim() || DEFAULT_MODEL, shareValues: share.checked });
+  const current = (): AiSettings => ({ ...settings, enabled: on.checked, apiKey: key.value.trim(), model: model.value.trim() || DEFAULT_MODEL, shareValues: share.checked });
   const fill = (): void => { on.checked = settings.enabled; key.value = settings.apiKey; model.value = settings.model; share.checked = settings.shareValues; status.textContent = ""; };
 
   const open = (): void => { fill(); if (typeof dlg.showModal === "function") dlg.showModal(); else dlg.setAttribute("open", ""); };
