@@ -254,3 +254,50 @@ describe("model choice", () => {
     await expect(new GeminiClient({ ...settings, model: "old" }, fetch).ask("s", "u")).rejects.toThrow(/couldn't find another one/);
   });
 });
+
+describe("a busy Gemini", () => {
+  const ok = { ok: true, status: 200, text: async () => JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "{\"ok\":true}" }] } }] }) };
+  const busy = { ok: false, status: 503, text: async () => JSON.stringify({ error: { message: "This model is currently experiencing high demand." } }) };
+  const list = { ok: true, status: 200, text: async () => JSON.stringify({ models: ["gemini-flash-latest", "gemini-3.0-flash", "gemini-2.0-flash"].map((n) => ({ name: `models/${n}`, supportedGenerationMethods: ["generateContent"] })) }) };
+
+  it("waits and tries again", async () => {
+    let calls = 0;
+    const c = new GeminiClient({ ...settings, model: "gemini-flash-latest" }, async () => (++calls < 3 ? busy : ok));
+    const waits: number[] = [];
+    const status: string[] = [];
+    c.wait = async (ms) => { waits.push(ms); };
+    c.onStatus = (m) => status.push(m);
+    expect(await c.ask("s", "u")).toEqual({ ok: true });
+    expect(waits).toEqual([2000, 5000]);
+    expect(status[0]).toMatch(/busy/);
+  });
+
+  it("then tries another Flash model for this request, without changing the saved one", async () => {
+    const tried: string[] = [];
+    const s = { ...settings, model: "gemini-flash-latest" };
+    const c = new GeminiClient(s, async (url) => {
+      if (url.includes("?pageSize")) return list;
+      const m = /models\/([^:]+):/.exec(url)![1];
+      tried.push(m);
+      return m === "gemini-2.0-flash" ? ok : busy;
+    });
+    c.wait = async () => {};
+    expect(await c.ask("s", "u")).toEqual({ ok: true });
+    expect(tried).toEqual(["gemini-flash-latest", "gemini-flash-latest", "gemini-flash-latest", "gemini-3.0-flash", "gemini-2.0-flash"]);
+    expect(s.model).toBe("gemini-flash-latest");
+  });
+
+  it("says plainly when Google stays busy", async () => {
+    const c = new GeminiClient({ ...settings }, async (url) => (url.includes("?pageSize") ? list : busy));
+    c.wait = async () => {};
+    await expect(c.ask("s", "u")).rejects.toThrow(/overloaded right now/);
+  });
+
+  it("stops waiting when the person presses Stop", async () => {
+    const c = new GeminiClient({ ...settings }, async () => busy);
+    const stop = new AbortController();
+    const asking = c.ask("s", "u", stop.signal);
+    setTimeout(() => stop.abort(), 10);
+    await expect(asking).rejects.toThrow(/Stopped/);
+  });
+});

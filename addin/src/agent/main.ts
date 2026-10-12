@@ -59,6 +59,11 @@ function client(s: AiSettings): GeminiClient {
     const box = document.getElementById("s-model") as HTMLInputElement | null;
     if (box) box.value = model;
   };
+  c.onStatus = (message) => {
+    setStatus(message);
+    const dialog = document.getElementById("settings") as HTMLDialogElement | null;
+    if (dialog?.open) $("s-status").textContent = message;
+  };
   return c;
 }
 let agent = new Agent(client(state.settings), ctx, { step: showStep, status: setStatus });
