@@ -12,6 +12,7 @@ import { DemoHost } from "./excel/demo";
 import { ExcelHost, progress } from "./excel/io";
 import { Cancelled, Host, HostError, MAX_CELLS, Notice, SourceRef, TooWideError } from "./host";
 import { autoColumns } from "./columns";
+import { Dictionary, SegmentDef, describeSegment, emptyDictionary, fingerprint, mentionsSegment } from "./engine/dictionary";
 import { suggestPercentages } from "./suggest";
 import type { WebHooks } from "./web/ui";
 import { Field, TEMPLATES, Template, Values, build, columnChoices, visibleFields } from "./builder";
@@ -43,6 +44,8 @@ const state = {
   headers: [] as string[],
   /** The user's own table (as opposed to a result sheet they continued from): where the picked columns apply. */
   sourceRef: undefined as SourceRef | undefined,
+  /** What words like "old user" mean in this file (saved per file layout). */
+  dictionary: emptyDictionary() as Dictionary,
   /** A table too big to read whole: its headers and size. Columns are then read as each sentence needs them. */
   wide: null as { headers: string[]; rows: number; approx: boolean } | null,
   /** Set on the website: file picking, downloads and charts on the page. */
@@ -179,7 +182,7 @@ async function readSource(ref?: SourceRef, fresh = false, hint?: string): Promis
   const result = isResultRef(ref);
   let columns = result ? undefined : state.columns;
   // A wide table: read the columns this sentence needs (plus those already loaded) instead of asking the user to pick.
-  if (!result && state.wide && hint !== undefined) columns = state.columns = autoColumns(state.wide.headers, state.wide.rows, hint, state.columns ?? []);
+  if (!result && state.wide && hint !== undefined) columns = state.columns = autoColumns(state.wide.headers, state.wide.rows, hint, state.columns ?? [], undefined, dictionaryColumns());
   let src;
   try {
     src = await state.host!.readSource(ref, fresh, columns);
@@ -187,9 +190,10 @@ async function readSource(ref?: SourceRef, fresh = false, hint?: string): Promis
     if (!(e instanceof TooWideError)) throw e;
     state.wide = { headers: e.headers, rows: e.rows, approx: e.approx };
     state.headers = e.headers;
+    loadDictionary();
     state.ref = state.sourceRef = e.ref ?? ref;
     showWide();
-    const cols = hint ? autoColumns(e.headers, e.rows, hint, state.columns ?? []) : [];
+    const cols = hint ? autoColumns(e.headers, e.rows, hint, state.columns ?? [], undefined, dictionaryColumns()) : [];
     if (!cols.length) {
       throw new Notice(`This file has ${e.approx ? "about " : ""}${num(e.rows)} rows and ${e.headers.length} columns, too many to load all at once. `
         + (hint ? "I couldn't tell which columns you mean: name them (click a column name above to add it to your sentence)." : "Just type your question and I'll read the columns it needs."));
@@ -201,10 +205,28 @@ async function readSource(ref?: SourceRef, fresh = false, hint?: string): Promis
   state.ref = src.ref;
   state.label = src.label;
   state.table = src.table;
-  state.headers = src.headers;
+  if (src.headers.join("\u0001") !== state.headers.join("\u0001") || !result) { state.headers = src.headers; if (!result) loadDictionary(); }
   if (!result) state.sourceRef = src.ref; // remembered, so Undo / "go back" returns to the same table and the same columns
   showSource(src.label, src.table);
   return src.table;
+}
+
+/** Columns the saved definitions need (so a wide file reads them when "old users" is mentioned). */
+const dictionaryColumns = (): string[] => (state.dictionary.segments.user_type ? [state.dictionary.segments.user_type.column] : []);
+
+const dictKey = (): string => `sheet-assistant-dict:${fingerprint(state.headers)}`;
+
+/** The definitions saved for this file's layout (empty if none, or if storage is blocked). */
+function loadDictionary(): void {
+  state.dictionary = emptyDictionary();
+  try {
+    const raw = localStorage.getItem(dictKey());
+    if (raw) state.dictionary = { ...emptyDictionary(), ...(JSON.parse(raw) as Dictionary) };
+  } catch { /* storage can be blocked: definitions just won't be remembered */ }
+}
+
+function saveDictionary(): void {
+  try { localStorage.setItem(dictKey(), JSON.stringify(state.dictionary)); } catch { /* ignore */ }
 }
 
 /** What the source card says about a table that has not been loaded (yet): its size and its column names. */
@@ -344,14 +366,31 @@ async function answer(text: string, table: Table, quiet: boolean, reading = 0): 
   }
   const problems: string[] = [];
   const files = await sheetsMentioned(reply ? state.asked! : text, problems);
-  const plan = reply ? makePlan(sheets, state.asked!, reply[0], {}, files) : makePlan(sheets, text, [], {}, files);
+  const plan = reply ? makePlan(sheets, state.asked!, reply[0], {}, files, state.dictionary) : makePlan(sheets, text, [], {}, files, state.dictionary);
   if (plan.clarification_question) {
     if (quiet) return;
     state.pending = null;
     state.asked = plan.awaits_columns ? (reply ? state.asked : text) : null;
     const card = post("bot", problems.length ? problems.join("\n") : plan.clarification_question);
-    const maybe = unreadColumnsFor(text);
+    const maybe = plan.needs_definition ? [] : unreadColumnsFor(text);
     if (maybe.length) card.append(el("div", "note", `Columns in your file that might be what you mean (not read yet): ${maybe.join(", ")}. Press “Change columns…”, tick them, and ask again.`));
+    // A word with no definition yet ("old users"): offer the likely definitions as buttons, remember the pick, and carry on.
+    if (plan.needs_definition?.options.length) {
+      const box = el("div", "actions defs");
+      for (const o of plan.needs_definition.options) {
+        const b = el("button", "primary", o.label);
+        b.type = "button";
+        b.addEventListener("click", () => {
+          state.dictionary.segments.user_type = o.def;
+          saveDictionary();
+          box.querySelectorAll("button").forEach((x) => ((x as HTMLButtonElement).disabled = true));
+          post("bot", `Saved for this file: ${describeSegment(o.def)}.`).classList.add("muted");
+          void guarded(() => answer(text, table, false));
+        });
+        box.append(b);
+      }
+      card.append(box);
+    }
     // A percentage that could mean several things: show the likely readings, with their results, instead of only asking.
     const readings = /won't guess/.test(plan.clarification_question) ? suggestPercentages(table, text) : [];
     if (readings.length) {
@@ -384,7 +423,28 @@ async function answer(text: string, table: Table, quiet: boolean, reading = 0): 
     ...liveOptions(plan, table, result), source: state.ref! };
   state.pending = p;
   renderPreview(p, reading ? `Reading ${reading}: “${text}”` : undefined);
-  if (!quiet && !reading) offerAlternatives(text, table, plan);
+  if (!quiet && !reading) {
+    offerDefinitionNote(plan);
+    offerAlternatives(text, table, plan);
+  }
+}
+
+/** When the plan used a saved definition: say which, and let the user change it. */
+function offerDefinitionNote(plan: Plan): void {
+  const def = state.dictionary.segments.user_type;
+  if (!def || !plan.steps.some((s) => s.op === "label" && s.name === "user_type")) return;
+  const box = el("div", "alts");
+  box.append(el("span", "muted", `Definition used: ${describeSegment(def)}. `));
+  const change = el("button", "chip", "Change definition");
+  change.type = "button";
+  change.addEventListener("click", () => {
+    delete state.dictionary.segments.user_type;
+    saveDictionary();
+    post("bot", "Definition cleared. Ask again and I'll offer the options.");
+  });
+  box.append(change);
+  $("thread").append(box);
+  box.scrollIntoView({ block: "end", behavior: "smooth" });
 }
 
 /** After a percentage answer: other ways the same words could be read, as links that run them. */

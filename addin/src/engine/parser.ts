@@ -3,10 +3,11 @@
  * A line-by-line port of planner.py (the Python reference), covering filter, sort, split, dedupe and
  * column choice. Commands the add-in can't run yet are recognised and answered honestly instead of guessed at.
  */
+import { Dictionary, DefinitionRequest, SegmentDef, describeSegment, segmentWords, suggestSegmentDefs } from "./dictionary";
 import { COLORS, describe } from "./describe";
 import { applyPlan, PlanError } from "./engine";
 import { FORMULA_FUNCTIONS, FormulaSyntaxError, columnResolver, compileFormula } from "./formula";
-import type { Aggregation, Condition, DatePartStep, FilterStep, GroupByStep, PivotStep, Plan, SortStep, Step, TopNStep } from "./plan";
+import type { Aggregation, Condition, DatePartStep, FilterStep, GroupByStep, LabelStep, PivotStep, Plan, SortStep, Step, TopNStep } from "./plan";
 import { Cell, Column, Sheets, Table, combine, isBlankCell } from "./table";
 import {
   MONTHS, DAY_MS, closeMatch, colWords, fmt, isoDay, key, parseDate, parseNumber, similarity, singular, utcDay,
@@ -86,7 +87,7 @@ const FILE_VERBS = new RegExp(
 const WHAT_IT_CAN_DO = "Right now the add-in can filter rows, sort, split into sheets, remove duplicates and choose columns.";
 
 export class ParseError extends Error {
-  constructor(message: string, public awaitsColumns = false) {
+  constructor(message: string, public awaitsColumns = false, public definition?: DefinitionRequest) {
     super(message);
   }
 }
@@ -105,6 +106,7 @@ const strip = (s: string, chars: string): string => {
   return s.slice(a, b);
 };
 const unique = <T>(xs: T[]): T[] => [...new Set(xs)];
+const round2 = (a: string, b: string): string => `round([${a}] / [${b}] * 100, 2)`;
 
 /** Most values read as amounts once ₹, Rs. and commas are ignored ("₹1,200", "Rs. 90"). */
 function looksLikeAmounts(c: Column): boolean {
@@ -187,7 +189,7 @@ export class Parser {
   private values: Map<string, Map<string, string>> | null = null;
 
   /** `answer`: columns the user gave in reply to a "which column?" question. */
-  constructor(sheets: Sheets | Table, private answer: string[] = [], private computed: Record<string, string> = {}, private files: Record<string, Table> = {}) {
+  constructor(sheets: Sheets | Table, private answer: string[] = [], private computed: Record<string, string> = {}, private files: Record<string, Table> = {}, private dictionary?: Dictionary) {
     this.table = sheets instanceof Map ? combine(sheets) : sheets;
     this.columns = this.table.columns.map((c) => String(c.name));
     this.colKeys = new Map(this.columns.map((c) => [c, key(c)]));
@@ -459,8 +461,10 @@ export class Parser {
       groupText = cl.slice(g.index! + g[0].length);
       body = cl.slice(0, g.index);
     }
-    const ratio = this.parseRatio(body, groupText) ?? this.repayRatio(body, groupText);
+    const seg = this.segmentPhrase(cl);
+    const ratio = this.parseRatio(body, groupText) ?? this.repayRatio(body, groupText, seg);
     if (ratio) return ratio;
+    if (seg) throw new ParseError("I understood old and new users, but not which amounts make up the percentage. Say, for example: repayment percentage of old users and new users (total repaid out of the amount due), or name the two amount columns.");
     const rule = /\b(?:where|with|having|that|who|which|whose)\s+(.+)$/i.exec(body);
     if (!rule) {
       if (!this.sawWise && !/\b(?:paid|unpaid|repay\w*|repaid|collect\w*|recover\w*|on\s*time|ontime|late|overdue|delinquen\w*|default\w*|success\w*|fail\w*|approv\w*|reject\w*|bounce\w*|npa|active|closed|dormant|convert\w*)\b/.test(low)) return null;
@@ -481,6 +485,31 @@ export class Parser {
     const ruleText = rule[1].replace(/[\s,]+$/, "");
     const two = this.twoColumnRule(ruleText);
     return [...prefix, { op: "rate", columns: groupCols, when: two ? null : this.parseFilter(ruleText), formula: two ? two.formula : null, ...(two ? { label: two.label } : {}) }];
+  }
+
+  /**
+   * "old users and new users": a derived column (Old / New) from the saved definition. With no definition yet,
+   * the question comes back with the likely definitions as options, and nothing is guessed.
+   */
+  private segmentPhrase(text: string): { prefix: Step[]; name: string; only: string | null } | null {
+    const w = segmentWords(text);
+    if (!w.old && !w.new) return null;
+    const def: SegmentDef | undefined = this.dictionary?.segments.user_type;
+    if (!def) {
+      const options = suggestSegmentDefs(this.table);
+      const question = options.length
+        ? "What counts as an old user in this file? Pick one (I'll remember it for this file):"
+        : "I can't tell which column says whether a user is old or new. Tell me, for example: old users are those where <column> is <value>.";
+      throw new ParseError(question, false, { term: "user_type", question, options });
+    }
+    if (!this.columns.includes(def.column)) {
+      throw new ParseError(`Your definition of old and new users (${describeSegment(def)}) needs the column ${def.column}, which isn't in this table. Change the definition, or read that column.`);
+    }
+    const label: LabelStep = {
+      op: "label", name: "user_type", replace: false, ordered: true, default: def.newLabel,
+      cases: [{ value: def.oldLabel, when: { op: "filter", match: "all", conditions: [{ column: def.column, operator: def.operator, value: def.value }] } }],
+    };
+    return { prefix: [label], name: "user_type", only: w.old && !w.new ? def.oldLabel : w.new && !w.old ? def.newLabel : null };
   }
 
   /** "repaid_date <= due_date" or "repaid_date is before due_date": two columns compared, as a formula. */
@@ -526,7 +555,7 @@ export class Parser {
    * "repayment percentage of b0 amount by state", "total statewise repaid b0 percentage": how much of what was due was repaid.
    * The repaid amount is the b0 / repaid / total column the sentence points at; what was due is the allocated / due / EMI amount.
    */
-  private repayRatio(body: string, groupText: string): Step[] | null {
+  private repayRatio(body: string, groupText: string, seg: { prefix: Step[]; name: string; only: string | null } | null = null): Step[] | null {
     if (!/\b(?:repay\w*|repaid|paid|collect\w*|recover\w*)\b/i.test(body)) return null;
     const paidish = (c: string) => /(^|_)(b\d+|repaid|paid|tot|total|collected|recovered)(_|$)/i.test(c);
     const plain = (n: string) => n.split(/[^a-z0-9]+/i).length * 1000 + n.length;
@@ -550,6 +579,19 @@ export class Parser {
     if (!groupText.trim()) {
       // "statename and repayment percentage": a named category column (text) is the grouping
       groupCols = unique(this.findColumns(body).map((x) => x.column)).filter((c) => c !== a && c !== due && !this.numericCols.includes(c) && !this.dateCols.includes(c));
+    }
+    if (seg) {
+      // old / new users: group by the derived Old / New column (then by anything else named), as a pivot when asked
+      const rows = [seg.name, ...groupCols];
+      const filter: Step[] = seg.only ? [{ op: "filter", match: "all", conditions: [{ column: seg.name, operator: "equals", value: seg.only }] }] : [];
+      const pct = round2(a, due);
+      if (PIVOT.test(body)) {
+        return [...seg.prefix, ...prefix, ...filter, {
+          op: "pivot", rows, columns: [], values: null, func: "sum", totals: !seg.only,
+          calculated: { Due: `[${due}]`, Repaid: `[${a}]`, "Repayment %": pct },
+        }];
+      }
+      return [...seg.prefix, ...prefix, ...filter, { op: "group_by", columns: rows, aggregations: [], calculated: { [`${a} % of ${due}`]: pct } }];
     }
     if (groupText.trim() && !groupCols.length) return null;
     return this.ratioSteps(a, due, prefix, groupCols);
@@ -1837,7 +1879,7 @@ export function replyColumns(sheets: Sheets | Table, text: string): [string[], s
 
 export const examples = (sheets: Sheets | Table): string[] => new Parser(sheets).examples();
 
-export function makePlan(sheets: Sheets, request: string, answer: string[] = [], computed: Record<string, string> = {}, files: Record<string, Table> = {}): Plan {
+export function makePlan(sheets: Sheets, request: string, answer: string[] = [], computed: Record<string, string> = {}, files: Record<string, Table> = {}, dictionary?: Dictionary): Plan {
   computed = { ...computed };
   const empty = (q: string, awaits = false): Plan => ({ clarification_question: q, summary: "", steps: [], awaits_columns: awaits });
   try {
@@ -1864,7 +1906,7 @@ export function makePlan(sheets: Sheets, request: string, answer: string[] = [],
     const steps: Step[] = [];
     let current = sheets;
     clauses.forEach((clause, i) => {
-      const made = new Parser(current, answer, computed, files).parseClause(clause);
+      const made = new Parser(current, answer, computed, files, dictionary).parseClause(clause);
       steps.push(...made);
       for (const st of made) if (st.op === "compute") computed[st.name] = st.expr;
       // Later parts see the result so far: "add column gst = ... and sort by gst".
@@ -1872,7 +1914,7 @@ export function makePlan(sheets: Sheets, request: string, answer: string[] = [],
     });
     return { clarification_question: null, summary: steps.map(describe).join("; ") + ".", steps, awaits_columns: false };
   } catch (e) {
-    if (e instanceof ParseError) return empty(e.message, e.awaitsColumns);
+    if (e instanceof ParseError) return { ...empty(e.message, e.awaitsColumns), needs_definition: e.definition ?? null };
     if (e instanceof PlanError) return empty(`That can't run on this data: ${e.message}`);
     throw e;
   }
