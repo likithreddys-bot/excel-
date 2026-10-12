@@ -384,6 +384,27 @@ async function answer(text: string, table: Table, quiet: boolean, reading = 0): 
     ...liveOptions(plan, table, result), source: state.ref! };
   state.pending = p;
   renderPreview(p, reading ? `Reading ${reading}: “${text}”` : undefined);
+  if (!quiet && !reading) offerAlternatives(text, table, plan);
+}
+
+/** After a percentage answer: other ways the same words could be read, as links that run them. */
+function offerAlternatives(text: string, table: Table, plan: Plan): void {
+  if (!/%|percent|repay|repaid|paid/i.test(text)) return;
+  const used = plan.steps.flatMap((s) => (s.op === "group_by" ? Object.keys(s.calculated) : s.op === "rate" ? ["rate"] : []));
+  if (!used.length) return;
+  const group = plan.steps.flatMap((s) => (s.op === "group_by" || s.op === "rate" ? s.columns : []))[0];
+  const others = suggestPercentages(table, text, group).filter((sentence) => !used.some((u) => u !== "rate" && sentence.startsWith(u.replace(" % of ", " as percentage of "))));
+  if (!others.length) return;
+  const box = el("div", "alts");
+  box.append(el("span", "muted", "Meant something else? "));
+  for (const sentence of others.slice(0, 3)) {
+    const b = el("button", "chip", sentence);
+    b.type = "button";
+    b.addEventListener("click", () => { if (!state.busy) void guarded(() => preview(sentence)); });
+    box.append(b);
+  }
+  $("thread").append(box);
+  box.scrollIntoView({ block: "end", behavior: "smooth" });
 }
 
 function renderPreview(p: Pending, title = "Here's what I'll do:"): void {

@@ -19,7 +19,7 @@ const COMPANION_NAMES = new Set(["alloc", "due", "repaid", "principal", "emi", "
 function isCompanion(header: string): boolean {
   const toks = tokens(header);
   const last = toks[toks.length - 1];
-  return toks[toks.length - 1] === "bucket" || (toks[0] === "tot" || toks[0] === "total") && last === "amt"
+  return toks[toks.length - 1] === "bucket" || (toks.length === 2 && toks[0] === "b0" && last === "amt") || (toks[0] === "tot" || toks[0] === "total") && last === "amt"
     || toks.some((t) => COMPANION_NAMES.has(t)) && (last === "amt" || last === "amount" || last === "date");
 }
 
@@ -34,6 +34,7 @@ export function matchScore(header: string, words: string[]): number {
   let score = 0;
   for (const w of words) {
     for (const t of toks) {
+      if (t === `${w}name`) { score += 4; break; } // state ~ statename beats state_category
       if (w === t) { score += 3; break; }
       if (w.length >= 4 && t.length >= 4 && (t.startsWith(w) || w.startsWith(t))) { score += 2; break; } // state ~ statename
       if (w.length >= 4 && t.includes(w)) { score += 1; break; } // paid ~ repaid
