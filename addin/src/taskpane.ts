@@ -10,7 +10,9 @@ import { sheetNameFor } from "./engine/naming";
 import { isoDay, key, singular } from "./engine/util";
 import { DemoHost } from "./excel/demo";
 import { ExcelHost, progress } from "./excel/io";
-import { Cancelled, Host, HostError, MAX_CELLS, SourceRef, TooWideError } from "./host";
+import { Cancelled, Host, HostError, MAX_CELLS, Notice, SourceRef, TooWideError } from "./host";
+import { autoColumns } from "./columns";
+import { suggestPercentages } from "./suggest";
 import type { WebHooks } from "./web/ui";
 import { Field, TEMPLATES, Template, Values, build, columnChoices, visibleFields } from "./builder";
 
@@ -41,6 +43,8 @@ const state = {
   headers: [] as string[],
   /** The user's own table (as opposed to a result sheet they continued from): where the picked columns apply. */
   sourceRef: undefined as SourceRef | undefined,
+  /** A table too big to read whole: its headers and size. Columns are then read as each sentence needs them. */
+  wide: null as { headers: string[]; rows: number; approx: boolean } | null,
   /** Set on the website: file picking, downloads and charts on the page. */
   web: null as WebHooks | null,
 };
@@ -116,7 +120,7 @@ function showSource(label: string, t: Table): void {
   if (note) {
     const partial = state.headers.length > t.columns.length;
     note.classList.toggle("hidden", !partial);
-    if (partial) $("columns-note-text").textContent = `Reading ${t.columns.length} of ${state.headers.length} columns. Name another column in your sentence and I'll read it too.`;
+    if (partial) $("columns-note-text").textContent = `Read ${t.columns.length} of ${state.headers.length} columns so far. Ask about another column and I'll read it too.`;
   }
   const mixed = t.columns.filter((c) => c.mixedDates).map((c) => c.name);
   $("source-warning").textContent = mixed.length
@@ -171,17 +175,29 @@ function showExamples(t: Table): void {
 /** Is `ref` a result sheet the user continued from, rather than their own table? */
 const isResultRef = (ref?: SourceRef): boolean => !!ref && !!state.sourceRef && ref.sheet !== state.sourceRef.sheet;
 
-async function readSource(ref?: SourceRef, fresh = false): Promise<Table> {
+async function readSource(ref?: SourceRef, fresh = false, hint?: string): Promise<Table> {
   const result = isResultRef(ref);
-  const columns = result ? undefined : state.columns; // a result sheet is small and has its own columns
+  let columns = result ? undefined : state.columns;
+  // A wide table: read the columns this sentence needs (plus those already loaded) instead of asking the user to pick.
+  if (!result && state.wide && hint !== undefined) columns = state.columns = autoColumns(state.wide.headers, state.wide.rows, hint, state.columns ?? []);
   let src;
   try {
     src = await state.host!.readSource(ref, fresh, columns);
   } catch (e) {
     if (!(e instanceof TooWideError)) throw e;
-    state.columns = await pickColumns(e.headers, e.rows, e.message, [], e.approx);
-    src = await state.host!.readSource(ref, true, state.columns);
+    state.wide = { headers: e.headers, rows: e.rows, approx: e.approx };
+    state.headers = e.headers;
+    state.ref = state.sourceRef = e.ref ?? ref;
+    showWide();
+    const cols = hint ? autoColumns(e.headers, e.rows, hint, state.columns ?? []) : [];
+    if (!cols.length) {
+      throw new Notice(`This file has ${e.approx ? "about " : ""}${num(e.rows)} rows and ${e.headers.length} columns, too many to load all at once. `
+        + (hint ? "I couldn't tell which columns you mean: name them (click a column name above to add it to your sentence)." : "Just type your question and I'll read the columns it needs."));
+    }
+    state.columns = cols;
+    src = await state.host!.readSource(state.ref, true, cols);
   }
+  if (!result && !columns) state.wide = null; // it was read whole after all
   state.ref = src.ref;
   state.label = src.label;
   state.table = src.table;
@@ -191,15 +207,20 @@ async function readSource(ref?: SourceRef, fresh = false): Promise<Table> {
   return src.table;
 }
 
-const spaced = (s: string): string => ` ${s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
-
-/** Headers of the file that the sentence names but that weren't read (only some columns are loaded). */
-function unreadMentioned(text: string): string[] {
-  if (!state.columns || !state.table || isResultRef(state.ref)) return [];
-  const have = new Set(state.table.columns.map((c) => c.name.toLowerCase()));
-  const said = spaced(text);
-  return state.headers.filter((h) => !have.has(h.toLowerCase()) && spaced(h).trim().length >= 3 && said.includes(spaced(h)));
+/** What the source card says about a table that has not been loaded (yet): its size and its column names. */
+function showWide(): void {
+  const w = state.wide!;
+  $("source-text").textContent = `${state.sourceRef?.sheet ?? "Your table"} · ${w.approx ? "about " : ""}${num(w.rows)} rows · ${w.headers.length} columns. I read the columns each question needs.`;
+  $("source-text").classList.remove("muted");
+  $("columns").replaceChildren(...w.headers.map((h) => el("span", "chip", h)));
+  $("columns-box").classList.remove("hidden");
+  $("source-warning").classList.add("hidden");
+  $("findings").classList.add("hidden");
+  $("examples-box").classList.add("hidden");
+  state.web?.sourceShown(null);
 }
+
+const spaced = (s: string): string => ` ${s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
 
 const SKIP_WORDS = new Set(["show", "me", "the", "wise", "of", "on", "in", "by", "per", "for", "each", "and", "or", "all", "get", "give", "what", "is", "are", "to", "a", "an", "with", "where", "rows", "row", "percentage", "percent", "total", "how", "many"]);
 
@@ -297,30 +318,39 @@ const isLive = (): boolean => document.getElementById("live") instanceof HTMLInp
 
 async function preview(text: string): Promise<void> {
   post("user", text);
-  let table = await readSource(state.ref);
-  const extra = unreadMentioned(text);
-  if (extra.length) {
-    state.columns = [...state.columns!, ...extra];
-    table = await readSource(state.ref, true);
-    post("bot", `I also read ${extra.join(", ")}.`).classList.add("muted");
-  }
+  const had = new Set(state.table?.columns.map((c) => c.name));
+  const table = await readSource(state.ref, false, text);
+  const added = table.columns.map((c) => c.name).filter((n) => !had.has(n));
+  if (state.wide && added.length && had.size) post("bot", `I also read ${added.slice(0, 12).join(", ")}${added.length > 12 ? `, and ${added.length - 12} more` : ""}.`).classList.add("muted");
+  await answer(text, table, false);
+}
+
+/** Plan `text` on `table` and show the preview. `reading` (1, 2, 3) marks one of several guesses offered for an unclear sentence. */
+async function answer(text: string, table: Table, quiet: boolean, reading = 0): Promise<void> {
   const sheets: Sheets = new Map([["Result", table]]);
 
   // A reply that is only column names answers the "which column?" question asked just before.
   const reply = state.asked ? replyColumns(sheets, text) : null;
   if (reply && reply[1].length) {
-    post("bot", "I couldn't find " + reply[1].join(", ") + ". Reply again with the column names.");
+    if (!quiet) post("bot", "I couldn't find " + reply[1].join(", ") + ". Reply again with the column names.");
     return;
   }
   const problems: string[] = [];
   const files = await sheetsMentioned(reply ? state.asked! : text, problems);
   const plan = reply ? makePlan(sheets, state.asked!, reply[0], {}, files) : makePlan(sheets, text, [], {}, files);
   if (plan.clarification_question) {
+    if (quiet) return;
     state.pending = null;
     state.asked = plan.awaits_columns ? (reply ? state.asked : text) : null;
     const card = post("bot", problems.length ? problems.join("\n") : plan.clarification_question);
     const maybe = unreadColumnsFor(text);
     if (maybe.length) card.append(el("div", "note", `Columns in your file that might be what you mean (not read yet): ${maybe.join(", ")}. Press “Change columns…”, tick them, and ask again.`));
+    // A percentage that could mean several things: show the likely readings, with their results, instead of only asking.
+    const readings = /won't guess/.test(plan.clarification_question) ? suggestPercentages(table, text) : [];
+    if (readings.length) {
+      post("bot", "Here are the most likely readings, with results. Pick the one you meant:");
+      for (const [i, r] of readings.entries()) await answer(r, table, true, i + 1);
+    }
     if (!plan.awaits_columns) {
       const actions = el("div", "actions");
       const b = el("button", "", "Build it with menus instead");
@@ -343,13 +373,14 @@ async function preview(text: string): Promise<void> {
     if (e instanceof PlanError) { post("err", `This can't run on your data: ${e.message}`); return; }
     throw e;
   }
-  state.pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(notes)], formats: plan.steps.filter(isFormatStep),
+  const p: Pending = { text, plan, result, before: table.nrows, using: state.label, notes: [...new Set(notes)], formats: plan.steps.filter(isFormatStep),
     ...liveOptions(plan, table, result), source: state.ref! };
-  renderPreview(state.pending);
+  state.pending = p;
+  renderPreview(p, reading ? `Reading ${reading}: “${text}”` : undefined);
 }
 
-function renderPreview(p: Pending): void {
-  const card = post("bot", "Here's what I'll do:");
+function renderPreview(p: Pending, title = "Here's what I'll do:"): void {
+  const card = post("bot", title);
   card.append(el("div", "muted", `On: ${p.using}`));
   const list = el("ul", "steps");
   for (const s of p.plan.steps) list.append(el("li", "", describeStep(s)));
@@ -390,8 +421,8 @@ function renderPreview(p: Pending): void {
   actions.append(run, cancel);
   card.append(actions);
   const lock = () => { run.disabled = true; cancel.disabled = true; };
-  cancel.addEventListener("click", () => { lock(); state.pending = null; post("bot", "Cancelled. Nothing was changed."); });
-  run.addEventListener("click", () => { lock(); void guarded(() => execute(p)); });
+  cancel.addEventListener("click", () => { lock(); if (state.pending === p) state.pending = null; post("bot", "Cancelled. Nothing was changed."); });
+  run.addEventListener("click", () => { lock(); state.pending = p; void guarded(() => execute(p)); });
 }
 
 /** Colours for the preview rows, so the user sees what a highlight will mark. */
@@ -460,7 +491,7 @@ async function guarded(fn: () => Promise<void>): Promise<void> {
   try {
     await fn();
   } catch (e) {
-    if (e instanceof Cancelled) post("bot", e.message);
+    if (e instanceof Notice || e instanceof Cancelled) post("bot", e.message);
     else post("err", e instanceof HostError ? e.message : `Something went wrong: ${(e as Error).message ?? e}`);
   } finally {
     setBusy(false);
@@ -576,6 +607,7 @@ function wire(): void {
     state.asked = null;
     state.columns = undefined;
     state.sourceRef = undefined;
+    state.wide = null;
     await readSource(undefined, true);
   }));
 }
@@ -596,7 +628,7 @@ async function start(): Promise<void> {
       post,
       guarded,
       readSource: (ref, fresh) => readSource(ref, fresh),
-      reset: () => { state.ref = undefined; state.asked = null; state.columns = undefined; state.sourceRef = undefined; state.pending = null; },
+      reset: () => { state.ref = undefined; state.asked = null; state.columns = undefined; state.sourceRef = undefined; state.wide = null; state.pending = null; },
       miniTable,
       setStatus,
       cellText,

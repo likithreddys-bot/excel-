@@ -20,7 +20,7 @@ export interface DedupeStep { op: "dedupe"; columns: string[] | null; keep: "fir
 export interface Aggregation { column: string; func: "count" | "sum" | "mean" | "min" | "max" | "nunique" }
 export interface GroupByStep { op: "group_by"; columns: string[]; aggregations: Aggregation[]; calculated: Record<string, string> }
 /** For each group: how many rows there are and what percent of them meet `when` ("percent of customers paid on time, by state"). */
-export interface RateStep { op: "rate"; columns: string[]; when: FilterStep }
+export interface RateStep { op: "rate"; columns: string[]; when: FilterStep | null; /** A rule written as a formula, e.g. [repaid_date]<=[due_date] (used instead of `when`) */ formula: string | null; /** how to say the rule in plain words (for formula rules) */ label?: string }
 export interface SplitByStep { op: "split_by"; column: string }
 export interface PivotStep {
   op: "pivot"; rows: string[]; columns: string[]; values: string | null;
