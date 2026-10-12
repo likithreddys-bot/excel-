@@ -1,6 +1,6 @@
 /** The Excel Agent: workspace, tools (with privacy), the agent loop with a scripted Gemini, and the report. */
 import { describe, expect, it } from "vitest";
-import { Content, Fetch, GeminiClient, defaultSettings } from "../src/ai/gemini";
+import { Content, Fetch, GeminiClient, defaultSettings, pickModel } from "../src/ai/gemini";
 import { normalisePlan } from "../src/ai/schema";
 import { Agent } from "../src/agent/loop";
 import { reportSheets } from "../src/agent/report";
@@ -142,7 +142,7 @@ function scripted(turns: Content["parts"][]): { fetch: Fetch; bodies: string[] }
   const bodies: string[] = [];
   let i = 0;
   const fetch: Fetch = async (_url, init) => {
-    bodies.push(init.body);
+    bodies.push(init.body ?? "");
     const parts = turns[Math.min(i++, turns.length - 1)];
     return { ok: true, status: 200, text: async () => JSON.stringify({ candidates: [{ content: { role: "model", parts } }] }) };
   };
@@ -210,5 +210,94 @@ describe("report", () => {
     const how = (await readSheet(book, "How calculated")).table;
     expect(how.nrows).toBe(2);
     expect(String(how.columns[3].values[1])).toMatch(/customer_type/);
+  });
+});
+
+describe("model choice", () => {
+  const gen = ["generateContent"];
+  it("picks the newest stable Flash model, skipping special ones", () => {
+    expect(pickModel([
+      { name: "models/gemini-2.0-flash", supportedGenerationMethods: gen },
+      { name: "models/gemini-3.0-flash", supportedGenerationMethods: gen },
+      { name: "models/gemini-3.0-flash-lite", supportedGenerationMethods: gen },
+      { name: "models/gemini-3.5-flash-preview-09", supportedGenerationMethods: gen },
+      { name: "models/gemini-3.0-flash-image", supportedGenerationMethods: gen },
+      { name: "models/gemini-3.0-pro", supportedGenerationMethods: gen },
+      { name: "models/text-embedding-004", supportedGenerationMethods: ["embedContent"] },
+    ])).toBe("gemini-3.0-flash");
+    expect(pickModel([{ name: "models/gemini-flash-latest", supportedGenerationMethods: gen }, { name: "models/gemini-3.0-flash", supportedGenerationMethods: gen }])).toBe("gemini-flash-latest");
+    expect(pickModel([])).toBeNull();
+  });
+
+  it("switches to an available model when the chosen one was retired, and says so", async () => {
+    const urls: string[] = [];
+    const fetch: Fetch = async (url) => {
+      urls.push(url);
+      if (url.includes("gemini-2.5-flash:")) return { ok: false, status: 404, text: async () => JSON.stringify({ error: { message: "models/gemini-2.5-flash is not found" } }) };
+      if (url.includes("?pageSize")) return { ok: true, status: 200, text: async () => JSON.stringify({ models: [{ name: "models/gemini-3.0-flash", supportedGenerationMethods: ["generateContent"] }] }) };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "{\"ok\":true}" }] } }] }) };
+    };
+    const s = { ...settings, model: "gemini-2.5-flash" };
+    const c = new GeminiClient(s, fetch);
+    let changed = "";
+    c.onModelChange = (m) => { changed = m; };
+    expect(await c.ask("sys", "ping")).toEqual({ ok: true });
+    expect(changed).toBe("gemini-3.0-flash");
+    expect(s.model).toBe("gemini-3.0-flash");
+    expect(urls.map((u) => u.replace(/^.*models/, ""))).toEqual(["/gemini-2.5-flash:generateContent", "?pageSize=1000", "/gemini-3.0-flash:generateContent"]);
+  });
+
+  it("explains when no model can be found", async () => {
+    const fetch: Fetch = async (url) => (url.includes("?pageSize")
+      ? { ok: true, status: 200, text: async () => JSON.stringify({ models: [] }) }
+      : { ok: false, status: 404, text: async () => "{}" });
+    await expect(new GeminiClient({ ...settings, model: "old" }, fetch).ask("s", "u")).rejects.toThrow(/couldn't find another one/);
+  });
+});
+
+describe("a busy Gemini", () => {
+  const ok = { ok: true, status: 200, text: async () => JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "{\"ok\":true}" }] } }] }) };
+  const busy = { ok: false, status: 503, text: async () => JSON.stringify({ error: { message: "This model is currently experiencing high demand." } }) };
+  const list = { ok: true, status: 200, text: async () => JSON.stringify({ models: ["gemini-flash-latest", "gemini-3.0-flash", "gemini-2.0-flash"].map((n) => ({ name: `models/${n}`, supportedGenerationMethods: ["generateContent"] })) }) };
+
+  it("waits and tries again", async () => {
+    let calls = 0;
+    const c = new GeminiClient({ ...settings, model: "gemini-flash-latest" }, async () => (++calls < 3 ? busy : ok));
+    const waits: number[] = [];
+    const status: string[] = [];
+    c.wait = async (ms) => { waits.push(ms); };
+    c.onStatus = (m) => status.push(m);
+    expect(await c.ask("s", "u")).toEqual({ ok: true });
+    expect(waits).toEqual([2000, 5000]);
+    expect(status[0]).toMatch(/busy/);
+  });
+
+  it("then tries another Flash model for this request, without changing the saved one", async () => {
+    const tried: string[] = [];
+    const s = { ...settings, model: "gemini-flash-latest" };
+    const c = new GeminiClient(s, async (url) => {
+      if (url.includes("?pageSize")) return list;
+      const m = /models\/([^:]+):/.exec(url)![1];
+      tried.push(m);
+      return m === "gemini-2.0-flash" ? ok : busy;
+    });
+    c.wait = async () => {};
+    expect(await c.ask("s", "u")).toEqual({ ok: true });
+    expect(tried).toEqual(["gemini-flash-latest", "gemini-flash-latest", "gemini-flash-latest", "gemini-3.0-flash", "gemini-2.0-flash"]);
+    expect(s.model).toBe("gemini-flash-latest");
+  });
+
+  it("says plainly when Google stays busy", async () => {
+    const c = new GeminiClient({ ...settings }, async (url) => (url.includes("?pageSize") ? list : busy));
+    c.wait = async () => {};
+    await expect(c.ask("s", "u")).rejects.toThrow(/overloaded right now/);
+  });
+
+  it("stops waiting when the person presses Stop", async () => {
+    const c = new GeminiClient({ ...settings }, async () => busy);
+    const stop = new AbortController();
+    const asking = c.ask("s", "u", stop.signal);
+    setTimeout(() => stop.abort(), 10);
+    await expect(asking).rejects.toThrow(/Stopped/);
   });
 });
