@@ -8,12 +8,12 @@ import type { Table } from "./engine/table";
 const ID_LIKE = /(^|_)(id|pin|code|num|number|schedule|age)(_|$)/i;
 const DENOMINATORS = [/alloc/i, /due/i, /emi/i, /tot(al)?_?amt/i, /principal/i, /outstanding/i];
 
-export function suggestPercentages(t: Table, text: string): string[] {
+export function suggestPercentages(t: Table, text: string, groupHint?: string): string[] {
   const words = sentenceWords(text);
   const best = (pred: (c: Table["columns"][number]) => boolean): string | undefined =>
     t.columns.filter(pred).map((c) => ({ c: c.name, s: matchScore(c.name, words) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s || a.c.length - b.c.length)[0]?.c;
 
-  const group = best((c) => c.kind === "text");
+  const group = groupHint ?? best((c) => c.kind === "text");
   const by = group ? ` by ${group}` : "";
   const numeric = t.columns.filter((c) => c.kind === "number" && !ID_LIKE.test(c.name));
   // Best match first; on a tie the plainer name wins (b0_amt before before_b0_amt).
@@ -26,6 +26,10 @@ export function suggestPercentages(t: Table, text: string): string[] {
     const denom = DENOMINATORS.map((re) => numeric.find((c) => re.test(c.name) && c.name !== a)?.name).find(Boolean);
     if (denom) out.push(`${a} as percentage of ${denom}${by}`);
   }
+  // "on time" = repaid in bucket B0: offer it whenever there is a b0 amount
+  const b0 = numeric.map((c) => c.name).filter((n) => /(^|_)b0(_|$)/i.test(n)).sort((x, y) => plain(x) - plain(y))[0];
+  const due0 = DENOMINATORS.map((re) => numeric.find((c) => re.test(c.name) && c.name !== b0)?.name).find(Boolean);
+  if (b0 && due0) out.push(`${b0} as percentage of ${due0}${by}`);
   const dates = t.columns.filter((c) => c.kind === "date");
   const due = dates.find((c) => /due/i.test(c.name));
   const paid = dates.find((c) => /paid|pay|repaid/i.test(c.name) && c !== due);

@@ -54,6 +54,13 @@ describe("autoColumns on real phrasing", () => {
   });
 });
 
+describe("state means statename", () => {
+  it("beats state_category when both exist", () => {
+    const t = makeTable(["statename", "state_category", "b0_amt", "alloc_amt"], [["MH", "A", 1, 2], ["KA", "B", 1, 2]]);
+    expect(suggestPercentages(t, "state wise repayment percentage")[0]).toBe("b0_amt as percentage of alloc_amt by statename");
+  });
+});
+
 describe("suggestPercentages", () => {
   const t = makeTable(
     ["statename", "b0_amt", "alloc_amt", "due_date", "repaid_date", "cur_bucket"],
