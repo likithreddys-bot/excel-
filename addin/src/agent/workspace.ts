@@ -78,6 +78,8 @@ const stem = (file: string): string => file.replace(/\.[^.]+$/, "") || file;
 export class Workspace {
   readonly tables = new Map<string, Entry>();
   progress: (message: string) => void = () => {};
+  /** The table being read right now (for the page's progress bar), or null. */
+  reading: string | null = null;
 
   private unique(wanted: string): string {
     const base = sheetSafe(wanted);
@@ -164,9 +166,15 @@ export class Workspace {
     }
     const whole = all.length === e.headers.length;
     // Re-read every needed column in one pass, so the rows always line up.
-    const got = e.book
-      ? await readSheet(e.book, e.sheet, whole ? undefined : all, this.progress)
-      : await readCsv(e.blob, whole ? undefined : all, this.progress);
+    this.reading = e.name;
+    let got;
+    try {
+      got = e.book
+        ? await readSheet(e.book, e.sheet, whole ? undefined : all, this.progress)
+        : await readCsv(e.blob, whole ? undefined : all, this.progress);
+    } finally {
+      this.reading = null;
+    }
     e.loaded = got.table;
     e.rows = got.table.nrows;
     e.approx = false;

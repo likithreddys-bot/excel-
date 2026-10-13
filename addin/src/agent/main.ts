@@ -91,6 +91,12 @@ function post(kind: "user" | "agent" | "err", text = ""): HTMLDivElement {
 function setStatus(text: string): void {
   $("status-text").textContent = text;
   $("status").classList.toggle("hidden", !text);
+  // "Reading your file: 45%…" moves the bar on that file's card.
+  const pct = /(\d+)%/.exec(text);
+  if (ws.reading) {
+    const bar = document.querySelector<HTMLElement>(`.table[data-name="${CSS.escape(ws.reading)}"] .track`);
+    if (bar) { bar.classList.add("reading"); (bar.firstElementChild as HTMLElement).style.transform = `scaleX(${pct ? Number(pct[1]) / 100 : 0.05})`; }
+  } else document.querySelectorAll<HTMLElement>(".track.reading").forEach((b) => { b.classList.remove("reading"); (b.firstElementChild as HTMLElement).style.transform = ""; });
 }
 
 const ICON: Record<StepView["kind"], string> = { look: "🔎", run: "▦", ask: "?", note: "✓", error: "!" };
@@ -186,6 +192,8 @@ async function send(text: string): Promise<void> {
 
 async function addFiles(list: File[]): Promise<void> {
   if (!list.length) return;
+  document.body.classList.add("dropped");
+  setTimeout(() => document.body.classList.remove("dropped"), 700);
   setStatus("Opening your files…");
   try {
     const { added, problems } = await ws.addFiles(list);
@@ -193,7 +201,8 @@ async function addFiles(list: File[]): Promise<void> {
     if (added.length) {
       const card = post("agent", `Added ${added.length === 1 ? "“" + added[0] + "”" : added.length + " tables: " + added.join(", ")}. Check the type of each file on the left (I guessed it from the name), then ask away.`);
       card.classList.add("muted");
-      select(added[0]);
+      renderTables();
+      showScan(added);
     }
   } finally {
     setStatus("");
@@ -201,35 +210,105 @@ async function addFiles(list: File[]): Promise<void> {
   }
 }
 
+const SHEET_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M4 9h16M4 15h16M10 3v18" stroke="currentColor" stroke-width="1.8"/></svg>';
+const RESULT_ICON = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+/** Cards already shown, so only new ones animate in. */
+const shown = new Set<string>();
+
 function renderTables(): void {
   const list = $("table-list");
   list.replaceChildren();
+  let fresh = 0;
   for (const e of ws.tables.values()) {
     const li = el("li", `table ${e.kind}${state.selected === e.name ? " selected" : ""}`);
+    li.dataset.name = e.name;
+    if (!shown.has(e.name)) { li.classList.add("enter"); li.style.setProperty("--i", String(fresh++)); shown.add(e.name); }
+    const top = el("div", "t-top");
+    const icon = el("span", "t-icon");
+    icon.innerHTML = e.kind === "source" ? SHEET_ICON : RESULT_ICON;
+    const names = el("div", "t-names");
     const open = el("button", "table-name", e.name);
     open.type = "button";
     open.addEventListener("click", () => select(e.name));
-    const meta = el("div", "muted small", e.kind === "source"
-      ? `${e.approx ? "about " : ""}${num(e.rows)} rows · ${e.headers.length} columns`
-      : `result · ${num(e.table.nrows)} rows · ${e.table.columns.length} columns`);
-    li.append(open, meta);
+    const meta = el("div", "t-meta", e.kind === "source"
+      ? `${e.approx ? "~" : ""}${num(e.rows)} rows · ${e.headers.length} cols`
+      : `result · ${num(e.table.nrows)} rows · ${e.table.columns.length} cols`);
+    names.append(open, meta);
+    top.append(icon, names);
+    li.append(top);
     if (e.kind === "source") {
+      const track = el("div", "track");
+      track.append(el("i"));
       const role = el("select", "role");
       role.setAttribute("aria-label", `What is in ${e.name}`);
       for (const r of ROLES) { const o = el("option", "", r.label); o.value = r.value; o.selected = r.value === e.role; role.append(o); }
       role.addEventListener("change", () => { e.role = role.value as Role; });
-      li.append(role);
+      li.append(track, role);
     } else {
       const del = el("button", "ghost small", "Remove");
       del.type = "button";
-      del.addEventListener("click", () => { ws.remove(e.name); if (state.selected === e.name) state.selected = null; renderTables(); renderViewer(); });
+      del.addEventListener("click", () => { ws.remove(e.name); shown.delete(e.name); if (state.selected === e.name) state.selected = null; renderTables(); renderViewer(); });
       li.append(del);
     }
     list.append(li);
   }
-  $("drop").classList.toggle("compact", ws.tables.size > 0);
+  for (const n of [...shown]) if (!ws.tables.has(n)) shown.delete(n);
+  document.body.classList.toggle("empty", ws.tables.size === 0);
+  $("file-count").textContent = ws.tables.size ? `${ws.sources().length} files · ${ws.results().length} results` : "";
   $<HTMLButtonElement>("download-report").disabled = state.busy || ws.results().length === 0;
   renderSuggestions();
+}
+
+/** A column's likely role from its name and kind, for the coloured dot. */
+function roleColour(name: string): [string, string] {
+  const n = name.toLowerCase();
+  if (/(^|_)(id|uuid|no|number|ref)$|^id(_|$)|phone|mobile|pan|aadha|email|account/.test(n)) return ["var(--muted)", "id / personal (never sent)"];
+  if (/date|_dt$|time|month|year|day/.test(n)) return ["var(--green)", "date"];
+  if (/amt|amount|due|paid|bal|principal|emi|income|fee|value|total|interest|outstanding/.test(n)) return ["var(--cyan)", "amount"];
+  return ["var(--violet)", "category / count"];
+}
+
+/** After files are added: a short "understanding" animation listing each file's columns by role. */
+function showScan(names: string[]): void {
+  state.selected = null;
+  renderTables();
+  const body = $("viewer-body");
+  $("viewer-title").textContent = names.length === 1 ? `Understanding ${names[0]}` : `Understanding ${names.length} files`;
+  $("viewer-tag").textContent = "SCANNING";
+  $("download-sheet").classList.add("hidden");
+  body.classList.remove("enter"); void body.offsetWidth; body.classList.add("enter");
+  const scan = el("div", "scan");
+  const beam = el("div", "beam");
+  const rows = el("div", "rows");
+  for (let i = 0; i < 6; i++) { const r = el("i"); r.style.width = `${40 + ((i * 37) % 55)}%`; rows.append(r); }
+  beam.append(rows);
+  scan.append(beam);
+  let k = 0;
+  for (const n of names) {
+    const s = ws.get(n);
+    if (!s || s.kind !== "source") continue;
+    const h = el("h3");
+    h.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
+    h.append(document.createTextNode(`${n} `), el("span", "mono muted small", `${s.headers.length} columns`));
+    const chips = el("div", "chips");
+    for (const c of s.headers.slice(0, 80)) {
+      const [colour] = roleColour(c);
+      const chip = el("span", "col-chip");
+      chip.style.setProperty("--c", colour);
+      chip.style.setProperty("--i", String(k++ % 40));
+      chip.append(el("i"), document.createTextNode(c));
+      chips.append(chip);
+    }
+    if (s.headers.length > 80) chips.append(el("span", "mono muted small", `+${s.headers.length - 80} more`));
+    scan.append(h, chips);
+  }
+  const legend = el("div", "legend");
+  for (const [c, label] of [["var(--cyan)", "amount"], ["var(--green)", "date"], ["var(--violet)", "category / count"], ["var(--muted)", "id / personal (never sent)"]]) {
+    const sp = el("span"); const d = el("i"); d.style.setProperty("--c", c); sp.append(d, document.createTextNode(label)); legend.append(sp);
+  }
+  scan.append(legend, el("p", "muted small", "Colours are a first guess from the column names; the AI checks each column before using it. Now ask for what you need."));
+  body.replaceChildren(scan);
+  setTimeout(() => { if (!state.selected) $("viewer-tag").textContent = "READY"; }, 1800);
 }
 
 function renderSuggestions(): void {
@@ -284,6 +363,7 @@ function grid(t: Table, limit = GRID_ROWS): HTMLElement {
 /** Exactly what left this computer, request by request: the transparency log. */
 function renderSent(body: HTMLElement): void {
   $("viewer-title").textContent = "What was sent to the AI";
+  $("viewer-tag").textContent = `${state.sent.length} REQUESTS`;
   $("download-sheet").classList.add("hidden");
   body.replaceChildren(el("p", "small", "Every request this tab sent to Gemini, newest first. Your rows never appear here: only your questions, column facts and what the privacy settings allow. This list is kept in memory and cleared when you close the tab."));
   if (!state.sent.length) { body.append(el("p", "muted", "Nothing has been sent yet.")); return; }
@@ -297,16 +377,56 @@ function renderSent(body: HTMLElement): void {
   }
 }
 
+/** Small results with a percentage column become tiles with a meter (New 71.48%, Old 89.79%...). */
+function kpis(t: Table): HTMLElement | null {
+  if (t.nrows < 1 || t.nrows > 6 || t.columns.length < 2) return null;
+  const label = t.columns[0];
+  const pct = [...t.columns].reverse().find((c) => c.kind === "number" && /%|percent|pct|rate|ratio/i.test(c.name));
+  if (!pct || label.kind === "number") return null;
+  const colours = ["var(--cyan)", "var(--green)", "var(--violet)", "var(--warn)", "var(--cyan)", "var(--green)"];
+  const box = el("div", "kpis");
+  for (let i = 0; i < t.nrows; i++) {
+    const v = pct.values[i];
+    if (typeof v !== "number") continue;
+    const tile = el("div", "kpi");
+    tile.style.setProperty("--c", /total/i.test(String(label.values[i])) ? "var(--violet)" : colours[i]);
+    tile.style.setProperty("--i", String(i));
+    const val = el("div", "v", "0");
+    const track = el("div", "track"); const fillBar = el("i"); fillBar.style.width = `${Math.max(0, Math.min(100, v))}%`; track.append(fillBar);
+    tile.append(el("div", "k", `${String(label.values[i] ?? "")} · ${pct.name}`), val, track);
+    box.append(tile);
+    countUp(val, v, /%|percent|pct/i.test(pct.name) ? "%" : "");
+  }
+  return box.children.length ? box : null;
+}
+
+function countUp(node: HTMLElement, to: number, suffix: string): void {
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const fmt = (x: number) => `${x.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${suffix}`;
+  if (reduce) { node.textContent = fmt(to); return; }
+  const start = performance.now();
+  const tick = (now: number): void => {
+    const k = Math.min(1, (now - start) / 700);
+    node.textContent = fmt(to * (1 - Math.pow(1 - k, 3)));
+    if (k < 1) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
 async function renderViewer(): Promise<void> {
   const body = $("viewer-body");
   if (state.selected === SENT_VIEW) { renderSent(body); return; }
   const e = state.selected ? ws.get(state.selected) : undefined;
   $("download-sheet").classList.toggle("hidden", !e || e.kind !== "result");
-  if (!e) { $("viewer-title").textContent = "Sheets"; body.replaceChildren(el("p", "muted", "Results appear here as sheets.")); return; }
+  if (!e) { $("viewer-title").textContent = "Sheets"; $("viewer-tag").textContent = ""; body.replaceChildren(el("p", "muted", "Results appear here as sheets.")); return; }
   $("viewer-title").textContent = e.name;
+  $("viewer-tag").textContent = e.kind === "result" ? `${e.plan.steps.some((x) => x.op === "pivot") ? "PIVOT" : "RESULT"} · ${num(e.table.nrows)} ROWS` : "SOURCE";
   body.replaceChildren();
+  body.classList.remove("enter"); void body.offsetWidth; body.classList.add("enter");
   if (e.kind === "result") {
     if (e.purpose) body.append(el("p", "purpose", e.purpose));
+    const tiles = kpis(e.table);
+    if (tiles) body.append(tiles);
     for (const f of e.formats) {
       if (f.op !== "chart") continue;
       try { body.append(drawChart(chartTable(e.table, f as ChartStep), f as ChartStep)); } catch { /* a chart that doesn't fit the final table is skipped */ }
@@ -402,6 +522,8 @@ function applySettings(s: AiSettings): void {
   agent = new Agent(client(s), ctx, { step: showStep, status: setStatus });
   $("setup").classList.toggle("hidden", ready());
   $("open-settings").textContent = ready() ? "AI settings" : "AI settings (not set up)";
+  $("model-status").classList.toggle("on", ready());
+  $("model-label").textContent = !ready() ? "AI not set up" : s.provider === "ollama" ? `${s.ollamaModel || DEFAULT_OLLAMA_MODEL} · local` : `${s.model || DEFAULT_MODEL} · Gemini`;
 }
 
 // ---------- start ----------
@@ -413,6 +535,11 @@ function wire(): void {
   $("drop").addEventListener("keydown", (ev) => { if ((ev as KeyboardEvent).key === "Enter") input.click(); });
   input.addEventListener("change", () => { const files = [...(input.files ?? [])]; input.value = ""; void addFiles(files); });
   $("try-sample").addEventListener("click", (ev) => { ev.stopPropagation(); void addFiles(sampleFiles()); });
+  $("hero-browse").addEventListener("click", (ev) => { ev.stopPropagation(); input.click(); });
+  $("hero-sample").addEventListener("click", (ev) => { ev.stopPropagation(); void addFiles(sampleFiles()); });
+  $("hero-drop").addEventListener("click", () => input.click());
+  $("hero-drop").addEventListener("keydown", (ev) => { if ((ev as KeyboardEvent).key === "Enter") input.click(); });
+  $("model-status").addEventListener("click", openSettings);
   document.addEventListener("dragover", (ev) => { ev.preventDefault(); document.body.classList.add("dragging"); });
   document.addEventListener("dragleave", (ev) => { if (!(ev as DragEvent).relatedTarget) document.body.classList.remove("dragging"); });
   document.addEventListener("drop", (ev) => { ev.preventDefault(); document.body.classList.remove("dragging"); void addFiles([...((ev as DragEvent).dataTransfer?.files ?? [])]); });
@@ -496,6 +623,7 @@ function wire(): void {
   });
 }
 
+ws.progress = setStatus;
 wire();
 applySettings(state.settings);
 renderTables();
