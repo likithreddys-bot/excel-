@@ -140,3 +140,12 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
   .top .link { font-size: 12px; }
   #files { max-height: 45vh; }
 }
+
+.privacy { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; display: flex; flex-direction: column; gap: 6px; }
+.privacy legend { font-weight: 600; padding: 0 4px; }
+.privacy p { margin: 0; }
+.note.warn { background: var(--err-bg); color: var(--fg); }
+.sent { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.sent summary { cursor: pointer; }
+.sent pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 50vh; overflow: auto; margin: 6px 0 0; }
+.msg.blocked { border: 1px solid var(--err-fg); }

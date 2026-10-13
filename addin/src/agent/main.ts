@@ -7,6 +7,7 @@ import { Cell, Table } from "../engine/table";
 import { isoDay } from "../engine/util";
 import { drawChart } from "../web/chart";
 import { buildXlsx } from "../web/xlsx-write";
+import { PrivacyBlock, blockedValues, checkOutgoing } from "./guard";
 import { Agent } from "./loop";
 import { reportBlob } from "./report";
 import { sampleFiles } from "./sample";
@@ -39,7 +40,11 @@ const state = {
   selected: null as string | null,
   /** The question waiting for an answer from the person, if any. */
   answer: null as ((text: string) => void) | null,
+  /** Every request sent to the AI in this tab (kept in memory only), newest last. */
+  sent: [] as { at: Date; body: Record<string, unknown> }[],
 };
+
+const SENT_VIEW = "\u0000sent";
 
 const saveNotes = (): void => { try { localStorage.setItem(NOTES_KEY, JSON.stringify(state.notes.slice(-50))); } catch { /* ignore */ } };
 const ready = (): boolean => state.settings.apiKey.trim() !== "";
@@ -59,6 +64,9 @@ function client(s: AiSettings): GeminiClient {
     const box = document.getElementById("s-model") as HTMLInputElement | null;
     if (box) box.value = model;
   };
+  // Guardrail: every request is checked for personal data and file values before it leaves; blocked ones are never sent.
+  c.guard = (body) => checkOutgoing(body, blockedValues(ws));
+  c.onSend = (body) => { state.sent.push({ at: new Date(), body }); if (state.sent.length > 40) state.sent.shift(); if (state.selected === SENT_VIEW) void renderViewer(); };
   c.onStatus = (message) => {
     setStatus(message);
     const dialog = document.getElementById("settings") as HTMLDialogElement | null;
@@ -162,6 +170,7 @@ async function send(text: string): Promise<void> {
     }
   } catch (e) {
     if ((e as Error).name === "AbortError") post("agent", "Stopped. The sheets made so far are kept.").classList.add("muted");
+    else if (e instanceof PrivacyBlock) post("err", e.message).classList.add("blocked");
     else post("err", e instanceof AiError ? e.message : `Something went wrong: ${(e as Error).message ?? e}`);
   } finally {
     state.abort = null;
@@ -270,8 +279,25 @@ function grid(t: Table, limit = GRID_ROWS): HTMLElement {
   return wrap;
 }
 
+/** Exactly what left this computer, request by request: the transparency log. */
+function renderSent(body: HTMLElement): void {
+  $("viewer-title").textContent = "What was sent to the AI";
+  $("download-sheet").classList.add("hidden");
+  body.replaceChildren(el("p", "small", "Every request this tab sent to Gemini, newest first. Your rows never appear here: only your questions, column facts and what the privacy settings allow. This list is kept in memory and cleared when you close the tab."));
+  if (!state.sent.length) { body.append(el("p", "muted", "Nothing has been sent yet.")); return; }
+  for (const { at, body: req } of [...state.sent].reverse()) {
+    const box = el("details", "sent");
+    box.append(el("summary", "", `${at.toLocaleTimeString()} · ${JSON.stringify(req).length.toLocaleString("en-IN")} characters`));
+    const pre = el("pre", "small");
+    pre.textContent = JSON.stringify(req, null, 2);
+    box.append(pre);
+    body.append(box);
+  }
+}
+
 async function renderViewer(): Promise<void> {
   const body = $("viewer-body");
+  if (state.selected === SENT_VIEW) { renderSent(body); return; }
   const e = state.selected ? ws.get(state.selected) : undefined;
   $("download-sheet").classList.toggle("hidden", !e || e.kind !== "result");
   if (!e) { $("viewer-title").textContent = "Sheets"; body.replaceChildren(el("p", "muted", "Results appear here as sheets.")); return; }
@@ -398,6 +424,7 @@ function wire(): void {
     if (!e || e.kind !== "result") return;
     download(await buildXlsx(new Map([[e.name, e.table]]), e.formats), `${e.name}.xlsx`);
   });
+  $("show-sent").addEventListener("click", () => { state.selected = SENT_VIEW; renderTables(); void renderViewer(); });
   $("forget-notes").addEventListener("click", () => {
     state.notes.splice(0, state.notes.length);
     saveNotes();

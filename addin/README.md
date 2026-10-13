@@ -5,10 +5,16 @@
 An AI analyst for lending data. Add several files at once (new customers, old customers, loans, repayments, policy), ask for an analysis or a report in your own words, and get result sheets you can download as one Excel workbook.
 
 - **How it works:** a Gemini model plans the work with tools: it looks at the tables, runs plans (filters, pivots, ratios of totals, joins between files, stacking files, charts), checks the results and asks you when a definition matters ("what counts as an old customer?"). Every number is calculated in the browser by the same exact engine as the classic app, on every row.
-- **What the model sees:** your request, table and column names, each column's type, range and share of empty cells, the common values of category columns (state, status, policy name; can be switched off) and small summary results (at most 60 rows, no personal or id columns; can be switched off). **Never** your rows, names, phone numbers, PAN, account numbers or ids. Tests check this.
+- **Guardrails (always on):**
+  - Files are read and calculated only on this computer; nothing is uploaded, and nothing from them is stored after the tab is closed (only the key, settings and confirmed definitions stay in the browser).
+  - **Strict privacy by default:** the model gets the question, table and column names, column types, ranges and share of empty cells. Nothing else. Two opt-in boxes add the common values of small category columns and small summary results (at most 60 rows, no personal or id columns).
+  - **Outgoing check:** every request is scanned just before it is sent (`src/agent/guard.ts`). It is stopped, and nothing is sent, if it contains a PAN, Aadhaar, phone number, e-mail, card or account number, or any value from a name, id, address or other free-text column of the files. Personal and id columns do not even send their range.
+  - **Locked-down page:** a Content-Security-Policy lets the page connect only to its own server and Google's Gemini API.
+  - **"What was sent to the AI"** shows every request, word for word.
+  - **Training:** on Google's free tier Google may use prompts (question and column facts) to improve its products; on a paid, billing-enabled key Google's terms say prompts are not used for training. Use a paid key from the company's Google Cloud account for real customer files, and check Google's current terms.
 - **Remembers definitions** you confirm (in this browser), and keeps the conversation so follow-ups work ("now by state").
 - **Report download:** every result sheet plus a **How calculated** sheet listing the steps and notes behind each one.
-- **Setup:** open **AI settings** and paste a Gemini API key (free at aistudio.google.com/apikey). The key stays in the browser. A free key may let Google use prompts to improve its products: use it with test or masked files. For real customer data, use a paid key under your company's agreement.
+- **Setup:** open **AI settings** and paste a Gemini API key (free at aistudio.google.com/apikey). The key stays in the browser. Use the free key with test or masked files only (see Training above).
 - **Try it:** press **Try sample data** for made-up new/old customer, repayment and policy files.
 - Code: `src/agent/` (workspace, tools, agent loop, page), `src/ai/` (Gemini client, column profile, plan checker). Tests: `test/agent.test.ts`.
 

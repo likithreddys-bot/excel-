@@ -11,11 +11,15 @@ export interface AiSettings {
   shareValues: boolean;
   /** Let the agent read small summary results (at most 60 rows, no personal or id columns) so it can explain them. */
   readResults: boolean;
+  /** Set once the person has seen the privacy choices (older saved settings start in strict mode). */
+  privacyVersion?: number;
 }
 
 /** Google's alias for its current Flash model (fast, with a free tier). If a key can't use it, a working model is looked up. */
 export const DEFAULT_MODEL = "gemini-flash-latest";
-export const defaultSettings = (): AiSettings => ({ enabled: false, apiKey: "", model: DEFAULT_MODEL, shareValues: true, readResults: true });
+/** Strict by default: only column names, types and ranges leave the computer. */
+export const defaultSettings = (): AiSettings => ({ enabled: false, apiKey: "", model: DEFAULT_MODEL, shareValues: false, readResults: false, privacyVersion: PRIVACY_VERSION });
+export const PRIVACY_VERSION = 2;
 
 /** One turn of a Gemini conversation, kept exactly as the API returned it (parts may carry thought signatures). */
 export interface Content { role: "user" | "model"; parts: Part[] }
@@ -64,6 +68,10 @@ export const BUSY_WAITS_MS = [2000, 5000];
 export class GeminiClient {
   /** Called when the client switched to another model because the chosen one is not available. */
   onModelChange: (model: string) => void = () => {};
+  /** Checks every request before it is sent; throws to stop it (the privacy guard). */
+  guard: (body: Record<string, unknown>) => void = () => {};
+  /** Called with every request that is actually sent (for the "What was sent" log). */
+  onSend: (body: Record<string, unknown>) => void = () => {};
   /** Progress while waiting on a busy Gemini ("Gemini is busy, trying again…"). */
   onStatus: (message: string) => void = () => {};
   /** How to wait between retries (replaced in tests). */
@@ -117,6 +125,8 @@ export class GeminiClient {
 
   private async generate(body: Record<string, unknown>, signal?: AbortSignal): Promise<Content> {
     if (!this.settings.apiKey.trim()) throw new AiError("Add your Gemini API key in the AI settings first.", "key");
+    this.guard(body);
+    this.onSend(body);
     let model = this.settings.model || DEFAULT_MODEL;
     let switched = false;
     let alternates: string[] | null = null;
