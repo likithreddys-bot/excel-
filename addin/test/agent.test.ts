@@ -2,6 +2,7 @@
 import { describe, expect, it } from "vitest";
 import { Content, Fetch, GeminiClient, defaultSettings, pickModel } from "../src/ai/gemini";
 import { normalisePlan } from "../src/ai/schema";
+import { PrivacyBlock, blockedValues, checkOutgoing, personalData } from "../src/agent/guard";
 import { Agent } from "../src/agent/loop";
 import { reportSheets } from "../src/agent/report";
 import { sampleFiles } from "../src/agent/sample";
@@ -10,7 +11,8 @@ import { Workspace, guessRole } from "../src/agent/workspace";
 import { buildXlsx } from "../src/web/xlsx-write";
 import { openXlsx, readSheet } from "../src/web/xlsx-read";
 
-const settings = { ...defaultSettings(), enabled: true, apiKey: "test-key" };
+/** "Standard" privacy (values and small results shared); strict mode is tested on its own below. */
+const settings = { ...defaultSettings(), enabled: true, apiKey: "test-key", shareValues: true, readResults: true };
 
 async function sampleWorkspace(): Promise<Workspace> {
   const ws = new Workspace();
@@ -299,5 +301,67 @@ describe("a busy Gemini", () => {
     const asking = c.ask("s", "u", stop.signal);
     setTimeout(() => stop.abort(), 10);
     await expect(asking).rejects.toThrow(/Stopped/);
+  });
+});
+
+describe("guardrails", () => {
+  it("are strict by default: no values and no result rows leave", async () => {
+    const strict = { ...defaultSettings(), enabled: true, apiKey: "k" };
+    expect(strict.shareValues).toBe(false);
+    expect(strict.readResults).toBe(false);
+    const ws = await sampleWorkspace();
+    const ctx = { ...context(ws), settings: strict };
+    const states = await runTool("value_counts", { table: "new_customers", column: "state" }, ctx);
+    expect(JSON.stringify(states.response)).not.toMatch(/Maharashtra/);
+    const run = await runTool("run_plan", { table: "repayments", plan: JSON.stringify({ steps: [{ op: "group_by", columns: ["dpd"], aggregations: [{ column: "due_amt", func: "sum" }] }] }), result_name: "x", purpose: "" }, ctx);
+    expect(run.response.data).toBeUndefined();
+    expect(run.response.rows_withheld).toMatch(/switched off/);
+  });
+
+  it("recognise personal data", () => {
+    expect(personalData("pan ABCDE1234F please")).toEqual(["a PAN number"]);
+    expect(personalData("call 9876543210")).toEqual(["a phone number"]);
+    expect(personalData("aadhaar 1234 5678 9012")).toContain("an Aadhaar number");
+    expect(personalData("mail asha@example.com")).toEqual(["an e-mail address"]);
+    expect(personalData("repayment % of old vs new customers by state")).toEqual([]);
+  });
+
+  it("stop a request carrying personal data or a value from a name or id column, before it is sent", async () => {
+    const ws = new Workspace();
+    const csv = "customer_id,customer_name,phone,state,due_amt\n" + Array.from({ length: 80 }, (_, i) => `C${1000 + i},Person${i} Kumar,98765${String(10000 + i)},${["MH", "KA"][i % 2]},${1000 + i}`).join("\n");
+    await ws.addFiles([new File([csv], "cx.csv")]);
+    await ws.ensure("cx", "all");
+    const blocked = blockedValues(ws);
+    const req = (text: string) => ({ contents: [{ role: "user", parts: [{ text }] }] });
+    expect(() => checkOutgoing(req("repayment % by state and due_amt for MH"), blocked)).not.toThrow(); // column names and states are fine
+    expect(() => checkOutgoing(req("what did Person7 pay?"), blocked)).toThrow(PrivacyBlock);
+    expect(() => checkOutgoing(req("loans of C1005"), blocked)).toThrow(/value from your file/);
+    expect(() => checkOutgoing(req("call 9876510003"), blocked)).toThrow(/phone number/);
+    // a tool result that somehow carried a name is stopped too
+    expect(() => checkOutgoing({ contents: [{ role: "user", parts: [{ functionResponse: { name: "x", response: { data: [["Person3 Kumar", 5]] } } }] }] }, blocked)).toThrow(PrivacyBlock);
+  });
+
+  it("the client never sends a blocked request", async () => {
+    let sent = 0;
+    const c = new GeminiClient(settings, async () => { sent++; return { ok: true, status: 200, text: async () => "{}" }; });
+    c.guard = (body) => checkOutgoing(body, { values: new Set(), words: new Set() });
+    await expect(c.ask("system", "my PAN is ABCDE1234F")).rejects.toThrow(PrivacyBlock);
+    expect(sent).toBe(0);
+  });
+
+  it("the whole agent run sends no personal data, in standard mode too", async () => {
+    const ws = await sampleWorkspace();
+    await ws.ensure("new_customers", "all");
+    const { fetch, bodies } = scripted([
+      [{ functionCall: { name: "describe_table", args: { table: "new_customers" } } }],
+      [{ functionCall: { name: "value_counts", args: { table: "new_customers", column: "customer_id" } } }],
+      [{ functionCall: { name: "final_answer", args: { message: "ok" } } }],
+    ]);
+    const c = new GeminiClient(settings, fetch);
+    c.guard = (body) => checkOutgoing(body, blockedValues(ws));
+    const agent = new Agent(c, context(ws), { step: () => {}, status: () => {} });
+    await agent.run("describe the new customers");
+    expect(bodies).toHaveLength(3);
+    expect(bodies.join("")).not.toMatch(/C0\d{4}/);
   });
 });

@@ -1,5 +1,5 @@
 /** The AI settings dialog and the "what I understood about your sheet" panel. */
-import { AiError, AiSettings, DEFAULT_MODEL, GeminiClient, defaultSettings } from "./gemini";
+import { AiError, AiSettings, DEFAULT_MODEL, GeminiClient, PRIVACY_VERSION, defaultSettings } from "./gemini";
 import { ColumnProfile, describeColumn } from "./profile";
 
 const KEY = "sheet-assistant-ai";
@@ -7,7 +7,12 @@ const KEY = "sheet-assistant-ai";
 export function loadAiSettings(): AiSettings {
   try {
     const raw = localStorage.getItem(KEY);
-    if (raw) return { ...defaultSettings(), ...(JSON.parse(raw) as Partial<AiSettings>) };
+    if (raw) {
+      const saved = JSON.parse(raw) as Partial<AiSettings>;
+      // Settings saved before the privacy guardrails: keep the key and model, start again in strict mode.
+      if ((saved.privacyVersion ?? 0) < PRIVACY_VERSION) { saved.shareValues = false; saved.readResults = false; saved.privacyVersion = PRIVACY_VERSION; }
+      return { ...defaultSettings(), ...saved };
+    }
   } catch { /* storage blocked or damaged: use the defaults */ }
   return defaultSettings();
 }

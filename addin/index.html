@@ -6,6 +6,8 @@
 <title>Excel Agent</title>
 <meta name="description" content="Add your Excel or CSV files and ask for any analysis or report in plain words. The AI plans the work; every number is calculated on your computer.">
 <link rel="icon" href="/assets/icon-32.png">
+<!-- Guardrail: this page may only talk to its own server and to Google's Gemini API. Any other connection is refused by the browser. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://generativelanguage.googleapis.com; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'">
 <script>
   try { var t = localStorage.getItem("sheet-assistant-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
 </script>
@@ -40,6 +42,7 @@
     <ul id="table-list" class="tables"></ul>
     <div class="panel-foot">
       <button id="download-report" class="primary wide" type="button" disabled>Download report (.xlsx)</button>
+      <button id="show-sent" class="ghost small wide" type="button">What was sent to the AI</button>
       <button id="forget-notes" class="ghost small wide" type="button">Forget saved definitions</button>
     </div>
   </aside>
@@ -93,11 +96,17 @@
       <input id="s-model" type="text" placeholder="gemini-flash-latest">
     </label>
     <p class="muted small">Leave it as it is. If Google retires a model, I switch to the newest Flash model your key can use.</p>
-    <label class="check"><input id="s-share" type="checkbox"> Share the common values of category columns (state, status, policy name, 0/1 flags)</label>
-    <label class="check"><input id="s-results" type="checkbox"> Let the AI read small summary results (up to 60 rows, no personal or id columns) so it can explain them</label>
+    <fieldset class="privacy">
+      <legend>Privacy</legend>
+      <p class="small"><strong>Strict (default):</strong> leave both boxes unticked. Only your question, column names, types, ranges and how empty each column is are sent. The AI then refers you to the result sheets instead of quoting numbers.</p>
+      <label class="check"><input id="s-share" type="checkbox"> Also share the common values of small category columns (state, status, policy name, 0/1 flags)</label>
+      <label class="check"><input id="s-results" type="checkbox"> Also let the AI read small summary results (up to 60 rows, no personal or id columns) so it can explain them</label>
+    </fieldset>
     <div class="note">
-      <strong>Sent to Google:</strong> your request, table and column names, each column's type, range and share of empty cells, and what the two boxes above allow.
-      <strong>Never sent:</strong> your rows, names, phone numbers, PAN, account numbers or ids. A free key may let Google use prompts to improve its products: use test or masked files with it.
+      <strong>Guardrails, always on:</strong> your files are read and calculated on this computer only and are never uploaded. Your rows, names, phone numbers, PAN, Aadhaar, e-mails, account numbers and ids are never sent: every request is checked before it leaves, and one that contains them is stopped. The page can talk to no server except Google's Gemini API. Nothing from your files is stored after you close the tab. <strong>See exactly what was sent</strong> with "What was sent to the AI".
+    </div>
+    <div class="note warn">
+      <strong>Training:</strong> on Google's <em>free</em> tier, Google may use what is sent (your question and column facts) to improve its products. On a <em>paid</em> (billing-enabled) key, Google's terms say prompts are not used to train its models. For real customer files, use a paid key from your company's Google Cloud account.
     </div>
     <p id="s-status" class="small" role="status"></p>
     <div class="row end">

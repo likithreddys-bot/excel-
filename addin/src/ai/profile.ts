@@ -79,9 +79,11 @@ export function profileColumn(c: Column, nrows: number, opts: { values: boolean 
   if (c.kind === "date" && lo <= hi) { p.min = dayText(lo); p.max = dayText(hi); }
   else if (c.kind === "number" && nums) { p.min = lo; p.max = hi; p.mean = roundTo(sum / nums); }
 
-  if (!opts.values) p.withheld = "values not shared";
-  else if (PERSONAL.test(c.name)) p.withheld = "looks like personal data";
+  // Personal and id columns: not even their range is shared (the smallest phone number is still a phone number).
+  if (PERSONAL.test(c.name) || p.role === "id") { delete p.min; delete p.max; delete p.mean; }
+  if (PERSONAL.test(c.name)) p.withheld = "looks like personal data";
   else if (p.role === "id") p.withheld = "an identifier";
+  else if (!opts.values) p.withheld = "values not shared";
   else if (c.kind === "date") { /* the range above is enough */ }
   else if (c.kind === "number" && p.role !== "flag" && distinct > 8) { /* the range above is enough */ }
   else if (capped || distinct > CATEGORY_MAX) p.withheld = "many different values";
