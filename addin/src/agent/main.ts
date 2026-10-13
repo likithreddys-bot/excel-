@@ -13,7 +13,8 @@ import { PrivacyBlock, blockedValues, checkOutgoing } from "./guard";
 import { Agent } from "./loop";
 import { reportBlob } from "./report";
 import { sampleFiles } from "./sample";
-import { StepView, planLines } from "./tools";
+import { StepView, howLines } from "./tools";
+import { startBrowserDuck } from "./duck";
 import { ROLES, Role, Workspace } from "./workspace";
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -33,7 +34,7 @@ function loadNotes(): string[] {
   return [];
 }
 
-const ws = new Workspace();
+const ws = new Workspace(startBrowserDuck);
 const state = {
   settings: loadAiSettings(),
   notes: loadNotes(),
@@ -57,6 +58,7 @@ const ctx = {
   get notes() { return state.notes; },
   saveNotes,
   ask: (question: string, options: string[]) => askPerson(question, options),
+  status: (text: string) => setStatus(text),
 };
 /** The chosen AI's client, which remembers it when it had to switch to another model (a retired or missing one). */
 function client(s: AiSettings): ModelClient {
@@ -235,6 +237,7 @@ function renderTables(): void {
       : `result · ${num(e.table.nrows)} rows · ${e.table.columns.length} cols`);
     names.append(open, meta);
     top.append(icon, names);
+    if (e.kind === "source" && e.engine === "sql") { const b = el("span", "badge mono", "SQL"); b.title = "Large file: analysed by DuckDB straight from disk, every row"; top.append(b); }
     li.append(top);
     if (e.kind === "source") {
       const track = el("div", "track");
@@ -341,7 +344,7 @@ function cellText(t: Table, j: number, i: number): string {
   const v: Cell = c.values[i];
   if (v === null || v === "") return "";
   if (c.kind === "date" && c.time?.[i] != null) return isoDay(c.time[i]!);
-  if (typeof v === "number") return Number.isInteger(v) ? v.toLocaleString("en-IN") : v.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+  if (typeof v === "number") return Number.isInteger(v) ? v.toLocaleString("en-IN") : v.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return String(v);
 }
 
@@ -437,7 +440,7 @@ async function renderViewer(): Promise<void> {
     how.append(el("summary", "", "How this was calculated"));
     how.append(el("p", "small", `Made from “${e.from}”, using every row:`));
     const ol = el("ol", "small");
-    for (const l of planLines(e.plan)) ol.append(el("li", "", l));
+    for (const l of howLines(e)) ol.append(el("li", "", l));
     how.append(ol);
     if (e.notes.length) { const ul = el("ul", "small muted"); for (const n of e.notes) ul.append(el("li", "", n)); how.append(ul); }
     body.append(how);

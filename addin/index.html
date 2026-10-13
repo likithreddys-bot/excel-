@@ -7,7 +7,7 @@
 <meta name="description" content="Add your Excel or CSV files and ask for any analysis or report in plain words. The AI plans the work; every number is calculated on your computer.">
 <link rel="icon" href="/assets/icon-32.png">
 <!-- Guardrail: this page may only talk to its own server and to Google's Gemini API. Any other connection is refused by the browser. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://generativelanguage.googleapis.com http://localhost:* http://127.0.0.1:*; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://generativelanguage.googleapis.com http://localhost:* http://127.0.0.1:*; object-src 'none'; base-uri 'self'; form-action 'none'; frame-src 'none'">
 <script>
   try { var t = localStorage.getItem("sheet-assistant-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
 </script>
@@ -39,7 +39,7 @@
     <div class="dz-inner">
       <div class="orb"><span class="ripple"></span><svg viewBox="0 0 24 24" width="30" height="30" fill="none" aria-hidden="true"><path d="M12 16V4m0 0-5 5m5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
       <strong class="dz-title">Drag &amp; drop Excel or CSV files</strong>
-      <span class="mono muted small">.xlsx · .csv · lakhs of rows · 298+ columns</span>
+      <span class="mono muted small">.xlsx · .csv · .parquet · crores of rows · 298+ columns</span>
       <div class="row">
         <button id="hero-browse" class="primary glow-btn" type="button">Browse files</button>
         <button id="hero-sample" type="button">Try sample data</button>
@@ -62,7 +62,7 @@
         <button id="add-files" class="primary" type="button">Add files…</button>
         <button id="try-sample" type="button">Try sample data</button>
       </div>
-      <input id="file-input" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt,.xls,.xlsb" multiple hidden>
+      <input id="file-input" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt,.parquet,.xls,.xlsb" multiple hidden>
     </div>
     <ul id="table-list" class="tables"></ul>
     <div class="panel-foot">
