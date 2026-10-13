@@ -13,6 +13,22 @@ export interface AiSettings {
   readResults: boolean;
   /** Set once the person has seen the privacy choices (older saved settings start in strict mode). */
   privacyVersion?: number;
+  /** Which AI plans the work: Google's Gemini (cloud) or a model running on this computer or the company network (Ollama). */
+  provider?: "gemini" | "ollama";
+  /** The local model server, e.g. http://localhost:11434 */
+  ollamaUrl?: string;
+  /** The local model's name as Ollama lists it, e.g. qwen2.5:7b */
+  ollamaModel?: string;
+}
+
+/** What the agent needs from any AI: a JSON answer, a tool-using conversation turn, and the guard and log hooks. */
+export interface ModelClient {
+  ask(system: string, user: string, signal?: AbortSignal): Promise<unknown>;
+  chat(system: string, contents: Content[], tools: FunctionDeclaration[], signal?: AbortSignal): Promise<Content>;
+  guard: (body: Record<string, unknown>) => void;
+  onSend: (body: Record<string, unknown>) => void;
+  onStatus: (message: string) => void;
+  onModelChange: (model: string) => void;
 }
 
 /** Google's alias for its current Flash model (fast, with a free tier). If a key can't use it, a working model is looked up. */
@@ -65,7 +81,7 @@ const BUSY = new Set([500, 502, 503, 504]);
 /** Waits before retrying the same model when Google is busy. */
 export const BUSY_WAITS_MS = [2000, 5000];
 
-export class GeminiClient {
+export class GeminiClient implements ModelClient {
   /** Called when the client switched to another model because the chosen one is not available. */
   onModelChange: (model: string) => void = () => {};
   /** Checks every request before it is sent; throws to stop it (the privacy guard). */

@@ -5,11 +5,17 @@
 An AI analyst for lending data. Add several files at once (new customers, old customers, loans, repayments, policy), ask for an analysis or a report in your own words, and get result sheets you can download as one Excel workbook.
 
 - **How it works:** a Gemini model plans the work with tools: it looks at the tables, runs plans (filters, pivots, ratios of totals, joins between files, stacking files, charts), checks the results and asks you when a definition matters ("what counts as an old customer?"). Every number is calculated in the browser by the same exact engine as the classic app, on every row.
+- **Local model option (nothing leaves the computer):** in AI settings choose **Local model on this computer**. The agent then talks to [Ollama](https://ollama.com) at `http://localhost:11434` instead of Google, so no request leaves the PC and nothing is used for training. One-time setup:
+  1. Install Ollama (Windows, Mac or Linux).
+  2. `ollama pull qwen2.5:7b` (about 5 GB, 16 GB RAM; with 8 GB RAM use `qwen2.5:3b`). Any model that supports tools works: Qwen 2.5/3, Llama 3.1+, Mistral Nemo...
+  3. Allow the site to call it and restart Ollama: `setx OLLAMA_ORIGINS "https://likithreddys-bot.github.io"` on Windows (`launchctl setenv` on Mac, the service's environment on Linux).
+  4. Press **Test** in AI settings. If the browser asks to allow access to the local network, allow it.
+  If the named model isn't installed, the app uses an installed one that can call tools. A company server works too (host the site inside the company so its security rule can allow that address). Small local models are less capable than Gemini at multi-step reports; `qwen2.5:14b` or larger works noticeably better if the PC has the memory.
 - **Guardrails (always on):**
   - Files are read and calculated only on this computer; nothing is uploaded, and nothing from them is stored after the tab is closed (only the key, settings and confirmed definitions stay in the browser).
   - **Strict privacy by default:** the model gets the question, table and column names, column types, ranges and share of empty cells. Nothing else. Two opt-in boxes add the common values of small category columns and small summary results (at most 60 rows, no personal or id columns).
   - **Outgoing check:** every request is scanned just before it is sent (`src/agent/guard.ts`). It is stopped, and nothing is sent, if it contains a PAN, Aadhaar, phone number, e-mail, card or account number, or any value from a name, id, address or other free-text column of the files. Personal and id columns do not even send their range.
-  - **Locked-down page:** a Content-Security-Policy lets the page connect only to its own server and Google's Gemini API.
+  - **Locked-down page:** a Content-Security-Policy lets the page connect only to its own server, Google's Gemini API and a model server on this computer (localhost).
   - **"What was sent to the AI"** shows every request, word for word.
   - **Training:** on Google's free tier Google may use prompts (question and column facts) to improve its products; on a paid, billing-enabled key Google's terms say prompts are not used for training. Use a paid key from the company's Google Cloud account for real customer files, and check Google's current terms.
 - **Remembers definitions** you confirm (in this browser), and keeps the conversation so follow-ups work ("now by state").

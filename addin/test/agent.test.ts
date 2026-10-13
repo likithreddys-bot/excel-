@@ -2,6 +2,8 @@
 import { describe, expect, it } from "vitest";
 import { Content, Fetch, GeminiClient, defaultSettings, pickModel } from "../src/ai/gemini";
 import { normalisePlan } from "../src/ai/schema";
+import { OllamaClient, pickLocalModel } from "../src/ai/ollama";
+import { isReady, makeClient } from "../src/ai/client";
 import { PrivacyBlock, blockedValues, checkOutgoing, personalData } from "../src/agent/guard";
 import { Agent } from "../src/agent/loop";
 import { reportSheets } from "../src/agent/report";
@@ -363,5 +365,75 @@ describe("guardrails", () => {
     await agent.run("describe the new customers");
     expect(bodies).toHaveLength(3);
     expect(bodies.join("")).not.toMatch(/C0\d{4}/);
+  });
+});
+
+describe("local model (Ollama)", () => {
+  const local = { ...settings, provider: "ollama" as const, ollamaUrl: "http://localhost:11434", ollamaModel: "qwen2.5:7b", apiKey: "" };
+  const reply = (message: Record<string, unknown>) => ({ ok: true, status: 200, text: async () => JSON.stringify({ message: { role: "assistant", content: "", ...message } }) });
+
+  it("turns the agent's turns into chat messages and tool calls back into the agent's shape", async () => {
+    const seen: Record<string, unknown>[] = [];
+    const fetch: Fetch = async (url, init) => {
+      expect(url).toBe("http://localhost:11434/api/chat");
+      seen.push(JSON.parse(init.body!));
+      return reply({ tool_calls: [{ function: { name: "describe_table", arguments: { table: "repayments" } } }] });
+    };
+    const c = new OllamaClient(local, fetch);
+    const turn = await c.chat("system text", [
+      { role: "user", parts: [{ text: "repayment by state" }] },
+      { role: "model", parts: [{ functionCall: { name: "value_counts", args: { table: "a", column: "b" } } }] },
+      { role: "user", parts: [{ functionResponse: { name: "value_counts", response: { values: [] } } }] },
+    ], [{ name: "describe_table", description: "look", parameters: { type: "object", properties: {} } }]);
+    expect(turn).toEqual({ role: "model", parts: [{ functionCall: { name: "describe_table", args: { table: "repayments" } } }] });
+    const body = seen[0] as { model: string; messages: { role: string; content: string; tool_calls?: unknown[]; tool_name?: string }[]; tools: { function: { name: string } }[] };
+    expect(body.model).toBe("qwen2.5:7b");
+    expect(body.messages.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool"]);
+    expect(body.messages[2].tool_calls).toHaveLength(1);
+    expect(body.messages[3].tool_name).toBe("value_counts");
+    expect(body.tools[0].function.name).toBe("describe_table");
+  });
+
+  it("runs the whole agent with a local model, guard and log included", async () => {
+    const ws = await sampleWorkspace();
+    const turns = [
+      { tool_calls: [{ function: { name: "run_plan", arguments: { table: "new_customers", plan: ALL_CUSTOMERS, result_name: "All customers", purpose: "both" } } }] },
+      { tool_calls: [{ function: { name: "run_plan", arguments: { table: "repayments", plan: JSON.parse(OLD_NEW_PIVOT), result_name: "Repayment old vs new", purpose: "pct" } } }] },
+      { content: "Old customers repay better." },
+    ];
+    let i = 0;
+    const c = new OllamaClient(local, async () => reply(turns[i++]));
+    const sent: unknown[] = [];
+    c.onSend = (b) => sent.push(b);
+    c.guard = (b) => checkOutgoing(b, blockedValues(ws));
+    const answer = await new Agent(c, context(ws), { step: () => {}, status: () => {} }).run("old vs new repayment pivot");
+    expect(answer.message).toBe("Old customers repay better.");
+    expect(answer.sheets).toEqual(["Repayment old vs new", "All customers"]); // newest first; the plan may arrive as an object from small models
+    expect(sent).toHaveLength(3);
+  });
+
+  it("uses an installed model when the chosen one is missing", async () => {
+    const c = new OllamaClient({ ...local, ollamaModel: "nope" }, async (url, init) => {
+      if (url.endsWith("/api/tags")) return { ok: true, status: 200, text: async () => JSON.stringify({ models: [{ name: "nomic-embed-text" }, { name: "llama3.1:8b" }] }) };
+      const model = JSON.parse(init.body!).model;
+      return model === "nope" ? { ok: false, status: 404, text: async () => "{\"error\":\"model 'nope' not found\"}" } : reply({ content: "{\"ok\":true}" });
+    });
+    let changed = "";
+    c.onModelChange = (m) => { changed = m; };
+    expect(await c.ask("s", "u")).toEqual({ ok: true });
+    expect(changed).toBe("llama3.1:8b");
+    expect(pickLocalModel(["mistral:7b", "qwen2.5:14b"])).toBe("qwen2.5:14b");
+  });
+
+  it("explains how to fix an unreachable server", async () => {
+    const c = new OllamaClient(local, async () => { throw new TypeError("Failed to fetch"); });
+    await expect(c.ask("s", "u")).rejects.toThrow(/OLLAMA_ORIGINS/);
+  });
+
+  it("needs no key", () => {
+    expect(isReady(local)).toBe(true);
+    expect(isReady({ ...settings, apiKey: "" })).toBe(false);
+    expect(makeClient(local)).toBeInstanceOf(OllamaClient);
+    expect(makeClient(settings)).toBeInstanceOf(GeminiClient);
   });
 });

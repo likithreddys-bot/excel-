@@ -1,5 +1,7 @@
 /** The Excel Agent page: files on the left, the conversation in the middle, the sheets on the right. */
-import { AiError, AiSettings, DEFAULT_MODEL, GeminiClient } from "../ai/gemini";
+import { isReady, makeClient } from "../ai/client";
+import { AiError, AiSettings, DEFAULT_MODEL, ModelClient } from "../ai/gemini";
+import { DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, OllamaClient } from "../ai/ollama";
 import { loadAiSettings, saveAiSettings } from "../ai/ui";
 import { chartTable } from "../engine/format";
 import type { ChartStep } from "../engine/plan";
@@ -47,7 +49,7 @@ const state = {
 const SENT_VIEW = "\u0000sent";
 
 const saveNotes = (): void => { try { localStorage.setItem(NOTES_KEY, JSON.stringify(state.notes.slice(-50))); } catch { /* ignore */ } };
-const ready = (): boolean => state.settings.apiKey.trim() !== "";
+const ready = (): boolean => isReady(state.settings);
 
 const ctx = {
   ws,
@@ -56,12 +58,12 @@ const ctx = {
   saveNotes,
   ask: (question: string, options: string[]) => askPerson(question, options),
 };
-/** A Gemini client that remembers it when it had to switch to another model (a retired one, for example). */
-function client(s: AiSettings): GeminiClient {
-  const c = new GeminiClient(s);
+/** The chosen AI's client, which remembers it when it had to switch to another model (a retired or missing one). */
+function client(s: AiSettings): ModelClient {
+  const c = makeClient(s);
   c.onModelChange = (model) => {
     if (s === state.settings) saveAiSettings(state.settings);
-    const box = document.getElementById("s-model") as HTMLInputElement | null;
+    const box = document.getElementById(s.provider === "ollama" ? "s-ollama-model" : "s-model") as HTMLInputElement | null;
     if (box) box.value = model;
   };
   // Guardrail: every request is checked for personal data and file values before it leaves; blocked ones are never sent.
@@ -148,7 +150,7 @@ function setBusy(busy: boolean): void {
 async function send(text: string): Promise<void> {
   if (state.answer) { state.answer(text); return; } // a reply to the agent's question
   if (state.busy) return;
-  if (!ready()) { post("err", "Add your Gemini API key in AI settings first."); openSettings(); return; }
+  if (!ready()) { post("err", "Set up the AI first: add a Gemini API key, or choose a local model, in AI settings."); openSettings(); return; }
   if (!ws.tables.size) { post("err", "Add a file first (or press “Try sample data”)."); return; }
   post("user", text);
   setBusy(true);
@@ -352,8 +354,24 @@ function download(blob: Blob, name: string): void {
 
 // ---------- settings ----------
 
+/** Show the fields of the chosen provider. */
+function showProvider(): void {
+  const local = $<HTMLInputElement>("s-provider-ollama").checked;
+  $("s-gemini").classList.toggle("hidden", local);
+  $("s-ollama").classList.toggle("hidden", !local);
+  $("s-local-note").classList.toggle("hidden", !local);
+  $("s-cloud-note").classList.toggle("hidden", local);
+}
+
 function openSettings(): void {
   const s = state.settings;
+  $<HTMLInputElement>(s.provider === "ollama" ? "s-provider-ollama" : "s-provider-gemini").checked = true;
+  $<HTMLInputElement>("s-ollama-url").value = s.ollamaUrl ?? "";
+  $<HTMLInputElement>("s-ollama-url").placeholder = DEFAULT_OLLAMA_URL;
+  $<HTMLInputElement>("s-ollama-model").value = s.ollamaModel ?? "";
+  $<HTMLInputElement>("s-ollama-model").placeholder = DEFAULT_OLLAMA_MODEL;
+  document.querySelectorAll("#settings .origin").forEach((e) => (e.textContent = location.origin));
+  showProvider();
   $<HTMLInputElement>("s-key").value = s.apiKey;
   $<HTMLInputElement>("s-model").placeholder = DEFAULT_MODEL;
   $<HTMLInputElement>("s-model").value = s.model;
@@ -368,6 +386,9 @@ function formSettings(): AiSettings {
   return {
     ...state.settings,
     enabled: true,
+    provider: $<HTMLInputElement>("s-provider-ollama").checked ? "ollama" : "gemini",
+    ollamaUrl: $<HTMLInputElement>("s-ollama-url").value.trim() || DEFAULT_OLLAMA_URL,
+    ollamaModel: $<HTMLInputElement>("s-ollama-model").value.trim() || DEFAULT_OLLAMA_MODEL,
     apiKey: $<HTMLInputElement>("s-key").value.trim(),
     model: $<HTMLInputElement>("s-model").value.trim() || DEFAULT_MODEL,
     shareValues: $<HTMLInputElement>("s-share").checked,
@@ -431,11 +452,16 @@ function wire(): void {
     post("agent", "Forgot the saved definitions. I'll ask again when one is needed.").classList.add("muted");
   });
 
+  for (const id of ["s-provider-gemini", "s-provider-ollama"]) $(id).addEventListener("change", () => {
+    showProvider();
+    // A local model keeps everything on this computer, so the richer (safe) sharing is turned on for better answers.
+    if ($<HTMLInputElement>("s-provider-ollama").checked) { $<HTMLInputElement>("s-share").checked = true; $<HTMLInputElement>("s-results").checked = true; }
+  });
   $("open-settings").addEventListener("click", openSettings);
   $("setup-open").addEventListener("click", openSettings);
   $("s-save").addEventListener("click", () => {
     const s = formSettings();
-    if (!s.apiKey) { $("s-status").textContent = "Paste your Gemini API key first."; return; }
+    if (s.provider !== "ollama" && !s.apiKey) { $("s-status").textContent = "Paste your Gemini API key first, or choose a local model."; return; }
     applySettings(s);
     $<HTMLDialogElement>("settings").close();
   });
@@ -443,6 +469,18 @@ function wire(): void {
     $("s-status").textContent = "Testing…";
     try {
       const s = formSettings();
+      if (s.provider === "ollama") {
+        const local = new OllamaClient(s);
+        const installed = await local.listModels();
+        const list = $("s-ollama-models");
+        list.replaceChildren(...installed.map((n) => { const o = el("option"); o.value = n; return o; }));
+        if (!installed.length) { $("s-status").textContent = `Ollama is running, but no model is installed. In a terminal run: ollama pull ${DEFAULT_OLLAMA_MODEL}`; return; }
+        const asked = s.ollamaModel;
+        const c = client(s);
+        await c.ask("Reply with the JSON object {\"ok\":true}.", "ping");
+        $("s-status").textContent = s.ollamaModel === asked ? `The local model works (${s.ollamaModel}). Nothing leaves this computer.` : `“${asked}” isn't installed, so I'll use ${s.ollamaModel}. Press Save to keep it.`;
+        return;
+      }
       const asked = s.model;
       await client(s).ask("Reply with the JSON object {\"ok\":true}.", "ping");
       $("s-status").textContent = s.model === asked ? `The key works (model ${s.model}).` : `The key works. “${asked}” isn't available, so I'll use ${s.model}. Press Save to keep it.`;

@@ -2,7 +2,7 @@
  * The agent loop: the model looks at the tables, runs plans, checks the results, asks when it must, and finishes
  * with a short answer. It works through tools (tools.ts); the engine does every calculation.
  */
-import { AiError, Content, GeminiClient } from "../ai/gemini";
+import { AiError, Content, ModelClient } from "../ai/gemini";
 import { STEP_REFERENCE } from "../ai/schema";
 import { ROLES } from "./workspace";
 import { StepView, TOOLS, ToolContext, runTool } from "./tools";
@@ -56,7 +56,7 @@ export class Agent {
   /** Each finished request's turns, for follow-up questions. */
   private past: Content[][] = [];
 
-  constructor(private readonly client: GeminiClient, private readonly ctx: ToolContext, private readonly events: AgentEvents) {}
+  constructor(private readonly client: ModelClient, private readonly ctx: ToolContext, private readonly events: AgentEvents) {}
 
   reset(): void {
     this.past = [];
@@ -75,7 +75,8 @@ export class Agent {
         const calls = reply.parts.filter((p) => p.functionCall);
         if (!calls.length) {
           const text = reply.parts.map((p) => p.text ?? "").join("").trim();
-          return this.done(turns, { message: text || "Done.", sheets: made });
+          // No final_answer (common with small local models): the newest sheet is the answer, so it comes first.
+          return this.done(turns, { message: text || "Done.", sheets: [...made].reverse() });
         }
         const responses: Content = { role: "user", parts: [] };
         let final: AgentAnswer | undefined;
