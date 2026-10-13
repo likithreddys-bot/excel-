@@ -5,11 +5,12 @@ import { buildXlsx } from "../web/xlsx-write";
 import { howLines } from "./tools";
 import { Workspace } from "./workspace";
 
-export function reportSheets(workspace: Workspace): { sheets: Sheets; formats: FormatStep[] } {
+/** Result sheets (all of them, or just `names`) plus a "How calculated" sheet for them. */
+export function reportSheets(workspace: Workspace, names?: string[]): { sheets: Sheets; formats: FormatStep[] } {
   const sheets: Sheets = new Map();
   const how: Cell[][] = [];
   const formats: FormatStep[] = [];
-  for (const r of workspace.results()) {
+  for (const r of workspace.results().filter((x) => !names || names.includes(x.name))) {
     sheets.set(r.name, r.table);
     formats.push(...r.formats);
     how.push([r.name, r.from, r.purpose, howLines(r).join("\n"), r.notes.join("\n")]);
@@ -18,7 +19,7 @@ export function reportSheets(workspace: Workspace): { sheets: Sheets; formats: F
   return { sheets, formats };
 }
 
-export async function reportBlob(workspace: Workspace): Promise<Blob> {
-  const { sheets, formats } = reportSheets(workspace);
+export async function reportBlob(workspace: Workspace, names?: string[]): Promise<Blob> {
+  const { sheets, formats } = reportSheets(workspace, names);
   return buildXlsx(sheets, formats);
 }

@@ -38,6 +38,12 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+        env:
+          # Optional: a Gemini key built into the site, so people need no key of their own. Set it under
+          # Settings > Secrets and variables > Actions > New repository secret (name GEMINI_API_KEY). Restrict the key in
+          # Google Cloud to the Generative Language API and to this site's address (HTTP referrer), because anyone who
+          # opens the site can see it.
+          VITE_BUILTIN_GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
       # The manifest to give IT, pointing at where Pages serves the files.
       - run: npm run manifest -- "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}"
       - uses: actions/configure-pages@v5

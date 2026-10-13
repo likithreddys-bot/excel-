@@ -1,5 +1,5 @@
 /** The Excel Agent page: files on the left, the conversation in the middle, the sheets on the right. */
-import { isReady, makeClient } from "../ai/client";
+import { BUILTIN_KEY, isReady, makeClient, usesBuiltinKey } from "../ai/client";
 import { AiError, AiSettings, DEFAULT_MODEL, ModelClient } from "../ai/gemini";
 import { DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, OllamaClient } from "../ai/ollama";
 import { loadAiSettings, saveAiSettings } from "../ai/ui";
@@ -8,7 +8,6 @@ import type { ChartStep } from "../engine/plan";
 import { Cell, Table } from "../engine/table";
 import { isoDay } from "../engine/util";
 import { drawChart } from "../web/chart";
-import { buildXlsx } from "../web/xlsx-write";
 import { PrivacyBlock, blockedValues, checkOutgoing } from "./guard";
 import { Agent } from "./loop";
 import { reportBlob } from "./report";
@@ -64,6 +63,7 @@ const ctx = {
 function client(s: AiSettings): ModelClient {
   const c = makeClient(s);
   c.onModelChange = (model) => {
+    if (s.provider === "ollama") s.ollamaModel = model; else s.model = model; // the client may work on a copy (built-in key)
     if (s === state.settings) saveAiSettings(state.settings);
     const box = document.getElementById(s.provider === "ollama" ? "s-ollama-model" : "s-model") as HTMLInputElement | null;
     if (box) box.value = model;
@@ -175,6 +175,11 @@ async function send(text: string): Promise<void> {
         b.addEventListener("click", () => select(s));
         row.append(b);
       }
+      const dl = el("button", "primary small", answer.sheets.length === 1 ? "Download this sheet (.xlsx)" : `Download these ${answer.sheets.length} sheets (.xlsx)`);
+      dl.type = "button";
+      const names = [...answer.sheets];
+      dl.addEventListener("click", async () => download(await reportBlob(ws, names), `${fileSafe(names.length === 1 ? names[0] : "Excel Agent answer")}.xlsx`));
+      row.append(dl);
       card.append(row);
       select(answer.sheets[0]);
     }
@@ -260,6 +265,46 @@ function renderTables(): void {
   $("file-count").textContent = ws.tables.size ? `${ws.sources().length} files · ${ws.results().length} results` : "";
   $<HTMLButtonElement>("download-report").disabled = state.busy || ws.results().length === 0;
   renderSuggestions();
+  renderTabs();
+}
+
+const fileSafe = (name: string): string => name.replace(/[\\/:*?"<>|]+/g, " ").trim() || "sheet";
+const DOWNLOAD_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" aria-hidden="true"><path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+/** Tabs already shown, so only new ones pop in. */
+const tabbed = new Set<string>();
+
+/** Excel-style tabs along the bottom of the sheet panel: one per result, each downloadable. */
+function renderTabs(): void {
+  const bar = $("sheet-tabs");
+  const results = ws.results();
+  bar.classList.toggle("hidden", results.length === 0);
+  bar.replaceChildren();
+  for (const r of results) {
+    const tab = el("div", `sheet-tab${state.selected === r.name ? " active" : ""}`);
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", String(state.selected === r.name));
+    if (!tabbed.has(r.name)) { tab.classList.add("enter"); tabbed.add(r.name); }
+    const open = el("button", "tab-name", r.name);
+    open.type = "button";
+    open.title = r.purpose || r.name;
+    open.addEventListener("click", () => select(r.name));
+    const dl = el("button", "tab-dl");
+    dl.type = "button";
+    dl.innerHTML = DOWNLOAD_ICON;
+    dl.title = `Download “${r.name}” (.xlsx)`;
+    dl.setAttribute("aria-label", dl.title);
+    dl.addEventListener("click", async (ev) => { ev.stopPropagation(); download(await reportBlob(ws, [r.name]), `${fileSafe(r.name)}.xlsx`); });
+    tab.append(open, dl);
+    bar.append(tab);
+  }
+  for (const n of [...tabbed]) if (!results.some((r) => r.name === n)) tabbed.delete(n);
+  if (results.length > 1) {
+    const all = el("button", "tab-all", `Download all ${results.length} (.xlsx)`);
+    all.type = "button";
+    all.addEventListener("click", async () => download(await reportBlob(ws), "Excel Agent report.xlsx"));
+    bar.append(all);
+  }
+  bar.querySelector(".sheet-tab.active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
 /** A column's likely role from its name and kind, for the coloured dot. */
@@ -496,6 +541,8 @@ function openSettings(): void {
   document.querySelectorAll("#settings .origin").forEach((e) => (e.textContent = location.origin));
   showProvider();
   $<HTMLInputElement>("s-key").value = s.apiKey;
+  $<HTMLInputElement>("s-key").placeholder = BUILTIN_KEY ? "Built-in company key in use (paste your own only to override)" : "Paste your key";
+  $("s-builtin").classList.toggle("hidden", !BUILTIN_KEY);
   $<HTMLInputElement>("s-model").placeholder = DEFAULT_MODEL;
   $<HTMLInputElement>("s-model").value = s.model;
   $<HTMLInputElement>("s-share").checked = s.shareValues;
@@ -526,7 +573,7 @@ function applySettings(s: AiSettings): void {
   $("setup").classList.toggle("hidden", ready());
   $("open-settings").textContent = ready() ? "AI settings" : "AI settings (not set up)";
   $("model-status").classList.toggle("on", ready());
-  $("model-label").textContent = !ready() ? "AI not set up" : s.provider === "ollama" ? `${s.ollamaModel || DEFAULT_OLLAMA_MODEL} · local` : `${s.model || DEFAULT_MODEL} · Gemini`;
+  $("model-label").textContent = !ready() ? "AI not set up" : s.provider === "ollama" ? `${s.ollamaModel || DEFAULT_OLLAMA_MODEL} · local` : `${s.model || DEFAULT_MODEL} · Gemini${usesBuiltinKey(s) ? " (built-in)" : ""}`;
 }
 
 // ---------- start ----------
@@ -573,7 +620,7 @@ function wire(): void {
   $("download-sheet").addEventListener("click", async () => {
     const e = state.selected ? ws.get(state.selected) : undefined;
     if (!e || e.kind !== "result") return;
-    download(await buildXlsx(new Map([[e.name, e.table]]), e.formats), `${e.name}.xlsx`);
+    download(await reportBlob(ws, [e.name]), `${fileSafe(e.name)}.xlsx`);
   });
   $("show-sent").addEventListener("click", () => { state.selected = SENT_VIEW; renderTables(); void renderViewer(); });
   $("forget-notes").addEventListener("click", () => {
@@ -591,7 +638,7 @@ function wire(): void {
   $("setup-open").addEventListener("click", openSettings);
   $("s-save").addEventListener("click", () => {
     const s = formSettings();
-    if (s.provider !== "ollama" && !s.apiKey) { $("s-status").textContent = "Paste your Gemini API key first, or choose a local model."; return; }
+    if (!isReady(s)) { $("s-status").textContent = "Paste your Gemini API key first, or choose a local model."; return; }
     applySettings(s);
     $<HTMLDialogElement>("settings").close();
   });
