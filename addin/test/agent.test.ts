@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { Content, Fetch, GeminiClient, defaultSettings, pickModel } from "../src/ai/gemini";
 import { normalisePlan } from "../src/ai/schema";
 import { OllamaClient, pickLocalModel } from "../src/ai/ollama";
-import { isReady, makeClient } from "../src/ai/client";
+import { isReady, keyFor, makeClient, usesBuiltinKey } from "../src/ai/client";
 import { PrivacyBlock, blockedValues, checkOutgoing, personalData } from "../src/agent/guard";
 import { Agent } from "../src/agent/loop";
 import { reportSheets } from "../src/agent/report";
@@ -435,5 +435,35 @@ describe("local model (Ollama)", () => {
     expect(isReady({ ...settings, apiKey: "" })).toBe(false);
     expect(makeClient(local)).toBeInstanceOf(OllamaClient);
     expect(makeClient(settings)).toBeInstanceOf(GeminiClient);
+  });
+});
+
+describe("built-in key", () => {
+  const none = { ...defaultSettings(), apiKey: "" };
+  it("is used when the person has no key, and their own key wins", () => {
+    expect(isReady(none, "")).toBe(false);
+    expect(isReady(none, "built-in")).toBe(true);
+    expect(keyFor(none, "built-in")).toBe("built-in");
+    expect(keyFor({ ...none, apiKey: "mine" }, "built-in")).toBe("mine");
+    expect(usesBuiltinKey(none, "built-in")).toBe(true);
+    expect(usesBuiltinKey({ ...none, provider: "ollama" }, "built-in")).toBe(false);
+  });
+  it("is sent with Gemini requests", async () => {
+    const headers: Record<string, string>[] = [];
+    const c = makeClient(none, "built-in");
+    (c as unknown as { fetchImpl: Fetch }).fetchImpl = async (_u, init) => { headers.push(init.headers); return { ok: true, status: 200, text: async () => JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text: "{}" }] } }] }) }; };
+    await c.ask("s", "u");
+    expect(headers[0]["x-goog-api-key"]).toBe("built-in");
+  });
+});
+
+describe("downloads per answer", () => {
+  it("a download holds just the chosen sheets plus How calculated", async () => {
+    const ws = await sampleWorkspace();
+    const ctx = context(ws);
+    await runTool("run_plan", { table: "new_customers", plan: ALL_CUSTOMERS, result_name: "All customers", purpose: "Both files" }, ctx);
+    await runTool("run_plan", { table: "repayments", plan: OLD_NEW_PIVOT, result_name: "Repayment old vs new", purpose: "Repayment %" }, ctx);
+    expect([...reportSheets(ws, ["Repayment old vs new"]).sheets.keys()]).toEqual(["Repayment old vs new", "How calculated"]);
+    expect([...reportSheets(ws).sheets.keys()]).toEqual(["All customers", "Repayment old vs new", "How calculated"]);
   });
 });

@@ -27,6 +27,7 @@ Rules:
 - If a business word needs a definition that is not in the notes (old vs new customer, on time, NPA, DPD bucket, active, policy cohort) and the data allows more than one sensible meaning, ask_user once with 2-4 options that name the columns and values. If the data makes it clear, state your assumption in the final answer instead of asking.
 - Use the notes: they are definitions the team already confirmed. When the person confirms a new definition, it is saved automatically; use remember for other lasting facts.
 - Use exact table and column names. Result sheet names: short, readable, at most 31 characters.
+- Tables marked LARGE (lakhs to crores of rows) can only be analysed with run_sql (DuckDB SQL, every row). run_sql also works on every other table and can join them, so it is the best tool for joins and big totals. Quote table and column names in double quotes. Use sum(a)*100.0/sum(b) for percentages. Return summaries, not raw rows.
 - Keep tool calls purposeful: at most ${MAX_ROUNDS} rounds per request.
 `.trim();
 
@@ -42,7 +43,7 @@ function overview(ctx: ToolContext): string {
   const lines: string[] = ["Tables in the workspace:"];
   for (const s of ctx.ws.sources()) {
     const cols = s.headers.length > 300 ? `${s.headers.slice(0, 300).join(", ")}, ... (${s.headers.length} in all)` : s.headers.join(", ");
-    lines.push(`- "${s.name}" (source; role: ${roleLabel(s.role)}; file ${s.file}; ${s.approx ? "about " : ""}${s.rows.toLocaleString("en-IN")} rows; ${s.headers.length} columns): ${cols}`);
+    lines.push(`- "${s.name}" (source${s.engine === "sql" ? "; LARGE: use run_sql" : ""}; role: ${roleLabel(s.role)}; file ${s.file}; ${s.approx ? "about " : ""}${s.rows.toLocaleString("en-IN")} rows; ${s.headers.length} columns): ${cols}`);
   }
   for (const r of ctx.ws.results()) {
     lines.push(`- "${r.name}" (result made from "${r.from}": ${r.purpose || "no description"}; ${r.table.nrows} rows): ${r.table.columns.map((c) => c.name).join(", ")}`);

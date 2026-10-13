@@ -45,12 +45,13 @@ export function blockedValues(ws: Workspace): Blocked {
   const values = new Set<string>();
   const words = new Set<string>();
   for (const s of ws.sources()) {
-    const t = s.loaded;
-    if (!t) continue;
-    let mine = cache.get(t);
-    if (!mine) { mine = secretsOf(t); cache.set(t, mine); }
-    for (const v of mine.values) values.add(v);
-    for (const w of mine.words) words.add(w);
+    for (const t of [s.loaded, ...(s.samples ?? [])]) {
+      if (!t) continue;
+      let mine = cache.get(t);
+      if (!mine) { mine = secretsOf(t); cache.set(t, mine); }
+      for (const v of mine.values) values.add(v);
+      for (const w of mine.words) words.add(w);
+    }
   }
   for (const a of allowed) { values.delete(a); words.delete(a); }
   return { values, words };

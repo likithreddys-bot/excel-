@@ -9,6 +9,7 @@ import type { Table } from "../engine/table";
 import { MAX_CELLS } from "../host";
 import { csvHead, readCsv } from "../web/csv";
 import { XlsxBook, openXlsx, readSheet, sheetHead } from "../web/xlsx-read";
+import { BIG_BYTES, SqlCatalog, SqlDb } from "./sql";
 
 export type Role = "new_customers" | "old_customers" | "customers" | "loans" | "repayments" | "policy" | "other";
 export const ROLES: { value: Role; label: string }[] = [
@@ -35,6 +36,11 @@ export interface SourceTable {
   loaded: Table | null;
   blob: Blob;
   book?: XlsxBook;
+  /** "sql": too big to hold in memory, so DuckDB queries the file on disk (run_sql). */
+  engine: "memory" | "sql";
+  delimiter?: string;
+  /** Random samples DuckDB returned for profiling (kept so the privacy guard knows this file's names and ids). */
+  samples?: Table[];
 }
 
 export interface ResultTable {
@@ -47,6 +53,8 @@ export interface ResultTable {
   plan: Plan;
   purpose: string;
   notes: string[];
+  /** Made by run_sql: the query DuckDB ran on every row. */
+  sql?: string;
 }
 
 export type Entry = SourceTable | ResultTable;
@@ -77,6 +85,31 @@ const stem = (file: string): string => file.replace(/\.[^.]+$/, "") || file;
 
 export class Workspace {
   readonly tables = new Map<string, Entry>();
+  /** DuckDB, started the first time a big file or a SQL query needs it. */
+  private catalog: SqlCatalog | null = null;
+  private starting: Promise<SqlCatalog> | null = null;
+  constructor(private readonly startSql: (() => Promise<SqlDb>) | null = null, readonly bigBytes = BIG_BYTES) {}
+
+  get sqlAvailable(): boolean { return !!this.startSql; }
+
+  async sql(): Promise<SqlCatalog> {
+    if (this.catalog) return this.catalog;
+    if (!this.startSql) throw new Error("The SQL engine is not available here.");
+    this.starting ??= this.startSql().then((db) => (this.catalog = new SqlCatalog(db)));
+    return this.starting;
+  }
+
+  /** Make sure DuckDB can see these tables (big files as views on the file; small tables copied in). */
+  async sqlReady(names: string[]): Promise<SqlCatalog> {
+    const cat = await this.sql();
+    for (const n of names) {
+      const e = this.get(n);
+      if (!e || cat.has(e.name)) continue;
+      if (e.kind === "source" && e.engine === "sql") await cat.addFile({ name: e.name, kind: /\.parquet$/i.test(e.file) ? "parquet" : "csv", blob: e.blob, delimiter: e.delimiter });
+      else await cat.addTable(e.name, await this.ensure(e.name, "all"));
+    }
+    return cat;
+  }
   progress: (message: string) => void = () => {};
   /** The table being read right now (for the page's progress bar), or null. */
   reading: string | null = null;
@@ -105,19 +138,29 @@ export class Workspace {
             let head;
             try { head = await sheetHead(book, s.name); } catch { continue; } // an empty sheet is skipped
             const name = this.unique(many ? `${stem(f.name)} - ${s.name}` : stem(f.name));
-            this.tables.set(name, { kind: "source", name, file: f.name, sheet: s.name, headers: head.headers, rows: head.rows, approx: head.rows < 0, role: guessRole(`${f.name} ${s.name}`, head.headers), loaded: null, blob: f, book });
+            this.tables.set(name, { kind: "source", name, file: f.name, sheet: s.name, headers: head.headers, rows: head.rows, approx: head.rows < 0, role: guessRole(`${f.name} ${s.name}`, head.headers), loaded: null, blob: f, book, engine: "memory" });
             added.push(name);
           }
           if (!added.length) problems.push(`“${f.name}” has no sheet with a header row.`);
         } else if (/\.(csv|tsv|txt)$/.test(lower)) {
           const head = await csvHead(f);
           const name = this.unique(stem(f.name));
-          this.tables.set(name, { kind: "source", name, file: f.name, sheet: name, headers: head.headers, rows: head.rows, approx: true, role: guessRole(f.name, head.headers), loaded: null, blob: f });
+          const big = !!this.startSql && f.size > this.bigBytes;
+          this.tables.set(name, { kind: "source", name, file: f.name, sheet: name, headers: head.headers, rows: head.rows, approx: true, role: guessRole(f.name, head.headers), loaded: null, blob: f, engine: big ? "sql" : "memory", delimiter: head.delimiter });
+          added.push(name);
+        } else if (/\.parquet$/.test(lower)) {
+          if (!this.startSql) { problems.push(`“${f.name}” is a Parquet file; it needs the SQL engine, which isn't available here.`); continue; }
+          const name = this.unique(stem(f.name));
+          const cat = await this.sql();
+          await cat.addFile({ name, kind: "parquet", blob: f });
+          const headers = await cat.headers(name);
+          const rows = await cat.count(name);
+          this.tables.set(name, { kind: "source", name, file: f.name, sheet: name, headers, rows, approx: false, role: guessRole(f.name, headers), loaded: null, blob: f, engine: "sql" });
           added.push(name);
         } else if (/\.(xls|xlsb)$/.test(lower)) {
           problems.push(`“${f.name}” is an old Excel format. In Excel choose File → Save As → Excel Workbook (.xlsx), then add that.`);
         } else {
-          problems.push(`“${f.name}” isn't an Excel (.xlsx) or CSV file.`);
+          problems.push(`“${f.name}” isn't an Excel (.xlsx), CSV or Parquet file.`);
         }
       } catch (e) {
         problems.push(`I couldn't open “${f.name}”: ${(e as Error).message}`);
@@ -152,6 +195,7 @@ export class Workspace {
     const e = this.get(name);
     if (!e) throw new Error(`There's no table called “${name}”. Tables: ${[...this.tables.keys()].join(", ")}`);
     if (e.kind === "result") return e.table;
+    if (e.engine === "sql") throw new Error(`“${e.name}” is a large file (${e.approx ? "about " : ""}${num(e.rows)} rows), so it is analysed with SQL in place: use run_sql for it.`);
     const have = new Set(e.loaded?.columns.map((c) => c.name) ?? []);
     const fitsWhole = e.rows >= 0 && e.rows * e.headers.length <= MAX_CELLS;
     const lowerHeaders = new Map(e.headers.map((h) => [h.toLowerCase(), h]));
@@ -162,7 +206,7 @@ export class Workspace {
     if (!all.length) return e.loaded ?? { columns: [], nrows: 0 };
     const rows = e.rows > 0 ? e.rows : 0;
     if (rows && rows * all.length > MAX_CELLS) {
-      throw new Error(`“${e.name}” has ${e.approx ? "about " : ""}${num(rows)} rows; reading ${all.length} of its columns would be too much at once (limit about ${num(MAX_CELLS)} cells). Use fewer columns.`);
+      throw new Error(`“${e.name}” has ${e.approx ? "about " : ""}${num(rows)} rows; reading ${all.length} of its columns would be too much at once (limit about ${num(MAX_CELLS)} cells). Use fewer columns${this.startSql ? ", or use run_sql, which works on any size" : ""}.`);
     }
     const whole = all.length === e.headers.length;
     // Re-read every needed column in one pass, so the rows always line up.

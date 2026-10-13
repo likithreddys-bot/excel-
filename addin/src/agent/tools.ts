@@ -12,7 +12,8 @@ import { validatePlan } from "../planner";
 import type { AiSettings, FunctionDeclaration } from "../ai/gemini";
 import { ColumnProfile, describeColumn, profileColumn } from "../ai/profile";
 import { normalisePlan } from "../ai/schema";
-import { Workspace } from "./workspace";
+import { tablesIn } from "./sql";
+import { SourceTable, Workspace } from "./workspace";
 
 export const PREVIEW_ROWS = 60;
 
@@ -50,6 +51,19 @@ export const TOOLS: FunctionDeclaration[] = [
         purpose: { type: "string", description: "One plain sentence: what this result shows." },
       },
       required: ["table", "plan", "result_name", "purpose"],
+    },
+  },
+  {
+    name: "run_sql",
+    description: "Run one read-only SQL query (DuckDB dialect) over the tables and save the result as a new sheet. Works on any size, including large files of crores of rows that run_plan cannot hold, and can join any tables. Refer to tables and columns by their exact names in double quotes. Return a summary (GROUP BY, totals, top N), not raw rows: at most 2 lakh rows. Returns the result's size, columns, checks and, when it is a small summary, its rows.",
+    parameters: {
+      type: "object",
+      properties: {
+        sql: { type: "string", description: "One SELECT (or WITH ... SELECT) query. Example: SELECT \"state\", sum(\"paid_amt\")*100.0/sum(\"due_amt\") AS \"Repayment %\" FROM \"repayments\" GROUP BY 1 ORDER BY 2 DESC" },
+        result_name: { type: "string", description: "A short sheet name for the result (max 31 characters)." },
+        purpose: { type: "string", description: "One plain sentence: what this result shows." },
+      },
+      required: ["sql", "result_name", "purpose"],
     },
   },
   {
@@ -92,6 +106,8 @@ export interface ToolContext {
   saveNotes(): void;
   /** Put a question to the person and wait for the answer. */
   ask(question: string, options: string[]): Promise<string>;
+  /** Progress text for long work ("Calculating with DuckDB over 1,00,00,000 rows…"). */
+  status?: (text: string) => void;
 }
 
 export interface ToolResult {
@@ -162,6 +178,7 @@ export async function runTool(name: string, args: Record<string, unknown>, ctx: 
       case "describe_table": return await describeTable(args, ctx);
       case "value_counts": return await valueCounts(args, ctx);
       case "run_plan": return await runPlan(args, ctx);
+      case "run_sql": return await runSql(args, ctx);
       case "ask_user": {
         const question = str(args.question).trim() || "Could you tell me more?";
         const options = strList(args.options).slice(0, 5);
@@ -189,6 +206,11 @@ export async function runTool(name: string, args: Record<string, unknown>, ctx: 
   }
 }
 
+const isSql = (e: unknown): e is SourceTable => !!e && (e as SourceTable).kind === "source" && (e as SourceTable).engine === "sql";
+function remember(e: SourceTable, t: Table): void {
+  e.samples = [...(e.samples ?? []), t].slice(-6);
+}
+
 async function describeTable(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const e = ctx.ws.get(str(args.table));
   if (!e) throw new Error(`There's no table called “${str(args.table)}”. Tables: ${[...ctx.ws.tables.keys()].join(", ")}`);
@@ -202,6 +224,17 @@ async function describeTable(args: Record<string, unknown>, ctx: ToolContext): P
     response.rows = ctx.ws.rowsOf(e);
     response.columns = headers;
     response.note = `This table has ${headers.length} columns: call describe_table again with "columns" (up to 60) to see details of the ones you need.`;
+  } else if (isSql(e)) {
+    const cat = await ctx.ws.sqlReady([e.name]);
+    if (e.approx) { ctx.status?.(`Counting the rows of ${e.name}…`); e.rows = await cat.count(e.name); e.approx = false; }
+    ctx.status?.(`Sampling ${e.name}…`);
+    const t = await cat.sample(e.name, wanted);
+    remember(e, t);
+    response.rows = e.rows;
+    response.engine = "large file: analyse it with run_sql";
+    response.note = "Profile from a random sample of 20,000 rows; counts and totals in run_sql use every row.";
+    if (headers.length > wanted.length) response.other_columns = headers.filter((h) => !wanted.includes(h));
+    response.profile = profileOf(t, wanted, ctx.settings).map(describeColumn);
   } else {
     const t = await ctx.ws.ensure(e.name, wanted);
     response.rows = t.nrows;
@@ -218,6 +251,7 @@ async function valueCounts(args: Record<string, unknown>, ctx: ToolContext): Pro
   if (!e) throw new Error(`There's no table called “${table}”.`);
   const column = ctx.ws.headersOf(e.name).find((h) => h.toLowerCase() === str(args.column).toLowerCase());
   if (!column) throw new Error(`“${e.name}” has no column called “${str(args.column)}”.`);
+  if (isSql(e)) return valueCountsSql(e, column, args, ctx);
   const t = await ctx.ws.ensure(e.name, [column]);
   const c = t.columns.find((x) => x.name === column)!;
   const p = profileColumn(c, t.nrows, { values: true });
@@ -232,10 +266,51 @@ async function valueCounts(args: Record<string, unknown>, ctx: ToolContext): Pro
   return { response: { column, rows: t.nrows, distinct: p.distinct, values }, view };
 }
 
+async function valueCountsSql(e: SourceTable, column: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  const cat = await ctx.ws.sqlReady([e.name]);
+  const sample = await cat.sample(e.name, [column]);
+  remember(e, sample);
+  const p = profileColumn(sample.columns[0], sample.nrows, { values: true });
+  const top = Math.min(50, Math.max(1, Math.floor(Number(args.top) || 20)));
+  const view: StepView = { kind: "look", title: `Counted the values of ${column} in ${e.name}`, detail: [] };
+  if (!ctx.settings.shareValues) return { response: { column, withheld: "values are not shared (AI settings)" }, view };
+  if (PERSONAL.test(column) || p.role === "id") return { response: { column, withheld: "personal or id column" }, view };
+  ctx.status?.(`Counting values over every row of ${e.name}…`);
+  const { values, distinct } = await cat.valueCounts(e.name, column, top);
+  if (distinct > 200) return { response: { column, distinct, withheld: "too many different values; use describe_table for its range" }, view };
+  return { response: { column, rows: e.rows, distinct, values }, view };
+}
+
+/** A SQL query over any tables (DuckDB), saved as a result sheet. */
+async function runSql(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  if (!ctx.ws.sqlAvailable) return { response: { error: "The SQL engine is not available here; use run_plan." }, view: { kind: "error", title: "SQL is not available", detail: [] } };
+  const sql = str(args.sql).trim();
+  const used = tablesIn(sql, [...ctx.ws.tables.keys()]);
+  if (!used.length) return { response: { error: `The query names no known table. Tables: ${[...ctx.ws.tables.keys()].map((n) => `"${n}"`).join(", ")}` }, view: { kind: "error", title: "A query was rejected (the agent will fix it)", detail: [] } };
+  const cat = await ctx.ws.sqlReady(used);
+  const rows = used.map((n) => ctx.ws.get(n)).reduce((a, e) => a + (e ? ctx.ws.rowsOf(e) : 0), 0);
+  ctx.status?.(`Calculating with DuckDB over ${rows.toLocaleString("en-IN")} rows…`);
+  let result: Table;
+  try {
+    result = await cat.run(sql);
+  } catch (err) {
+    const message = ((err as Error).message ?? String(err)).split("\n")[0].slice(0, 400);
+    return { response: { error: message }, view: { kind: "error", title: `A query failed (the agent will fix it): ${message.slice(0, 120)}`, detail: [] } };
+  }
+  const name = ctx.ws.addResult(str(args.result_name) || "Result", result, { formats: [], from: used.join(", "), plan: { clarification_question: null, summary: sql, steps: [], awaits_columns: false }, purpose: str(args.purpose), notes: [], sql });
+  const checks = checksOf(result);
+  const response: Record<string, unknown> = { saved_as: [name], rows: result.nrows, columns: result.columns.map((c) => c.name), checks };
+  const why = shareable(result, ctx.settings);
+  if (why) response.rows_withheld = why;
+  else response.data = Array.from({ length: result.nrows }, (_, i) => result.columns.map((c) => cellOut(c.values[i])));
+  return { response, view: { kind: "run", title: `Made “${name}” with SQL over ${used.join(", ")} (${result.nrows.toLocaleString("en-IN")} rows)`, detail: [sql, ...checks.map((c) => `Check: ${c}`)], sheet: name } };
+}
+
 async function runPlan(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const tableName = str(args.table);
   const e = ctx.ws.get(tableName);
   if (!e) throw new Error(`There's no table called “${tableName}”. Tables: ${[...ctx.ws.tables.keys()].join(", ")}`);
+  if (isSql(e)) return { response: { error: `“${e.name}” is a large file (${e.rows.toLocaleString("en-IN")} rows): use run_sql for it.` }, view: { kind: "error", title: "Switching to SQL for a large file", detail: [] } };
   let raw: unknown = args.plan;
   if (typeof raw === "string") {
     try { raw = JSON.parse(raw); } catch { throw new Error("The plan is not valid JSON. Send {\"steps\":[...]} as JSON text."); }
@@ -287,6 +362,11 @@ async function runPlan(args: Record<string, unknown>, ctx: ToolContext): Promise
   else response.data = result.columns.length ? Array.from({ length: result.nrows }, (_, i) => result.columns.map((c) => cellOut(c.values[i]))) : [];
   const detail = plan.steps.map((s: Step) => { try { return describeStep(s); } catch { return s.op; } });
   return { response, view: { kind: "run", title: `Made “${saved.join("”, “")}” from ${e.name} (${result.nrows.toLocaleString("en-IN")} rows)`, detail: [...detail, ...checks.map((c) => `Check: ${c}`)], sheet: saved[0] } };
+}
+
+/** How a result was made, as plain lines (for the viewer and the "How calculated" sheet). */
+export function howLines(r: { plan: Plan; sql?: string }): string[] {
+  return r.sql ? [`SQL run by DuckDB on every row: ${r.sql}`] : planLines(r.plan);
 }
 
 /** The plan behind a result, as plain lines (for the "How calculated" sheet). */
